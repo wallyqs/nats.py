@@ -71,7 +71,7 @@ def main(loop):
 
     # Additional roundtrip with server to ensure everything has been
     # processed by the server already.
-    yield from nc.flush()
+    # yield from nc.flush()
 
     print("Waiting for {} messages on [{}]...".format(args.count, args.subject))
     try:

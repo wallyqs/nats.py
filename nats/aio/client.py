@@ -670,7 +670,6 @@ class Client():
             # Enough messages so can throwaway subscription now.
             self._subs.pop(msg.sid, None)
 
-        # msg = Msg(subject=subject.decode(), reply=reply.decode(), data=data)
         if sub.cb is not None:
             self._loop.create_task(sub.cb(msg))
         elif sub.future is not None and not sub.future.cancelled():
@@ -810,13 +809,14 @@ class Client():
                 yield from asyncio.sleep(1, loop=self._loop)
                 end_out_messages = self.stats["out_msgs"]
                 end_in_messages = self.stats["in_msgs"]
-                print("{} -- delta out: {} -- delta in: {} -- queue size: {} -- queue bytes: {} -- msgs queue: {}".format(
+                print("{} -- delta out: {} -- delta in: {} -- queue size: {} -- queue bytes: {} -- msgs queue: {} -- Parser State -- {}".format(
                     time.time(),
                     end_out_messages - start_out_messages,
                     end_in_messages - start_in_messages,
                     self._buffer_queue.qsize(),
                     self._buffer_queue_size,
                     self.msg_queue.qsize(),
+                    self._ps.state,
                     ))
                 print(self.stats)
             except Exception as e:

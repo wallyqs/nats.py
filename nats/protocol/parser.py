@@ -52,6 +52,31 @@ class Msg(object):
 
 class Parser(object):
 
+    OP_START         = 1
+    OP_PLUS          = 2
+    OP_PLUS_O        = 3
+    OP_PLUS_OK       = 4
+    OP_MINUS         = 5
+    OP_MINUS_E       = 6
+    OP_MINUS_ER      = 7
+    OP_MINUS_ERR     = 8
+    OP_MINUS_ERR_SPC = 9
+    MINUS_ERR_ARG    = 10
+    OP_M             = 11
+    OP_MS            = 12
+    OP_MSG           = 13
+    OP_MSG_SPC       = 14
+    MSG_ARG          = 15
+    MSG_PAYLOAD      = 16
+    MSG_END          = 17
+    OP_P             = 18
+    OP_PI            = 19
+    OP_PIN           = 20
+    OP_PING          = 21
+    OP_PO            = 22
+    OP_PON           = 23
+    OP_PONG          = 24
+
     def __init__(self, nc=None):
         self.nc = nc
         self.reset()
@@ -60,10 +85,15 @@ class Parser(object):
         return "<nats protocol parser state={0}>".format(self.state)
 
     def reset(self):
-        self.buf = b''
-        self.state = AWAITING_CONTROL_LINE
+        self.state = Parser.OP_START
         self.needed = 0
+
+        # New style parsing
         self.msg_arg = {}
+        self.msg_buf = None
+        self.msg_arg_buf = None
+        self.pos = 0
+        self.drop = 0
 
     @asyncio.coroutine
     def parse(self, data=''):
@@ -71,107 +101,145 @@ class Parser(object):
         Parses the wire protocol from NATS for the client
         and dispatches the subscription callbacks.
         """
-        self.buf = b''.join([self.buf, data])
-        while self.buf:
-            if self.state == AWAITING_CONTROL_LINE:
-                scratch = self.buf[:MAX_CONTROL_LINE_SIZE]
+        i = 0
+        buflen = len(data)
+        buf = memoryview(data)
+        while i < buflen:
+            c = buf[i:i+1]
 
-                # MSG
-                if scratch.startswith(MSG_OP):
-                    self.buf = self.buf[MSG_OP_SIZE:]
-                    self.state = AWAITING_MSG_ARG
-
-                # OK
-                elif scratch.startswith(OK):
-                    self.buf = self.buf[OK_SIZE:]
-                    self.state = AWAITING_CONTROL_LINE
-
-                # -ERR
-                elif scratch.startswith(ERR_OP):
-                    self.buf = self.buf[ERR_OP_SIZE:]
-                    self.state = AWAITING_MINUS_ERR_ARG
-
-                # PONG
-                elif scratch.startswith(PONG):
-                    self.buf = self.buf[PONG_SIZE:]
-                    self.state = AWAITING_CONTROL_LINE
-                    yield from self.nc._process_pong()
-
-                # PING
-                elif scratch.startswith(PING):
-                    self.buf = self.buf[PING_SIZE:]
-                    self.state = AWAITING_CONTROL_LINE
-                    yield from self.nc._process_ping()
+            if self.state is Parser.OP_START:
+                # In case there is a parsing error setting the next state,
+                # then it will stop parsing and raise and exception which
+                # process_op_error in client should handle.
+                if c == b'M' or c == b'm':
+                    self.state = Parser.OP_M
+                elif c == b'P' or c == b'p':
+                    self.state = Parser.OP_P
+                elif c == b'+':
+                    self.state = Parser.OP_PLUS
+                elif c == b'-':
+                    self.state = Parser.OP_MINUS
                 else:
-                    break
-
-            # -ERR 'error'
-            elif self.state == AWAITING_MINUS_ERR_ARG:
-                scratch = self.buf[:MAX_CONTROL_LINE_SIZE]
-
-                # Skip until we have the full control line.
-                if _CRLF_ not in scratch:
-                    break
-
-                i = scratch.find(_CRLF_)
-                line = scratch[:i]
-                _, err = line.split(_SPC_, 1)
-
-                # Consume buffer and set next state before handling err.
-                self.buf = self.buf[i+CRLF_SIZE:]
-                self.state = AWAITING_CONTROL_LINE
-                yield from self.nc._process_err(err)
-
-            elif self.state == AWAITING_MSG_ARG:
-                scratch = self.buf[:MAX_CONTROL_LINE_SIZE]
-
-                # Skip until we have the full control line.
-                if _CRLF_ not in scratch:
-                    break
-
-                i = scratch.find(_CRLF_)
-                line = scratch[:i]
-                args = line.split(_SPC_)
-
-                # Check in case of using a queue.
-                args_size = len(args)
-                if args_size == 5:
-                    self.msg_arg["subject"] = args[1]
-                    self.msg_arg["sid"] = int(args[2])
-                    self.msg_arg["reply"] = args[3]
-                    self.needed = int(args[4])
-                elif args_size == 4:
-                    self.msg_arg["subject"] = args[1]
-                    self.msg_arg["sid"] = int(args[2])
-                    self.msg_arg["reply"] = b''
-                    self.needed = int(args[3])
+                    raise ErrProtocol("nats: parsing error in OP_START state")
+            elif self.state is Parser.OP_M:
+                if c == b'S' or c == b's':
+                    self.state = Parser.OP_MS
                 else:
-                    raise ErrProtocol("nats: Wrong number of arguments in MSG")
+                    raise ErrProtocol("nats: parsing error in OP_M state")
+            elif self.state is Parser.OP_MS:
+                if c == b'G' or c == b'g':
+                    self.state = Parser.OP_MSG
+                else:
+                    raise ErrProtocol("nats: parsing error in OP_MS state")
+            elif self.state is Parser.OP_MSG:
+                if c == b' ' or c == b'\t':
+                    self.state = Parser.OP_MSG_SPC
+                else:
+                    raise ErrProtocol("nats: parsing error in OP_MSG state")
+            elif self.state is Parser.OP_MSG_SPC:
+                if c == b' ' or c == b'\t':
+                    continue
+                else:
+                    # Matched start of subject
+                    self.state = Parser.MSG_ARG
+                    self.pos = i
+            elif self.state is Parser.MSG_ARG:
+                if c == b'\r':
+                    self.drop = 1
+                elif c == b'\n':
+                    # Ready to process msg arguments
+                    msg_arg_buf = bytearray()
+                    if self.msg_arg_buf is not None:
+                        msg_arg_buf = self.msg_arg_buf
+                    else:
+                        msg_arg_buf.extend(bytes(buf[self.pos:i-self.drop]))
+                    args = msg_arg_buf.split(_SPC_)
 
-                # Consume buffer and set next state.
-                self.buf = self.buf[i+CRLF_SIZE:]
-                self.state = AWAITING_MSG_PAYLOAD
+                    # Check in case of using a queue.
+                    args_size = len(args)
+                    if args_size == 4:
+                        self.msg_arg["subject"] = args[0]
+                        self.msg_arg["sid"] = int(args[1])
+                        self.msg_arg["reply"] = args[2]
+                        self.needed = int(args[3])
+                    elif args_size == 3:
+                        self.msg_arg["subject"] = args[0]
+                        self.msg_arg["sid"] = int(args[1])
+                        self.msg_arg["reply"] = b''
+                        self.needed = int(args[2])
+                    else:
+                        raise ErrProtocol("nats: wrong number of arguments in MSG")
+                    self.drop = 0
+                    self.pos = i+1
+                    self.state = Parser.MSG_PAYLOAD
 
-            elif self.state == AWAITING_MSG_PAYLOAD:
-                if len(self.buf) < self.needed+CRLF_SIZE:
-                    break
+                    # Jump ahead with the index. If this overruns
+                    # what is left we fall out from the loop and
+                    # process the rest as split buffer.
+                    i = self.pos + self.needed - 1
+                else:
+                    if self.msg_arg_buf is not None:
+                        self.msg_arg_buf.extend(c)
+            elif self.state is Parser.MSG_PAYLOAD:
+                if self.msg_buf is not None:
+                    have_bytes = len(self.msg_buf)
+                    if have_bytes >= self.needed:
+                        # Still need _CRLF_ to follow the protocol
+                        # but we can dispatch the message here already.
+                        subject = self.msg_arg["subject"].decode()
+                        reply   = self.msg_arg["reply"]
+                        sid     = self.msg_arg["sid"]
+                        payload = bytes(self.msg_buf)
+                        msg     = Msg(subject=subject, reply=reply, data=payload, sid=sid)
+                        yield from self.nc.msg_queue.put(msg)
+                        self.msg_arg_buf = None
+                        self.msg_buf = None
+                        self.state = Parser.MSG_END
+                    else:
+                        # Copy as much as we can from the buffer
+                        to_copy = self.needed - have_bytes
+                        avail = buflen - i
 
-                # Protocol wise, a MSG should end with a break
-                # so signal protocol error if next char is not.
-                msg_op_payload = self.buf[:self.needed+CRLF_SIZE]
-                if msg_op_payload.endswith(MSG_END):
-                    # Set next stage already before dispatching to callback.
-                    self.buf = self.buf[self.needed+CRLF_SIZE:]
-                    self.state = AWAITING_CONTROL_LINE
+                        if avail < to_copy:
+                            to_copy = avail
 
-                    subject = self.msg_arg["subject"]
-                    sid     = self.msg_arg["sid"]
+                        if to_copy > 0:
+                            self.msg_buf = b''.join([self.msg_buf, bytes(buf[i:i+to_copy])])
+                            i = i + to_copy - 1
+                        else:
+                            self.msg_buf = b''.join([self.msg_buf, c])
+                elif i-self.pos >= self.needed:
+                    # Can slice upto enough bytes now since there are enough
+                    # in current read and buffer is not split..
+                    subject = self.msg_arg["subject"].decode()
                     reply   = self.msg_arg["reply"]
-                    payload = msg_op_payload[:self.needed]
-                    msg = Msg(subject=subject.decode(), reply=reply, data=payload, sid=sid)
+                    sid     = self.msg_arg["sid"]
+                    payload = bytes(buf[self.pos:i])
+                    msg     = Msg(subject=subject, reply=reply, data=payload, sid=sid)
                     yield from self.nc.msg_queue.put(msg)
+                    self.msg_arg_buf = None
+                    self.msg_buf = None
+                    self.state = Parser.MSG_END
+            elif self.state is Parser.MSG_END:
+                if c == b'\n':
+                    self.drop = 0
+                    self.pos = i + 1
+                    self.state = Parser.OP_START
                 else:
-                    raise ErrProtocol("nats: Wrong termination sequence for MSG")
+                    continue
+
+            # -----------------------------------------------------------
+            i += 1
+
+        # Split buffer with control line
+        if self.state in (Parser.MSG_ARG, Parser.MINUS_ERR_ARG) and self.msg_arg_buf is None:
+            # FIXME: Should be used for '-ERR' arguments as well.
+            self.msg_arg_buf = bytearray()
+            self.msg_arg_buf.extend(bytes(buf[self.pos:i-self.drop]))
+
+        # Check for split message payload
+        if self.state is Parser.MSG_PAYLOAD and self.msg_buf is None:
+            self.msg_buf = data[self.pos:]
 
 class ErrProtocol(Exception):
     def __str__(self):
