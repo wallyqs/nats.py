@@ -31,6 +31,8 @@ EMPTY       = ""
 PING_PROTO = PING_OP + _CRLF_
 PONG_PROTO = PONG_OP + _CRLF_
 
+MAX_CONTROL_LINE_SIZE  = 1024
+
 DEFAULT_PENDING_SIZE           = 1024 * 1024
 DEFAULT_BUFFER_SIZE            = 32768
 DEFAULT_RECONNECT_TIME_WAIT    = 2   # in seconds
@@ -39,7 +41,14 @@ DEFAULT_PING_INTERVAL          = 120 # in seconds
 DEFAULT_MAX_OUTSTANDING_PINGS  = 2
 DEFAULT_MAX_PAYLOAD_SIZE       = 1048576
 
-MAX_CONTROL_LINE_SIZE  = 1024
+# Buffer Queue for processing read commands.
+DEFAULT_BUFFER_QUEUE_SIZE  = 320
+DEFAULT_BUFFER_QUEUE_PENDING_LIMIT = 32
+DEFAULT_MESSAGES_QUEUE_SIZE = 65536
+
+# Pending Limits for Susbcriptions.
+DEFAULT_SUB_PENDING_MSGS_LIMIT  = 65536
+DEFAULT_SUB_PENDING_BYTES_LIMIT = 65536 * 1024
 
 class Client():
     """
@@ -61,6 +70,8 @@ class Client():
         self._server_info = {}
         self._server_pool = []
         self._reading_task = None
+        self._parsing_task = None
+        self._msg_task = None
         self._ping_interval_task = None
         self._pings_outstanding = 0
         self._pongs_received = 0
@@ -81,6 +92,10 @@ class Client():
         self._pending_data_size = 0
         self._flush_queue = None
         self._flusher_task = None
+        self._buffer_queue = None
+        self._buffer_queue_size = 0
+
+        self.msg_queue = None
         self.options = {}
         self.stats = {
             'in_msgs':    0,
@@ -90,6 +105,9 @@ class Client():
             'reconnects': 0,
             'errors_received': 0
             }
+
+        # DEBUG
+        # self._monitor_task = None
 
     @asyncio.coroutine
     def connect(self,
@@ -171,7 +189,19 @@ class Client():
             self._ping_interval_task.cancel()
 
         if self._flusher_task is not None and not self._flusher_task.cancelled():
+            if not self._flush_queue.empty():
+                self._flush_queue.task_done()
             self._flusher_task.cancel()
+
+        if self._parsing_task is not None and not self._parsing_task.cancelled():
+            if not self._buffer_queue.empty():
+                self._buffer_queue.task_done()
+            self._parsing_task.cancel()
+
+        if self._msg_task is not None and not self._msg_task.cancelled():
+            if not self.msg_queue.empty():
+                self.msg_queue.task_done()
+            self._msg_task.cancel()
 
         # Cleanup subscriptions
         self._subs.clear()
@@ -520,6 +550,8 @@ class Client():
                     self._flush_queue.task_done()
                 self._flusher_task.cancel()
 
+            # TODO: Cancel parsing, messages tasks too here...
+
             self._loop.create_task(self._attempt_reconnect())
         else:
             self._process_disconnect()
@@ -619,16 +651,16 @@ class Client():
             self._pings_outstanding -= 1
 
     @asyncio.coroutine
-    def _process_msg(self, sid, subject, reply, data):
+    def _process_msg(self, msg):
         """
         Process MSG sent by server.
         """
         self.stats['in_msgs']  += 1
-        self.stats['in_bytes'] += len(data)
+        self.stats['in_bytes'] += len(msg.data)
 
         sub = None
         try:
-            sub = self._subs[sid]
+            sub = self._subs[msg.sid]
         except KeyError:
             # Skip in case no subscription present.
             return
@@ -636,9 +668,9 @@ class Client():
         sub.received += 1
         if sub.max_msgs > 0 and sub.received >= sub.max_msgs:
             # Enough messages so can throwaway subscription now.
-            self._subs.pop(sid, None)
+            self._subs.pop(msg.sid, None)
 
-        msg = Msg(subject=subject.decode(), reply=reply.decode(), data=data)
+        # msg = Msg(subject=subject.decode(), reply=reply.decode(), data=data)
         if sub.cb is not None:
             self._loop.create_task(sub.cb(msg))
         elif sub.future is not None and not sub.future.cancelled():
@@ -700,6 +732,25 @@ class Client():
         self._flush_queue = asyncio.Queue(maxsize=1024, loop=self._loop)
         self._flusher_task = self._loop.create_task(self._flusher())
 
+        # Have 32 slots of DEFAULT_BUFFER_SIZE totalling in maximum 20MB
+        # 32768 * 32      == 1MB  (32)
+        # 32768 * 32 * 10 == 10MB (320)
+        # 32768 * 32 * 20 == 20MB (640)
+        self._buffer_queue = asyncio.Queue(maxsize=DEFAULT_BUFFER_QUEUE_SIZE, loop=self._loop)
+
+        # Buffer until it hurts... Parser will dispatch processed messages
+        # into a messages queue for which we have a task that continuously
+        # feeds from it.
+        self.msg_queue = asyncio.Queue(maxsize=DEFAULT_MESSAGES_QUEUE_SIZE, loop=self._loop)
+        self._msg_task = self._loop.create_task(self._msg_loop())
+
+        # Parsing and Messages tasks cooperate to handle the commands
+        # sent by the NATS server.
+        self._parsing_task = self._loop.create_task(self._parse_loop())
+
+        # DEBUG
+        # self._monitor_task = self._loop.create_task(self._monitor_loop())
+
     @asyncio.coroutine
     def _send_ping(self, future=None):
         if future is None:
@@ -751,6 +802,28 @@ class Client():
             #     pass
 
     @asyncio.coroutine
+    def _monitor_loop(self):
+        while True:
+            try:
+                start_out_messages = self.stats["out_msgs"]
+                start_in_messages = self.stats["in_msgs"]
+                yield from asyncio.sleep(1, loop=self._loop)
+                end_out_messages = self.stats["out_msgs"]
+                end_in_messages = self.stats["in_msgs"]
+                print("{} -- delta out: {} -- delta in: {} -- queue size: {} -- queue bytes: {} -- msgs queue: {}".format(
+                    time.time(),
+                    end_out_messages - start_out_messages,
+                    end_in_messages - start_in_messages,
+                    self._buffer_queue.qsize(),
+                    self._buffer_queue_size,
+                    self.msg_queue.qsize(),
+                    ))
+                print(self.stats)
+            except Exception as e:
+                print(e)
+                continue
+
+    @asyncio.coroutine
     def _read_loop(self):
         """
         Coroutine which gathers bytes sent by the server
@@ -768,7 +841,8 @@ class Client():
                     break
 
                 b = yield from self._io_reader.read(DEFAULT_BUFFER_SIZE)
-                yield from self._ps.parse(b)
+                yield from self._buffer_queue.put(b)
+                self._buffer_queue_size += len(b)
             except ErrProtocol:
                 self._process_op_err(ErrProtocol)
                 break
@@ -779,6 +853,37 @@ class Client():
                 break
             # except asyncio.InvalidStateError:
             #     pass
+
+    @asyncio.coroutine
+    def _parse_loop(self):
+        while True:
+            try:
+                # Start parsing as soon as we have something pending
+                # in the buffer queue.
+                buf = yield from self._buffer_queue.get()
+                self._buffer_queue_size -= len(buf)
+                yield from self._ps.parse(buf)
+
+                # Continue parsing in case we have many chunks pending.
+                if self._buffer_queue.qsize() >= DEFAULT_BUFFER_QUEUE_PENDING_LIMIT:
+                    for i in range(0, DEFAULT_BUFFER_QUEUE_PENDING_LIMIT):
+                        chunk = yield from self._buffer_queue.get()
+                        self._buffer_queue_size -= len(chunk)
+                        yield from self._ps.parse(chunk)
+
+                # Minimal pause in between chunks parsing.
+                yield from asyncio.sleep(0.00001, loop=self._loop)
+            except asyncio.CancelledError:
+                break
+
+    @asyncio.coroutine
+    def _msg_loop(self):
+        while True:
+            try:
+                msg = yield from self.msg_queue.get()
+                yield from self._process_msg(msg)
+            except asyncio.CancelledError:
+                break
 
     def __enter__(self):
         """For when NATS client is used in a context manager"""
@@ -805,19 +910,6 @@ class Subscription():
         self.future    = future
         self.max_msgs  = max_msgs
         self.received = 0
-
-class Msg(object):
-
-    def __init__(self,
-                 subject='',
-                 reply='',
-                 data=b'',
-                 sid=0,
-                 ):
-        self.subject = subject
-        self.reply   = reply
-        self.data    = data
-        self.sid     = sid
 
 class Srv():
     """
