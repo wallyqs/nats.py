@@ -64,8 +64,11 @@ class Parser(object):
         self.state   = AWAITING_CONTROL_LINE
         self.needed  = 0
         self.msg_arg = {}
-        self.scratch = b''
-        self.msg_buf = b''
+        self.msg_buf = bytearray()
+        self.msg_buf_size = 0
+
+        self.scratch = bytearray()
+        self.scratch_size = 0
 
     @asyncio.coroutine
     def parse(self, buf=''):
@@ -77,11 +80,12 @@ class Parser(object):
         while i < buflen:
             if self.state == AWAITING_CONTROL_LINE:
                 # Get at least enough bytes for processing a control line.
-                orig_scratch_size = len(self.scratch)
-                self.scratch = b''.join([self.scratch, buf[i:i+MAX_CONTROL_LINE_SIZE]])
+                scratch = buf[i:i+MAX_CONTROL_LINE_SIZE]
+                self.scratch.extend(scratch)
 
                 # Split buffer so break already.
                 if _CRLF_ not in self.scratch:
+                    self.scratch_size += len(scratch)
                     break
 
                 # MSG
@@ -108,38 +112,39 @@ class Parser(object):
                         raise ErrProtocol("nats: Wrong number of arguments in MSG")
 
                     # Set next state and position
-                    i += len(line) + CRLF_SIZE - orig_scratch_size
+                    i += len(line) + CRLF_SIZE - self.scratch_size
+                    self.scratch = bytearray()
+                    self.scratch_size = 0
                     self.state = AWAITING_MSG_PAYLOAD
-
-                    # Reset scratch buffer
-                    self.scratch = b''
 
                 # OK
                 elif self.scratch.startswith(OK):
 
                     # Move position to be after +OK
                     i += OK_SIZE
-                    self.scratch = b''
+                    self.scratch = bytearray()
+                    self.scratch_size = 0
                     self.state = AWAITING_CONTROL_LINE
 
                 # -ERR
                 elif self.scratch.startswith(ERR_OP):
 
                     # TODO: Handle ERROR
-                    si = scratch.find(_CRLF_)
-                    line = scratch[:si]
+                    si = self.scratch.find(_CRLF_)
+                    line = self.scratch[:si]
                     _, err = line.split(_SPC_, 1)
-                    print("ERROR!!!!!!", err)
+                    i += len(line) + CRLF_SIZE - self.scratch_size
+                    self.scratch = bytearray()
+                    self.scratch_size = 0
                     yield from self.nc._process_err(err)
-                    self.scratch = b''
-                    i += len(line) + CRLF_SIZE - orig_scratch_size
 
                 # PONG
                 elif self.scratch.startswith(PONG):
 
                     # Move position to be after PONG
                     i += PONG_SIZE
-                    self.scratch = b''
+                    self.scratch = bytearray()
+                    self.scratch_size = 0
                     self.state = AWAITING_CONTROL_LINE
                     yield from self.nc._process_pong()
 
@@ -148,7 +153,8 @@ class Parser(object):
 
                     # Move position to be after PING
                     i += PING_SIZE
-                    self.scratch = b''
+                    self.scratch = bytearray()
+                    self.scratch_size = 0
                     self.state = AWAITING_CONTROL_LINE
                     yield from self.nc._process_ping()
 
@@ -156,14 +162,16 @@ class Parser(object):
                     raise ErrProtocol("nats: Unknown Protocol")
 
             elif self.state == AWAITING_MSG_PAYLOAD:
-                if len(self.msg_buf) < self.needed:
+
+                if self.msg_buf_size < self.needed:
                     # Need to take enough bytes and append to current buf
-                    before_copy = len(self.msg_buf)
+                    before_copy = self.msg_buf_size
                     needed_buf = buf[i:i+self.needed]
-                    self.msg_buf = b''.join([self.msg_buf, needed_buf])
+                    self.msg_buf.extend(needed_buf)
 
                     i += self.needed - before_copy
-                    if len(self.msg_buf) < self.needed:
+                    self.msg_buf_size = len(self.msg_buf)
+                    if self.msg_buf_size < self.needed:
                         # Still not enough bytes and split buffer so just break
                         # and handle in next read.
                         break
@@ -171,7 +179,8 @@ class Parser(object):
                     i += self.needed
 
                 # Set next stage already before dispatching to callback.
-                self.scratch = b''
+                self.scratch = bytearray()
+                self.scratch_size = 0
                 self.state = AWAITING_MSG_END
 
                 subject = self.msg_arg["subject"].decode()
@@ -179,35 +188,16 @@ class Parser(object):
                 reply   = self.msg_arg["reply"]
                 payload = self.msg_buf
                 msg     = Msg(subject=subject, reply=reply, data=payload, sid=sid)
-
-                # Nothing: peak 135416, high cpu (PUB 86,439 msgs/sec)
-                # PUB/SUB: delta out: 60816 -- delta in: 61240
-                self.nc.stats["in_msgs"] += 1
-
-                # Result: Buffer queue gets stuck?
-                # Worst...
-                # self.nc._loop.create_task(self.nc._process_msg(msg))
-
-                # Result: PUB/SUB delta out: 21720 -- delta in: 22734
-                # Most balanced.
-                # yield from self.nc.msg_queue.put(msg)
-
-                # Result: delta out: 30662 -- delta in: 56833
-                # Using sleep of 0.0001 after flushing with buffer queue pending limit.
-                # yield from self.nc._process_msg(msg)
-
-                # Result: High cpu and 48968 msgs/sec
-                # yield from self.nc._process_msg(msg)
-
-                # Slowest: 47474 msgs/sec
-                # self.nc.msg_queue.put_nowait(msg)
+                yield from self.nc._process_msg(msg)
 
             elif self.state == AWAITING_MSG_END:
                 c = memoryview(buf[i:i+1])
                 if c == b'\n':
-                    self.msg_buf = b''
+                    self.msg_buf = bytearray()
+                    self.msg_buf_size = 0
                     self.msg_arg = {}
-                    self.scratch = b''
+                    self.scratch = bytearray()
+                    self.scratch_size = 0
                     self.state = AWAITING_CONTROL_LINE
 
                 # Continue until we get the end of message.

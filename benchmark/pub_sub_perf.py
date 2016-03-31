@@ -65,7 +65,7 @@ def main(loop):
             sys.stdout.write("+")
             sys.stdout.flush()
 
-    yield from nc.subscribe(args.subject, cb=handler)
+    yield from nc.subscribe_sync(args.subject, cb=handler)
 
     # Start the benchmark
     start = time.time()

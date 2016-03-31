@@ -62,12 +62,16 @@ def main(loop):
     def handler(msg):
         nonlocal received
         nonlocal start
+        received += 1
+
         # Measure time from the time we got the first message.
         if received == 1:
             start = time.monotonic()
-        received += 1
+        if (received % HASH_MODULO) == 0:
+            sys.stdout.write("+")
+            sys.stdout.flush()
 
-    yield from nc.subscribe(args.subject, cb=handler)
+    yield from nc.subscribe_sync(args.subject, cb=handler)
 
     # Additional roundtrip with server to ensure everything has been
     # processed by the server already.
@@ -76,8 +80,7 @@ def main(loop):
     start = time.monotonic()
     print("Waiting for {} messages on [{}]...".format(args.count, args.subject))
     try:
-        # while received < args.count:
-        while nc.stats["in_msgs"] < args.count:
+        while received < args.count:
             yield from asyncio.sleep(0.1, loop=loop)
     except ErrTimeout:
         print("Server flush timeout after {0}".format(DEFAULT_FLUSH_TIMEOUT))

@@ -268,7 +268,7 @@ class Client():
             yield from self._flush_pending()
 
     @asyncio.coroutine
-    def subscribe(self, subject, queue="", cb=None, future=None, max_msgs=0):
+    def subscribe(self, subject, queue="", cb=None, future=None, max_msgs=0, async=True):
         """
         Takes a subject string and optional queue string to send a SUB cmd,
         and a callback which to which messages (Msg) will be dispatched.
@@ -281,10 +281,25 @@ class Client():
 
         self._ssid += 1
         ssid = self._ssid
-        sub = Subscription(subject=subject, queue=queue, cb=cb, future=future, max_msgs=max_msgs)
+        sub = Subscription(subject=subject,
+                           queue=queue,
+                           cb=cb,
+                           future=future,
+                           max_msgs=max_msgs,
+                           async=async)
         self._subs[ssid] = sub
         yield from self._subscribe(sub, ssid)
         return ssid
+
+    @asyncio.coroutine
+    def subscribe_sync(self, subject, **kwargs):
+        """
+        Sets the subcription to await for the callback processing
+        the message once at a time.
+        """
+        kwargs["async"] = False
+        sid = yield from self.subscribe(subject, **kwargs)
+        return sid
 
     @asyncio.coroutine
     def unsubscribe(self, ssid, max_msgs=0):
@@ -678,8 +693,14 @@ class Client():
             # Enough messages so can throwaway subscription now.
             self._subs.pop(msg.sid, None)
 
+        # Asynchronous subscription
         if sub.cb is not None:
-            self._loop.create_task(sub.cb(msg))
+            if sub.async:
+                # Dispatch each one of the callbacks using a task.
+                self._loop.create_task(sub.cb(msg))
+            else:
+                # Await for the result each callback at a time.
+                yield from sub.cb(msg)
         elif sub.future is not None and not sub.future.cancelled():
             sub.future.set_result(msg)
 
@@ -748,8 +769,8 @@ class Client():
         # Buffer until it hurts... Parser will dispatch processed messages
         # into a messages queue for which we have a task that continuously
         # feeds from it.
-        self.msg_queue = asyncio.Queue(maxsize=DEFAULT_MESSAGES_QUEUE_SIZE, loop=self._loop)
-        self._msg_task = self._loop.create_task(self._msg_loop())
+        # self.msg_queue = asyncio.Queue(maxsize=DEFAULT_MESSAGES_QUEUE_SIZE, loop=self._loop)
+        # self._msg_task = self._loop.create_task(self._msg_loop())
 
         # Parsing and Messages tasks cooperate to handle the commands
         # sent by NATS server.
@@ -916,13 +937,15 @@ class Subscription():
                  cb=None,
                  future=None,
                  max_msgs=0,
+                 async=True,
                  ):
         self.subject   = subject
         self.queue     = queue
         self.cb        = cb
         self.future    = future
         self.max_msgs  = max_msgs
-        self.received = 0
+        self.received  = 0
+        self.async     = async
 
 class Srv():
     """
