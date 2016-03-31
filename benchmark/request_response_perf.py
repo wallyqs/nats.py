@@ -46,7 +46,7 @@ def main(loop):
     servers = args.servers
     if len(args.servers) < 1:
         servers = ["nats://127.0.0.1:4222"]
-    opts = { "servers": servers, "io_loop": loop, "allow_reconnect": False }
+    opts = { "servers": servers, "io_loop": loop }
 
     # Make sure we're connected to a server first...
     nc = NATS()
@@ -57,33 +57,49 @@ def main(loop):
         show_usage_and_die()
 
     received = 0
-    start = None
     @asyncio.coroutine
     def handler(msg):
         nonlocal received
-        nonlocal start
-        # Measure time from the time we got the first message.
-        if received == 1:
-            start = time.monotonic()
         received += 1
+        yield from nc.publish(msg.reply.decode(), payload=b'')
 
-    yield from nc.subscribe(args.subject, cb=handler)
+    yield from nc.subscribe("tests.>", cb=handler)
+
+    # Start the benchmark
+    start = time.time()
+    to_send = args.count
+
+    print("Sending {0} messages of size {1} bytes on [{2}]".format(
+        args.count, args.size, args.subject))
+    while to_send > 0:
+        for i in range(0, args.batch):
+            to_send -= 1
+            yield from nc.timed_request("tests.{}".format(to_send), payload, 0.500)
+            if (to_send % HASH_MODULO) == 0:
+                sys.stdout.write("+")
+                sys.stdout.flush()
+            if to_send == 0:
+                break
+
+        # Minimal pause in between batches of commands sent to server
+        yield from asyncio.sleep(0.00001, loop=loop)
 
     # Additional roundtrip with server to ensure everything has been
     # processed by the server already.
-    yield from nc.flush()
-
-    start = time.monotonic()
-    print("Waiting for {} messages on [{}]...".format(args.count, args.subject))
     try:
-        # while received < args.count:
-        while nc.stats["in_msgs"] < args.count:
+        while received < args.count:
+            # yield from nc.flush(0.000001)
             yield from asyncio.sleep(0.1, loop=loop)
     except ErrTimeout:
         print("Server flush timeout after {0}".format(DEFAULT_FLUSH_TIMEOUT))
+        print(nc.stats)
+        print("Received: {}".format(received))
 
-    elapsed = time.monotonic() - start
-    print("\nTest completed : {0} msgs/sec sent".format(args.count/elapsed))
+    elapsed = time.time() - start
+    mbytes = "%.1f" % (((args.size * args.count)/elapsed) / (1024*1024))
+    print("\nTest completed : {0} msgs/sec sent ({1}) MB/sec".format(
+        args.count/elapsed,
+        mbytes))
 
     print("Received {0} messages ({1} msgs/sec)".format(received, received/elapsed))
     yield from nc.close()

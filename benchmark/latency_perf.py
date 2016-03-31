@@ -45,9 +45,16 @@ def main(loop):
     sys.stderr.write("ERROR: {0}".format(e))
     show_usage_and_die()
 
+  received = 0
+
   @asyncio.coroutine
   def handler(msg):
-    yield from nc.publish(msg.reply, b"")
+    nonlocal received
+    received += 1
+    if (received % HASH_MODULO) == 0:
+      sys.stdout.write("+")
+      sys.stdout.flush()
+    yield from nc.publish(msg.reply.decode(), b'')
   yield from nc.subscribe(args.subject, cb=handler)
 
   # Start the benchmark
@@ -63,7 +70,7 @@ def main(loop):
 
     yield from nc.timed_request(args.subject, b"")
     if (to_send % HASH_MODULO) == 0:
-      sys.stdout.write("+")
+      sys.stdout.write("#")
       sys.stdout.flush()
 
   duration = time.monotonic() - start

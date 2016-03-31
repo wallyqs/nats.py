@@ -41,7 +41,7 @@ DEFAULT_PING_INTERVAL          = 120 # in seconds
 DEFAULT_MAX_OUTSTANDING_PINGS  = 2
 DEFAULT_MAX_PAYLOAD_SIZE       = 1048576
 
-# Buffer Queue for processing read commands.
+# Buffering Queues for processing read commands.
 DEFAULT_BUFFER_QUEUE_SIZE  = 320
 DEFAULT_BUFFER_QUEUE_PENDING_LIMIT = 32
 DEFAULT_MESSAGES_QUEUE_SIZE = 65536
@@ -521,7 +521,7 @@ class Client():
         if not self.is_connecting:
             do_cbs = True
 
-        self._loop.create_task(self._close(Client.CLOSED, do_cbs))
+        yield from self._close(Client.CLOSED, do_cbs)
 
     def _process_op_err(self, e):
         """
@@ -550,7 +550,15 @@ class Client():
                     self._flush_queue.task_done()
                 self._flusher_task.cancel()
 
-            # TODO: Cancel parsing, messages tasks too here...
+            if self._parsing_task is not None and not self._parsing_task.cancelled():
+                if not self._buffer_queue.empty():
+                    self._buffer_queue.task_done()
+                self._parsing_task.cancel()
+
+            if self._msg_task is not None and not self._msg_task.cancelled():
+                if not self.msg_queue.empty():
+                    self.msg_queue.task_done()
+                self._msg_task.cancel()
 
             self._loop.create_task(self._attempt_reconnect())
         else:
@@ -731,10 +739,10 @@ class Client():
         self._flush_queue = asyncio.Queue(maxsize=1024, loop=self._loop)
         self._flusher_task = self._loop.create_task(self._flusher())
 
-        # Have 32 slots of DEFAULT_BUFFER_SIZE totalling in maximum 20MB
+        # Have 32 slots of DEFAULT_BUFFER_SIZE totalling in maximum 10MB usage.
         # 32768 * 32      == 1MB  (32)
-        # 32768 * 32 * 10 == 10MB (320)
-        # 32768 * 32 * 20 == 20MB (640)
+        # 32768 * 32 * 10 == 10MB (320) --- Default
+        # 32768 * 32 * 20 == 20MB (640) --- Larger buffer but could cause Slow Consumer...
         self._buffer_queue = asyncio.Queue(maxsize=DEFAULT_BUFFER_QUEUE_SIZE, loop=self._loop)
 
         # Buffer until it hurts... Parser will dispatch processed messages
@@ -744,7 +752,7 @@ class Client():
         self._msg_task = self._loop.create_task(self._msg_loop())
 
         # Parsing and Messages tasks cooperate to handle the commands
-        # sent by the NATS server.
+        # sent by NATS server.
         self._parsing_task = self._loop.create_task(self._parse_loop())
 
         # DEBUG
@@ -801,29 +809,6 @@ class Client():
             #     pass
 
     @asyncio.coroutine
-    def _monitor_loop(self):
-        while True:
-            try:
-                start_out_messages = self.stats["out_msgs"]
-                start_in_messages = self.stats["in_msgs"]
-                yield from asyncio.sleep(1, loop=self._loop)
-                end_out_messages = self.stats["out_msgs"]
-                end_in_messages = self.stats["in_msgs"]
-                print("{} -- delta out: {} -- delta in: {} -- queue size: {} -- queue bytes: {} -- msgs queue: {} -- Parser State -- {}".format(
-                    time.time(),
-                    end_out_messages - start_out_messages,
-                    end_in_messages - start_in_messages,
-                    self._buffer_queue.qsize(),
-                    self._buffer_queue_size,
-                    self.msg_queue.qsize(),
-                    self._ps.state,
-                    ))
-                print(self.stats)
-            except Exception as e:
-                print(e)
-                continue
-
-    @asyncio.coroutine
     def _read_loop(self):
         """
         Coroutine which gathers bytes sent by the server
@@ -840,6 +825,7 @@ class Client():
                     self._process_op_err(ErrStaleConnection)
                     break
 
+                # Read and add chunk to buffer queue
                 b = yield from self._io_reader.read(DEFAULT_BUFFER_SIZE)
                 yield from self._buffer_queue.put(b)
                 self._buffer_queue_size += len(b)
@@ -863,16 +849,17 @@ class Client():
                 buf = yield from self._buffer_queue.get()
                 self._buffer_queue_size -= len(buf)
                 yield from self._ps.parse(buf)
+                yield from asyncio.sleep(0, loop=self._loop)
 
-                # Continue parsing in case we have many chunks pending.
+                # Try to parse more in the same pass in case we have
+                # many pending chunks to process.
                 if self._buffer_queue.qsize() >= DEFAULT_BUFFER_QUEUE_PENDING_LIMIT:
                     for i in range(0, DEFAULT_BUFFER_QUEUE_PENDING_LIMIT):
                         chunk = yield from self._buffer_queue.get()
                         self._buffer_queue_size -= len(chunk)
                         yield from self._ps.parse(chunk)
+                        yield from asyncio.sleep(0, loop=self._loop)
 
-                # Minimal pause in between chunks parsing.
-                yield from asyncio.sleep(0.00001, loop=self._loop)
             except asyncio.CancelledError:
                 break
 
@@ -894,6 +881,32 @@ class Client():
         """Close connection to NATS when used in a context manager"""
 
         self._loop.create_task(self._close(Client.CLOSED, True))
+
+    @asyncio.coroutine
+    def _monitor_loop(self):
+        """
+        For debugging....
+        """
+        while True:
+            try:
+                start_out_messages = self.stats["out_msgs"]
+                start_in_messages = self.stats["in_msgs"]
+                yield from asyncio.sleep(1, loop=self._loop)
+                end_out_messages = self.stats["out_msgs"]
+                end_in_messages = self.stats["in_msgs"]
+                print("{} -- delta out: {} -- delta in: {} -- queue size: {} -- queue bytes: {} -- msgs queue: {} -- Parser State -- {}".format(
+                    time.time(),
+                    end_out_messages - start_out_messages,
+                    end_in_messages - start_in_messages,
+                    self._buffer_queue.qsize(),
+                    self._buffer_queue_size,
+                    self.msg_queue.qsize(),
+                    self._ps.state,
+                    ))
+                print(self.stats)
+            except Exception as e:
+                print(e)
+                continue
 
 class Subscription():
 

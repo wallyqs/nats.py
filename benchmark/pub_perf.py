@@ -67,7 +67,7 @@ def main(loop):
             to_send -= 1
             yield from nc.publish(args.subject, payload)
             if (to_send % HASH_MODULO) == 0:
-                sys.stdout.write("+")
+                sys.stdout.write("#")
                 sys.stdout.flush()
             if to_send == 0:
                 break
