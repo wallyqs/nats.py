@@ -44,7 +44,7 @@ DEFAULT_MAX_PAYLOAD_SIZE       = 1048576
 # Buffering Queues for processing commands.
 DEFAULT_FLUSHER_QUEUE_SIZE = 1024
 DEFAULT_BUFFER_QUEUE_SIZE  = 320
-DEFAULT_BUFFER_QUEUE_PENDING_LIMIT = 32
+# DEFAULT_BUFFER_QUEUE_PENDING_LIMIT = 32
 
 # Pending Limits for Susbcriptions.
 DEFAULT_SUB_PENDING_MSGS_LIMIT  = 65536
@@ -71,7 +71,6 @@ class Client():
         self._server_pool = []
         self._reading_task = None
         self._parsing_task = None
-        self._msg_task = None
         self._ping_interval_task = None
         self._pings_outstanding = 0
         self._pongs_received = 0
@@ -95,7 +94,6 @@ class Client():
         self._buffer_queue = None
         self._buffer_queue_size = 0
 
-        self.msg_queue = None
         self.options = {}
         self.stats = {
             'in_msgs':    0,
@@ -205,15 +203,6 @@ class Client():
                 pass
             finally:
                 self._parsing_task.cancel()
-
-        if self._msg_task is not None and not self._msg_task.cancelled():
-            try:
-                if not self.msg_queue.empty():
-                    self.msg_queue.task_done()
-            except:
-                pass
-            finally:
-                self._msg_task.cancel()
 
         # In case there are subscriptions using a task, notify that it is done.
         for sid, sub in self._subs.items():
@@ -625,15 +614,6 @@ class Client():
                 finally:
                     self._parsing_task.cancel()
 
-            if self._msg_task is not None and not self._msg_task.cancelled():
-                try:
-                    if not self.msg_queue.empty():
-                        self.msg_queue.task_done()
-                except:
-                    pass
-                finally:
-                    self._msg_task.cancel()
-
             self._loop.create_task(self._attempt_reconnect())
         else:
             self._process_disconnect()
@@ -934,25 +914,6 @@ class Client():
                 self._buffer_queue_size -= len(buf)
                 yield from self._ps.parse(buf)
                 yield from asyncio.sleep(0, loop=self._loop)
-
-                # Try to parse more in the same pass in case we have
-                # many pending chunks to process.
-                if self._buffer_queue.qsize() >= DEFAULT_BUFFER_QUEUE_PENDING_LIMIT:
-                    for i in range(0, DEFAULT_BUFFER_QUEUE_PENDING_LIMIT):
-                        chunk = yield from self._buffer_queue.get()
-                        self._buffer_queue_size -= len(chunk)
-                        yield from self._ps.parse(chunk)
-                        yield from asyncio.sleep(0, loop=self._loop)
-
-            except asyncio.CancelledError:
-                break
-
-    @asyncio.coroutine
-    def _msg_loop(self):
-        while True:
-            try:
-                msg = yield from self.msg_queue.get()
-                yield from self._process_msg(msg)
             except asyncio.CancelledError:
                 break
 
@@ -975,7 +936,7 @@ class Client():
             try:
                 start_out_messages = self.stats["out_msgs"]
                 start_in_messages = self.stats["in_msgs"]
-                yield from asyncio.sleep(1, loop=self._loop)
+                yield from asyncio.sleep(0.1, loop=self._loop)
                 end_out_messages = self.stats["out_msgs"]
                 end_in_messages = self.stats["in_msgs"]
                 print("{} -- delta out: {} -- delta in: {} -- queue size: {} -- queue bytes: {} -- Parser State -- {}".format(
