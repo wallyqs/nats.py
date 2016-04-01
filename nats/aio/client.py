@@ -1,4 +1,4 @@
-# Copyright 2015 Apcera Inc. All rights reserved.
+# Copyright 2015-2016 Apcera Inc. All rights reserved.
 
 import asyncio
 import json
@@ -41,10 +41,10 @@ DEFAULT_PING_INTERVAL          = 120 # in seconds
 DEFAULT_MAX_OUTSTANDING_PINGS  = 2
 DEFAULT_MAX_PAYLOAD_SIZE       = 1048576
 
-# Buffering Queues for processing read commands.
+# Buffering Queues for processing commands.
+DEFAULT_FLUSHER_QUEUE_SIZE = 1024
 DEFAULT_BUFFER_QUEUE_SIZE  = 320
 DEFAULT_BUFFER_QUEUE_PENDING_LIMIT = 32
-DEFAULT_MESSAGES_QUEUE_SIZE = 65536
 
 # Pending Limits for Susbcriptions.
 DEFAULT_SUB_PENDING_MSGS_LIMIT  = 65536
@@ -321,7 +321,7 @@ class Client():
         @asyncio.coroutine
         def consumer(sub):
             while True:
-                try: 
+                try:
                     msg = yield from sub.buffer_queue.get()
                     if sub.async:
                         self._loop.create_task(sub.cb(msg))
@@ -732,13 +732,19 @@ class Client():
             yield from sub.buffer_queue.put(msg)
 
         elif sub.cb is not None:
-            # Asynchronous subscription
-            if sub.async:
-                # Dispatch each one of the callbacks using a task.
-                self._loop.create_task(sub.cb(msg))
+            if asyncio.iscoroutinefunction(sub.cb):
+                if sub.async:
+                    # Dispatch each one of the callbacks using a task
+                    # to run them asynchronously.
+                    self._loop.create_task(sub.cb(msg))
+                else:
+                    # Await for the result each callback at a time
+                    # and process sequentially.
+                    yield from sub.cb(msg)
             else:
-                # Await for the result each callback at a time.
-                yield from sub.cb(msg)
+                # Schedule regular callbacks to be processed sequentially.
+                self._loop.call_soon(sub.cb, msg)
+
         elif sub.future is not None and not sub.future.cancelled():
             # Used for timed requests which expect a single response.
             sub.future.set_result(msg)
@@ -796,20 +802,11 @@ class Client():
         self._ping_interval_task = self._loop.create_task(self._ping_interval())
 
         # Queue for kicking the flusher
-        self._flush_queue = asyncio.Queue(maxsize=1024, loop=self._loop)
+        self._flush_queue = asyncio.Queue(maxsize=DEFAULT_FLUSHER_QUEUE_SIZE, loop=self._loop)
         self._flusher_task = self._loop.create_task(self._flusher())
 
-        # Have 32 slots of DEFAULT_BUFFER_SIZE totalling in maximum 10MB usage.
-        # 32768 * 32      == 1MB  (32)
-        # 32768 * 32 * 10 == 10MB (320) --- Default
-        # 32768 * 32 * 20 == 20MB (640) --- Larger buffer but could cause Slow Consumer...
+        # Have 320 slots of DEFAULT_BUFFER_SIZE totalling in maximum 10MB usage.
         self._buffer_queue = asyncio.Queue(maxsize=DEFAULT_BUFFER_QUEUE_SIZE, loop=self._loop)
-
-        # Buffer until it hurts... Parser will dispatch processed messages
-        # into a messages queue for which we have a task that continuously
-        # feeds from it.
-        # self.msg_queue = asyncio.Queue(maxsize=DEFAULT_MESSAGES_QUEUE_SIZE, loop=self._loop)
-        # self._msg_task = self._loop.create_task(self._msg_loop())
 
         # Parsing and Messages tasks cooperate to handle the commands
         # sent by NATS server.
