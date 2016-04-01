@@ -203,6 +203,11 @@ class Client():
                 self.msg_queue.task_done()
             self._msg_task.cancel()
 
+        # In case there are subscriptions using a task, notify that it is done.
+        for sid, sub in self._subs.items():
+            if sub.buffer_queue is not None:
+                sub.buffer_queue.task_done()
+
         # Cleanup subscriptions
         self._subs.clear()
 
@@ -268,7 +273,7 @@ class Client():
             yield from self._flush_pending()
 
     @asyncio.coroutine
-    def subscribe(self, subject, queue="", cb=None, future=None, max_msgs=0, async=True):
+    def subscribe(self, subject, queue="", cb=None, future=None, max_msgs=0, async=True, buffer_queue=None):
         """
         Takes a subject string and optional queue string to send a SUB cmd,
         and a callback which to which messages (Msg) will be dispatched.
@@ -286,7 +291,8 @@ class Client():
                            cb=cb,
                            future=future,
                            max_msgs=max_msgs,
-                           async=async)
+                           async=async,
+                           buffer_queue=buffer_queue)
         self._subs[ssid] = sub
         yield from self._subscribe(sub, ssid)
         return ssid
@@ -300,6 +306,32 @@ class Client():
         kwargs["async"] = False
         sid = yield from self.subscribe(subject, **kwargs)
         return sid
+
+    @asyncio.coroutine
+    def subscribe_task(self, subject, maxsize=8192, **kwargs):
+        """
+        Creates task with buffered queue to which the incoming messages
+        will be put and then consumed by the callback.
+        """
+        buffer_queue = asyncio.Queue(maxsize=maxsize, loop=self._loop)
+        kwargs["buffer_queue"] = buffer_queue
+        ssid = yield from self.subscribe(subject, **kwargs)
+        sub = self._subs[ssid]
+
+        @asyncio.coroutine
+        def consumer(sub):
+            while True:
+                try: 
+                    msg = yield from sub.buffer_queue.get()
+                    if sub.async:
+                        self._loop.create_task(sub.cb(msg))
+                    else:
+                        yield from sub.cb(msg)
+                except asyncio.CancelledError:
+                    break
+
+        task = self._loop.create_task(consumer(sub))
+        return task
 
     @asyncio.coroutine
     def unsubscribe(self, ssid, max_msgs=0):
@@ -692,9 +724,15 @@ class Client():
         if sub.max_msgs > 0 and sub.received >= sub.max_msgs:
             # Enough messages so can throwaway subscription now.
             self._subs.pop(msg.sid, None)
+            return
 
-        # Asynchronous subscription
-        if sub.cb is not None:
+        # If the subscription is buffered then put the message
+        # in its queue and wait for the task to process it.
+        if sub.buffer_queue is not None:
+            yield from sub.buffer_queue.put(msg)
+
+        elif sub.cb is not None:
+            # Asynchronous subscription
             if sub.async:
                 # Dispatch each one of the callbacks using a task.
                 self._loop.create_task(sub.cb(msg))
@@ -702,6 +740,7 @@ class Client():
                 # Await for the result each callback at a time.
                 yield from sub.cb(msg)
         elif sub.future is not None and not sub.future.cancelled():
+            # Used for timed requests which expect a single response.
             sub.future.set_result(msg)
 
     def _process_disconnect(self):
@@ -915,13 +954,12 @@ class Client():
                 yield from asyncio.sleep(1, loop=self._loop)
                 end_out_messages = self.stats["out_msgs"]
                 end_in_messages = self.stats["in_msgs"]
-                print("{} -- delta out: {} -- delta in: {} -- queue size: {} -- queue bytes: {} -- msgs queue: {} -- Parser State -- {}".format(
+                print("{} -- delta out: {} -- delta in: {} -- queue size: {} -- queue bytes: {} -- Parser State -- {}".format(
                     time.time(),
                     end_out_messages - start_out_messages,
                     end_in_messages - start_in_messages,
                     self._buffer_queue.qsize(),
                     self._buffer_queue_size,
-                    self.msg_queue.qsize(),
                     self._ps.state,
                     ))
                 print(self.stats)
@@ -938,6 +976,7 @@ class Subscription():
                  future=None,
                  max_msgs=0,
                  async=True,
+                 buffer_queue=None,
                  ):
         self.subject   = subject
         self.queue     = queue
@@ -946,6 +985,7 @@ class Subscription():
         self.max_msgs  = max_msgs
         self.received  = 0
         self.async     = async
+        self.buffer_queue = buffer_queue
 
 class Srv():
     """

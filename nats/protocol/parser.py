@@ -200,7 +200,7 @@ class Parser(object):
                     self.scratch_size = 0
                     self.state = AWAITING_CONTROL_LINE
 
-                # Continue until we get the end of message.
+                # Continue until msg end or until we can process next command.
                 i += 1
 
 class ErrProtocol(Exception):
