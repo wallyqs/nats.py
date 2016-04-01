@@ -94,8 +94,6 @@ class Client():
         self._flusher_task = None
         self._buffer_queue = None
         self._buffer_queue_size = 0
-
-        self.msg_queue = None
         self.options = {}
         self.stats = {
             'in_msgs':    0,
@@ -205,15 +203,6 @@ class Client():
                 pass
             finally:
                 self._parsing_task.cancel()
-
-        if self._msg_task is not None and not self._msg_task.cancelled():
-            try:
-                if not self.msg_queue.empty():
-                    self.msg_queue.task_done()
-            except:
-                pass
-            finally:
-                self._msg_task.cancel()
 
         # In case there are subscriptions using a task, notify that it is done.
         for sid, sub in self._subs.items():
@@ -625,15 +614,6 @@ class Client():
                 finally:
                     self._parsing_task.cancel()
 
-            if self._msg_task is not None and not self._msg_task.cancelled():
-                try:
-                    if not self.msg_queue.empty():
-                        self.msg_queue.task_done()
-                except:
-                    pass
-                finally:
-                    self._msg_task.cancel()
-
             self._loop.create_task(self._attempt_reconnect())
         else:
             self._process_disconnect()
@@ -930,7 +910,12 @@ class Client():
             try:
                 # Start parsing as soon as we have something pending
                 # in the buffer queue.
+                # FIXME: Handle 'None' 
                 buf = yield from self._buffer_queue.get()
+                if buf is None:
+                    # FIXME: Process this as an error?
+                    break
+
                 self._buffer_queue_size -= len(buf)
                 yield from self._ps.parse(buf)
                 yield from asyncio.sleep(0, loop=self._loop)
@@ -944,15 +929,6 @@ class Client():
                         yield from self._ps.parse(chunk)
                         yield from asyncio.sleep(0, loop=self._loop)
 
-            except asyncio.CancelledError:
-                break
-
-    @asyncio.coroutine
-    def _msg_loop(self):
-        while True:
-            try:
-                msg = yield from self.msg_queue.get()
-                yield from self._process_msg(msg)
             except asyncio.CancelledError:
                 break
 
