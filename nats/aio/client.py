@@ -189,24 +189,39 @@ class Client():
             self._ping_interval_task.cancel()
 
         if self._flusher_task is not None and not self._flusher_task.cancelled():
-            if not self._flush_queue.empty():
-                self._flush_queue.task_done()
-            self._flusher_task.cancel()
+            try:
+                if not self._flush_queue.empty():
+                    self._flush_queue.task_done()
+            except:
+                pass
+            finally:
+                self._flusher_task.cancel()
 
         if self._parsing_task is not None and not self._parsing_task.cancelled():
-            if not self._buffer_queue.empty():
-                self._buffer_queue.task_done()
-            self._parsing_task.cancel()
+            try:
+                if not self._buffer_queue.empty():
+                    self._buffer_queue.task_done()
+            except:
+                pass
+            finally:
+                self._parsing_task.cancel()
 
         if self._msg_task is not None and not self._msg_task.cancelled():
-            if not self.msg_queue.empty():
-                self.msg_queue.task_done()
-            self._msg_task.cancel()
+            try:
+                if not self.msg_queue.empty():
+                    self.msg_queue.task_done()
+            except:
+                pass
+            finally:
+                self._msg_task.cancel()
 
         # In case there are subscriptions using a task, notify that it is done.
         for sid, sub in self._subs.items():
-            if sub.buffer_queue is not None:
-                sub.buffer_queue.task_done()
+            try:
+                if sub.buffer_queue is not None:
+                    sub.buffer_queue.task_done()
+            except:
+                continue
 
         # Cleanup subscriptions
         self._subs.clear()
@@ -593,19 +608,31 @@ class Client():
                 self._io_writer.close()
 
             if self._flush_queue is not None:
-                if not self._flush_queue.empty():
-                    self._flush_queue.task_done()
-                self._flusher_task.cancel()
+                try:
+                    if not self._flush_queue.empty():
+                        self._flush_queue.task_done()
+                except:
+                    pass
+                finally:
+                    self._flusher_task.cancel()
 
             if self._parsing_task is not None and not self._parsing_task.cancelled():
-                if not self._buffer_queue.empty():
-                    self._buffer_queue.task_done()
-                self._parsing_task.cancel()
+                try:
+                    if not self._buffer_queue.empty():
+                        self._buffer_queue.task_done()
+                except:
+                    pass
+                finally:
+                    self._parsing_task.cancel()
 
             if self._msg_task is not None and not self._msg_task.cancelled():
-                if not self.msg_queue.empty():
-                    self.msg_queue.task_done()
-                self._msg_task.cancel()
+                try:
+                    if not self.msg_queue.empty():
+                        self.msg_queue.task_done()
+                except:
+                    pass
+                finally:
+                    self._msg_task.cancel()
 
             self._loop.create_task(self._attempt_reconnect())
         else:
