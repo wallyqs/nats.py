@@ -62,7 +62,7 @@ def main(loop):
         nonlocal received
         received += 1
         if (received % HASH_MODULO) == 0:
-            sys.stdout.write("+")
+            sys.stdout.write("*")
             sys.stdout.flush()
 
     yield from nc.subscribe_sync(args.subject, cb=handler)

@@ -713,16 +713,16 @@ class Client():
             self._pings_outstanding -= 1
 
     @asyncio.coroutine
-    def _process_msg(self, msg):
+    def _process_msg(self, sid, subject, reply, data):
         """
         Process MSG sent by server.
         """
         self.stats['in_msgs']  += 1
-        self.stats['in_bytes'] += len(msg.data)
+        self.stats['in_bytes'] += len(data)
 
         sub = None
         try:
-            sub = self._subs[msg.sid]
+            sub = self._subs[sid]
         except KeyError:
             # Skip in case no subscription present.
             return
@@ -730,8 +730,10 @@ class Client():
         sub.received += 1
         if sub.max_msgs > 0 and sub.received >= sub.max_msgs:
             # Enough messages so can throwaway subscription now.
-            self._subs.pop(msg.sid, None)
+            self._subs.pop(sid, None)
             return
+
+        msg = Msg(subject=subject.decode(), reply=reply.decode(), data=data, sid=sid)
 
         # If the subscription is buffered then put the message
         # in its queue and wait for the task to process it.
@@ -951,6 +953,19 @@ class Client():
             except Exception as e:
                 print(e)
                 continue
+
+class Msg(object):
+
+    def __init__(self,
+                 subject='',
+                 reply='',
+                 data=b'',
+                 sid=0,
+                 ):
+        self.subject = subject
+        self.reply   = reply
+        self.data    = data
+        self.sid     = sid
 
 class Subscription():
 

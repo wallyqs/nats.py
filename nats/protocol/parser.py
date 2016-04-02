@@ -1,4 +1,4 @@
-# Copyright 2015 Apcera Inc. All rights reserved.
+# Copyright 2015-2016 Apcera Inc. All rights reserved.
 
 """
 NATS network protocol parser.
@@ -37,19 +37,6 @@ AWAITING_MSG_PAYLOAD    = 3
 AWAITING_MINUS_ERR_ARG  = 4
 AWAITING_MSG_END        = 5
 MAX_CONTROL_LINE_SIZE   = 1024
-
-class Msg(object):
-
-    def __init__(self,
-                 subject='',
-                 reply='',
-                 data=b'',
-                 sid=0,
-                 ):
-        self.subject = subject
-        self.reply   = reply
-        self.data    = data
-        self.sid     = sid
 
 class Parser(object):
 
@@ -183,12 +170,11 @@ class Parser(object):
                 self.scratch_size = 0
                 self.state = AWAITING_MSG_END
 
-                subject = self.msg_arg["subject"].decode()
+                subject = self.msg_arg["subject"]
                 sid     = self.msg_arg["sid"]
                 reply   = self.msg_arg["reply"]
                 payload = self.msg_buf
-                msg     = Msg(subject=subject, reply=reply, data=payload, sid=sid)
-                yield from self.nc._process_msg(msg)
+                yield from self.nc._process_msg(sid, subject, reply, payload)
 
             elif self.state == AWAITING_MSG_END:
                 c = memoryview(buf[i:i+1])
