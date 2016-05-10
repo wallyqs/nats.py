@@ -32,6 +32,7 @@ def main(loop):
     parser.add_argument('-n', '--count', default=DEFAULT_NUM_MSGS, type=int)
     parser.add_argument('-S', '--subject', default='test')
     parser.add_argument('-t', '--subtype', default='sync')
+    parser.add_argument('-c', '--cbtype', default='coro')
     parser.add_argument('--servers', default=[], action='append')
     args = parser.parse_args()
 
@@ -52,6 +53,18 @@ def main(loop):
     start = None
 
     @asyncio.coroutine
+    def coro_handler(msg):
+        nonlocal received
+        nonlocal start
+        received += 1
+
+        # Measure time from when we get the first message.
+        if received == 1:
+            start = time.monotonic()
+        if (received % HASH_MODULO) == 0:
+            sys.stdout.write("*")
+            sys.stdout.flush()
+
     def handler(msg):
         nonlocal received
         nonlocal start
@@ -64,12 +77,21 @@ def main(loop):
             sys.stdout.write("*")
             sys.stdout.flush()
 
-    if args.subtype == 'sync':
-        yield from nc.subscribe(args.subject, cb=handler)
-    elif args.subtype == 'async':
-        yield from nc.subscribe_async(args.subject, cb=handler)
+    cb = None
+    if args.cbtype == 'coro':
+        cb = coro_handler
+    elif args.cbtype == 'regular':
+        cb = handler
     else:
-        sys.stderr.write("ERROR: Unsupported type of subscription {0}".format(e))
+        sys.stderr.write("ERROR: Unsupported type of callback {0}".format(args.cbtype))
+        show_usage_and_die()
+
+    if args.subtype == 'sync':
+        yield from nc.subscribe(args.subject, cb=cb)
+    elif args.subtype == 'async':
+        yield from nc.subscribe_async(args.subject, cb=cb)
+    else:
+        sys.stderr.write("ERROR: Unsupported type of subscription {0}".format(args.cbtype))
         show_usage_and_die()
 
     print("Waiting for {} messages on [{}]...".format(args.count, args.subject))

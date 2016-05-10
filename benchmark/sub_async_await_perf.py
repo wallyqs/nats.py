@@ -70,7 +70,7 @@ async def main(loop):
     elif args.subtype == 'async':
         await nc.subscribe_async(args.subject, cb=handler)
     else:
-        sys.stderr.write("ERROR: Unsupported type of subscription {0}".format(e))
+        sys.stderr.write("ERROR: Unsupported type of subscription {0}".format(args.subtype))
         show_usage_and_die()
 
     print("Waiting for {} messages on [{}]...".format(args.count, args.subject))
