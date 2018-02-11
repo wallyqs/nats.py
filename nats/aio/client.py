@@ -208,9 +208,9 @@ class Client(object):
     @asyncio.coroutine
     def close(self):
         """
-        Closes the socket to which we are connected and
-        sets the client to be in the CLOSED state.
-        No further reconnections occur once reaching this point.
+        Closes the socket to which we are connected and sets the
+        client to be in the CLOSED state.  No further reconnections
+        occur once reaching this point.
         """
         yield from self._close(Client.CLOSED)
 
@@ -277,8 +277,8 @@ class Client(object):
     @asyncio.coroutine
     def publish_request(self, subject, reply, payload):
         """
-        Publishes a message tagging it with a reply subscription
-        which can be used by those receiving the message to respond.
+        Publishes a message tagging it with a reply subscription which
+        can be used by those receiving the message to respond.
 
            ->> PUB hello   _INBOX.2007314fe0fcb2cdc2a2914c1 5
            ->> MSG_PAYLOAD: world
@@ -313,9 +313,9 @@ class Client(object):
     @asyncio.coroutine
     def subscribe(self, subject, queue="", cb=None, future=None, max_msgs=0, is_async=False):
         """
-        Takes a subject string and optional queue string to send a SUB cmd,
-        and a callback which to which messages (Msg) will be dispatched to
-        be processed sequentially by default.
+        Takes a subject string and optional queue string to send a SUB
+        cmd, and a callback which to which messages (Msg) will be
+        dispatched to be processed sequentially by default.
         """
         if subject == "":
             raise ErrBadSubject
@@ -350,7 +350,8 @@ class Client(object):
     @asyncio.coroutine
     def subscribe_async(self, subject, **kwargs):
         """
-        Sets the subcription to use a task when processing dispatched messages.
+        Sets the subcription to use a task when processing dispatched
+        messages.
         """
         kwargs["is_async"] = True
         sid = yield from self.subscribe(subject, **kwargs)
@@ -360,7 +361,8 @@ class Client(object):
     def unsubscribe(self, ssid, max_msgs=0):
         """
         Takes a subscription sequence id and removes the subscription
-        from the client, optionally after receiving more than max_msgs.
+        from the client, optionally after receiving more than
+        max_msgs.
         """
         if self.is_closed:
             raise ErrConnectionClosed
@@ -393,9 +395,9 @@ class Client(object):
     @asyncio.coroutine
     def request(self, subject, payload, expected=1, cb=None):
         """
-        Implements the request/response pattern via pub/sub
-        using an ephemeral subscription which will be published
-        with customizable limited interest.
+        Implements the request/response pattern via pub/sub using an
+        ephemeral subscription which will be published with
+        customizable limited interest.
 
           ->> SUB _INBOX.2007314fe0fcb2cdc2a2914c1 90
           ->> UNSUB 90 1
@@ -413,10 +415,10 @@ class Client(object):
     @asyncio.coroutine
     def timed_request(self, subject, payload, timeout=0.5):
         """
-        Implements the request/response pattern via pub/sub
-        using an ephemeral subscription which will be published
-        with a limited interest of 1 reply returning the response
-        or raising a Timeout error.
+        Implements the request/response pattern via pub/sub using an
+        ephemeral subscription which will be published with a limited
+        interest of 1 reply returning the response or raising a
+        Timeout error.
 
           ->> SUB _INBOX.2007314fe0fcb2cdc2a2914c1 90
           ->> UNSUB 90 1
@@ -441,9 +443,10 @@ class Client(object):
     @asyncio.coroutine
     def auto_unsubscribe(self, sid, limit=1):
         """
-        Sends an UNSUB command to the server.  Unsubscribe is one of the basic building
-        blocks in order to be able to define request/response semantics via pub/sub
-        by announcing the server limited interest a priori.
+        Sends an UNSUB command to the server.  Unsubscribe is one of
+        the basic building blocks in order to be able to define
+        request/response semantics via pub/sub by announcing the
+        server limited interest a priori.
         """
         b_limit = b''
         if limit > 0:
@@ -456,11 +459,11 @@ class Client(object):
     @asyncio.coroutine
     def flush(self, timeout=60):
         """
-        Sends a pong to the server expecting a pong back ensuring
-        what we have written so far has made it to the server and
-        also enabling measuring of roundtrip time.
-        In case a pong is not returned within the allowed timeout,
-        then it will raise ErrTimeout.
+        Sends a pong to the server expecting a pong back ensuring what
+        we have written so far has made it to the server and also
+        enabling measuring of roundtrip time.  In case a pong is not
+        returned within the allowed timeout, then it will raise
+        ErrTimeout.
         """
         if timeout <= 0:
             raise ErrBadTimeout
@@ -501,7 +504,7 @@ class Client(object):
     @property
     def max_payload(self):
         """
-        Returns the max payload which we received from the servers INFO
+        Returns the max payload which we received from the servers INFO.
         """
         return self._max_payload
 
@@ -562,8 +565,8 @@ class Client(object):
     @asyncio.coroutine
     def _select_next_server(self):
         """
-        Looks up in the server pool for an available server
-        and attempts to connect.
+        Looks up in the server pool for an available server and
+        attempts to connect.
         """
         srv = None
         now = time.monotonic()
@@ -632,10 +635,10 @@ class Client(object):
 
     def _process_op_err(self, e):
         """
-        Process errors which occured while reading or parsing
-        the protocol. If allow_reconnect is enabled it will
-        try to switch the server to which it is currently connected
-        otherwise it will disconnect.
+        Process errors which occured while reading or parsing the
+        protocol. If allow_reconnect is enabled it will try to switch
+        the server to which it is currently connected otherwise it
+        will disconnect.
         """
         if self.is_connecting or self.is_closed or self.is_reconnecting:
             return
@@ -717,8 +720,8 @@ class Client(object):
 
     def _connect_command(self):
         '''
-        Generates a JSON string with the params to be used
-        when sending CONNECT to the server.
+        Generates a JSON string with the params to be used when
+        sending CONNECT to the server.
 
           ->> CONNECT {"lang": "python3"}
 
@@ -842,9 +845,9 @@ class Client(object):
     @asyncio.coroutine
     def _process_connect_init(self):
         """
-        Process INFO received from the server and CONNECT to the server
-        with authentication.  It is also responsible of setting up the
-        reading and ping interval tasks from the client.
+        Process INFO received from the server and CONNECT to the
+        server with authentication.  It is also responsible of setting
+        up the reading and ping interval tasks from the client.
         """
         self._status = Client.CONNECTING
 
@@ -977,10 +980,9 @@ class Client(object):
     @asyncio.coroutine
     def _read_loop(self):
         """
-        Coroutine which gathers bytes sent by the server
-        and feeds them to the protocol parser.
-        In case of error while reading, it will stop running
-        and its task has to be rescheduled.
+        Coroutine which gathers bytes sent by the server and feeds
+        them to the protocol parser.  In case of error while reading,
+        it will stop running and its task has to be rescheduled.
         """
         while True:
             try:
