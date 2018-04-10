@@ -171,8 +171,7 @@ class Client(object):
             'errors_received': 0,
         }
 
-    @asyncio.coroutine
-    def connect(self,
+    async def connect(self,
                 servers=["nats://127.0.0.1:4222"],
                 io_loop=None,
                 error_cb=None,
@@ -220,8 +219,8 @@ class Client(object):
 
         while True:
             try:
-                yield from self._select_next_server()
-                yield from self._process_connect_init()
+                await self._select_next_server()
+                await self._process_connect_init()
                 self._current_server.reconnects = 0
                 break
             except ErrNoServers as e:
@@ -233,27 +232,25 @@ class Client(object):
             except (OSError, NatsError) as e:
                 self._err = e
                 if self._error_cb is not None:
-                    yield from self._error_cb(e)
+                    await self._error_cb(e)
 
                 # Bail on first attempt if reconnecting is disallowed.
                 if not self.options["allow_reconnect"]:
                     raise e
 
-                yield from self._close(Client.DISCONNECTED, False)
+                await self._close(Client.DISCONNECTED, False)
                 self._current_server.last_attempt = time.monotonic()
                 self._current_server.reconnects += 1
 
-    @asyncio.coroutine
-    def close(self):
+    async def close(self):
         """
         Closes the socket to which we are connected and
         sets the client to be in the CLOSED state.
         No further reconnections occur once reaching this point.
         """
-        yield from self._close(Client.CLOSED)
+        await self._close(Client.CLOSED)
 
-    @asyncio.coroutine
-    def _close(self, status, do_cbs=True):
+    async def _close(self, status, do_cbs=True):
         if self.is_closed:
             self._status = status
             return
@@ -261,7 +258,7 @@ class Client(object):
 
         # Kick the flusher once again so it breaks
         # and avoid pending futures.
-        yield from self._flush_pending()
+        await self._flush_pending()
 
         if self._reading_task is not None and not self._reading_task.cancelled():
             self._reading_task.cancel()
@@ -280,7 +277,7 @@ class Client(object):
             self._io_writer.writelines(self._pending[:])
             self._pending = []
             self._pending_data_size = 0
-            yield from self._io_writer.drain()
+            await self._io_writer.drain()
 
         # Cleanup subscriptions since not reconnecting so no need
         # to replay the subscriptions anymore.
@@ -295,12 +292,11 @@ class Client(object):
 
         if do_cbs:
             if self._disconnected_cb is not None:
-                yield from self._disconnected_cb()
+                await self._disconnected_cb()
             if self._closed_cb is not None:
-                yield from self._closed_cb()
+                await self._closed_cb()
 
-    @asyncio.coroutine
-    def publish(self, subject, payload):
+    async def publish(self, subject, payload):
         """
         Sends a PUB command to the server on the specified subject.
 
@@ -314,10 +310,9 @@ class Client(object):
         payload_size = len(payload)
         if payload_size > self._max_payload:
             raise ErrMaxPayload
-        yield from self._publish(subject, _EMPTY_, payload, payload_size)
+        await self._publish(subject, _EMPTY_, payload, payload_size)
 
-    @asyncio.coroutine
-    def publish_request(self, subject, reply, payload):
+    async def publish_request(self, subject, reply, payload):
         """
         Publishes a message tagging it with a reply subscription
         which can be used by those receiving the message to respond.
@@ -332,10 +327,9 @@ class Client(object):
         payload_size = len(payload)
         if payload_size > self._max_payload:
             raise ErrMaxPayload
-        yield from self._publish(subject, reply.encode(), payload, payload_size)
+        await self._publish(subject, reply.encode(), payload, payload_size)
 
-    @asyncio.coroutine
-    def _publish(self, subject, reply, payload, payload_size):
+    async def _publish(self, subject, reply, payload, payload_size):
         """
         Sends PUB command to the NATS server.
         """
@@ -348,12 +342,11 @@ class Client(object):
         ), _SPC_, reply, _SPC_, payload_size_bytes, _CRLF_, payload, _CRLF_])
         self.stats['out_msgs'] += 1
         self.stats['out_bytes'] += payload_size
-        yield from self._send_command(pub_cmd)
+        await self._send_command(pub_cmd)
         if self._flush_queue.empty():
-            yield from self._flush_pending()
+            await self._flush_pending()
 
-    @asyncio.coroutine
-    def subscribe(self, subject,
+    async def subscribe(self, subject,
                   queue="",
                   cb=None,
                   future=None,
@@ -401,14 +394,13 @@ class Client(object):
             # instead of having subscription type hold over state of the conn.
             err_cb = self._error_cb
 
-            @asyncio.coroutine
-            def wait_for_msgs():
+            async def wait_for_msgs():
                 nonlocal sub
                 nonlocal err_cb
 
                 while True:
                     try:
-                        msg = yield from sub.pending_queue.get()
+                        msg = await sub.pending_queue.get()
                         sub.pending_size -= len(msg.data)
 
                         try:
@@ -421,7 +413,7 @@ class Client(object):
                                     # should be processed.
                                     self._loop.create_task(sub.coro(msg))
                                 else:
-                                    yield from sub.coro(msg)
+                                    await sub.coro(msg)
                             elif sub.cb is not None:
                                 if sub.is_async:
                                     raise NatsError(
@@ -437,7 +429,7 @@ class Client(object):
                             # All errors from calling a handler
                             # are async errors.
                             if err_cb is not None:
-                                yield from err_cb(e)
+                                await err_cb(e)
 
                     except asyncio.CancelledError:
                         break
@@ -456,11 +448,10 @@ class Client(object):
         self._ssid += 1
         ssid = self._ssid
         self._subs[ssid] = sub
-        yield from self._subscribe(sub, ssid)
+        await self._subscribe(sub, ssid)
         return ssid
 
-    @asyncio.coroutine
-    def subscribe_async(self, subject, **kwargs):
+    async def subscribe_async(self, subject, **kwargs):
         """
         Sets the subcription to use a task per message to be processed.
 
@@ -468,11 +459,10 @@ class Client(object):
           Will be removed 9.0.
         """
         kwargs["is_async"] = True
-        sid = yield from self.subscribe(subject, **kwargs)
+        sid = await self.subscribe(subject, **kwargs)
         return sid
 
-    @asyncio.coroutine
-    def unsubscribe(self, ssid, max_msgs=0):
+    async def unsubscribe(self, ssid, max_msgs=0):
         """
         Takes a subscription sequence id and removes the subscription
         from the client, optionally after receiving more than max_msgs.
@@ -500,17 +490,15 @@ class Client(object):
         # We will send these for all subs when we reconnect anyway,
         # so that we can suppress here.
         if not self.is_reconnecting:
-            yield from self.auto_unsubscribe(ssid, max_msgs)
+            await self.auto_unsubscribe(ssid, max_msgs)
 
-    @asyncio.coroutine
-    def _subscribe(self, sub, ssid):
+    async def _subscribe(self, sub, ssid):
         sub_cmd = b''.join([SUB_OP, _SPC_, sub.subject.encode(
         ), _SPC_, sub.queue.encode(), _SPC_, ("%d" % ssid).encode(), _CRLF_])
-        yield from self._send_command(sub_cmd)
-        yield from self._flush_pending()
+        await self._send_command(sub_cmd)
+        await self._flush_pending()
 
-    @asyncio.coroutine
-    def request(self, subject, payload, timeout=0.5, expected=1, cb=None):
+    async def request(self, subject, payload, timeout=0.5, expected=1, cb=None):
         """
         Implements the request/response pattern via pub/sub
         using a single wildcard subscription that handles
@@ -523,9 +511,9 @@ class Client(object):
             next_inbox.extend(self._nuid.next())
             inbox = next_inbox.decode()
 
-            sid = yield from self.subscribe(inbox, cb=cb)
-            yield from self.auto_unsubscribe(sid, expected)
-            yield from self.publish_request(subject, inbox, payload)
+            sid = await self.subscribe(inbox, cb=cb)
+            await self.auto_unsubscribe(sid, expected)
+            await self.publish_request(subject, inbox, payload)
             return sid
 
         if self._resp_sub_prefix is None:
@@ -548,12 +536,11 @@ class Client(object):
                 )
 
             # Single task for handling the requests
-            @asyncio.coroutine
-            def wait_for_msgs():
+            async def wait_for_msgs():
                 nonlocal sub
                 while True:
                     try:
-                        msg = yield from sub.pending_queue.get()
+                        msg = await sub.pending_queue.get()
                         token = msg.subject[INBOX_PREFIX_LEN:]
 
                         try:
@@ -580,7 +567,7 @@ class Client(object):
             self._ssid += 1
             ssid = self._ssid
             self._subs[ssid] = sub
-            yield from self._subscribe(sub, ssid)
+            await self._subscribe(sub, ssid)
 
         # Use a new NUID for the token inbox and then use the future.
         token = self._nuid.next()
@@ -588,18 +575,17 @@ class Client(object):
         inbox.extend(token)
         future = asyncio.Future(loop=self._loop)
         self._resp_map[token.decode()] = future
-        yield from self.publish_request(subject, inbox.decode(), payload)
+        await self.publish_request(subject, inbox.decode(), payload)
 
         # Wait for the response or give up on timeout.
         try:
-            msg = yield from asyncio.wait_for(future, timeout, loop=self._loop)
+            msg = await asyncio.wait_for(future, timeout, loop=self._loop)
             return msg
         except asyncio.TimeoutError:
             future.cancel()
             raise ErrTimeout
 
-    @asyncio.coroutine
-    def timed_request(self, subject, payload, timeout=0.5):
+    async def timed_request(self, subject, payload, timeout=0.5):
         """
         Implements the request/response pattern via pub/sub
         using an ephemeral subscription which will be published
@@ -618,19 +604,18 @@ class Client(object):
         inbox = next_inbox.decode()
 
         future = asyncio.Future(loop=self._loop)
-        sid = yield from self.subscribe(inbox, future=future, max_msgs=1)
-        yield from self.auto_unsubscribe(sid, 1)
-        yield from self.publish_request(subject, inbox, payload)
+        sid = await self.subscribe(inbox, future=future, max_msgs=1)
+        await self.auto_unsubscribe(sid, 1)
+        await self.publish_request(subject, inbox, payload)
 
         try:
-            msg = yield from asyncio.wait_for(future, timeout, loop=self._loop)
+            msg = await asyncio.wait_for(future, timeout, loop=self._loop)
             return msg
         except asyncio.TimeoutError:
             future.cancel()
             raise ErrTimeout
 
-    @asyncio.coroutine
-    def auto_unsubscribe(self, sid, limit=1):
+    async def auto_unsubscribe(self, sid, limit=1):
         """
         Sends an UNSUB command to the server.  Unsubscribe is one of the basic building
         blocks in order to be able to define request/response semantics via pub/sub
@@ -641,11 +626,10 @@ class Client(object):
             b_limit = ("%d" % limit).encode()
         b_sid = ("%d" % sid).encode()
         unsub_cmd = b''.join([UNSUB_OP, _SPC_, b_sid, _SPC_, b_limit, _CRLF_])
-        yield from self._send_command(unsub_cmd)
-        yield from self._flush_pending()
+        await self._send_command(unsub_cmd)
+        await self._flush_pending()
 
-    @asyncio.coroutine
-    def flush(self, timeout=60):
+    async def flush(self, timeout=60):
         """
         Sends a pong to the server expecting a pong back ensuring
         what we have written so far has made it to the server and
@@ -661,8 +645,8 @@ class Client(object):
 
         future = asyncio.Future(loop=self._loop)
         try:
-            yield from self._send_ping(future)
-            yield from asyncio.wait_for(future, timeout, loop=self._loop)
+            await self._send_ping(future)
+            await asyncio.wait_for(future, timeout, loop=self._loop)
         except asyncio.TimeoutError:
             future.cancel()
             raise ErrTimeout
@@ -723,21 +707,19 @@ class Client(object):
     def is_connecting(self):
         return self._status == Client.CONNECTING
 
-    @asyncio.coroutine
-    def _send_command(self, cmd, priority=False):
+    async def _send_command(self, cmd, priority=False):
         if priority:
             self._pending.insert(0, cmd)
         else:
             self._pending.append(cmd)
         self._pending_data_size += len(cmd)
         if self._pending_data_size > DEFAULT_PENDING_SIZE:
-            yield from self._flush_pending()
+            await self._flush_pending()
 
-    @asyncio.coroutine
-    def _flush_pending(self):
+    async def _flush_pending(self):
         try:
             # kick the flusher!
-            yield from self._flush_queue.put(None)
+            await self._flush_queue.put(None)
 
             if not self.is_connected:
                 return
@@ -750,8 +732,7 @@ class Client(object):
             uri = urlparse(server)
             self._server_pool.append(Srv(uri))
 
-    @asyncio.coroutine
-    def _select_next_server(self):
+    async def _select_next_server(self):
         """
         Looks up in the server pool for an available server
         and attempts to connect.
@@ -765,11 +746,11 @@ class Client(object):
                     continue
             if s.did_connect and now < s.last_attempt + self.options["reconnect_time_wait"]:
                 # Backoff connecting to server if we attempted recently
-                yield from asyncio.sleep(self.options["reconnect_time_wait"], loop=self._loop)
+                await asyncio.sleep(self.options["reconnect_time_wait"], loop=self._loop)
             try:
                 s.did_connect = True
                 s.last_attempt = time.monotonic()
-                r, w = yield from asyncio.open_connection(
+                r, w = await asyncio.open_connection(
                     s.uri.hostname,
                     s.uri.port,
                     loop=self._loop,
@@ -789,15 +770,14 @@ class Client(object):
             except Exception as e:
                 self._err = e
                 if self._error_cb is not None:
-                    yield from self._error_cb(e)
+                    await self._error_cb(e)
                 continue
 
         if srv is None:
             raise ErrNoServers
         self._current_server = srv
 
-    @asyncio.coroutine
-    def _process_err(self, err_msg):
+    async def _process_err(self, err_msg):
         """
         Processes the raw error message sent by the server
         and close connection with current server.
@@ -841,8 +821,7 @@ class Client(object):
             self._err = e
             self._loop.create_task(self._close(Client.CLOSED, True))
 
-    @asyncio.coroutine
-    def _attempt_reconnect(self):
+    async def _attempt_reconnect(self):
         if self._reading_task is not None and not self._reading_task.cancelled():
             self._reading_task.cancel()
 
@@ -857,7 +836,7 @@ class Client(object):
 
         self._err = None
         if self._disconnected_cb is not None:
-            yield from self._disconnected_cb()
+            await self._disconnected_cb()
 
         if self.is_closed:
             return
@@ -870,8 +849,8 @@ class Client(object):
 
         while True:
             try:
-                yield from self._select_next_server()
-                yield from self._process_connect_init()
+                await self._select_next_server()
+                await self._process_connect_init()
                 self.stats["reconnects"] += 1
                 self._current_server.reconnects = 0
 
@@ -880,28 +859,28 @@ class Client(object):
                     sub_cmd = b''.join([SUB_OP, _SPC_, sub.subject.encode(
                     ), _SPC_, sub.queue.encode(), _SPC_, ("%d" % ssid).encode(), _CRLF_])
                     self._io_writer.write(sub_cmd)
-                yield from self._io_writer.drain()
+                await self._io_writer.drain()
 
                 # Flush pending data before continuing in connected status.
                 # FIXME: Could use future here and wait for an error result
                 # to bail earlier in case there are errors in the connection.
-                yield from self._flush_pending()
+                await self._flush_pending()
                 self._status = Client.CONNECTED
-                yield from self.flush()
+                await self.flush()
                 if self._reconnected_cb is not None:
-                    yield from self._reconnected_cb()
+                    await self._reconnected_cb()
                 break
             except ErrNoServers as e:
                 if self.options["max_reconnect_attempts"] < 0:
                     # Never stop reconnecting
                     continue
                 self._err = e
-                yield from self.close()
+                await self.close()
                 break
             except (OSError, NatsError, ErrTimeout) as e:
                 self._err = e
                 if self._error_cb is not None:
-                    yield from self._error_cb(e)
+                    await self._error_cb(e)
                 self._status = Client.RECONNECTING
                 self._current_server.last_attempt = time.monotonic()
                 self._current_server.reconnects += 1
@@ -936,16 +915,14 @@ class Client(object):
         connect_opts = json.dumps(options, sort_keys=True)
         return b''.join([CONNECT_OP + _SPC_ + connect_opts.encode() + _CRLF_])
 
-    @asyncio.coroutine
-    def _process_ping(self):
+    async def _process_ping(self):
         """
         Process PING sent by server.
         """
-        yield from self._send_command(PONG)
-        yield from self._flush_pending()
+        await self._send_command(PONG)
+        await self._flush_pending()
 
-    @asyncio.coroutine
-    def _process_pong(self):
+    async def _process_pong(self):
         """
         Process PONG sent by server.
         """
@@ -955,8 +932,7 @@ class Client(object):
             self._pongs_received += 1
             self._pings_outstanding -= 1
 
-    @asyncio.coroutine
-    def _process_msg(self, sid, subject, reply, data):
+    async def _process_msg(self, sid, subject, reply, data):
         """
         Process MSG sent by server.
         """
@@ -994,13 +970,13 @@ class Client(object):
                 sub.pending_size -= payload_size
 
                 if self._error_cb is not None:
-                    yield from self._error_cb(
+                    await self._error_cb(
                         ErrSlowConsumer(subject=subject, sid=sid))
                 return
             sub.pending_queue.put_nowait(msg)
         except asyncio.QueueFull:
             if self._error_cb is not None:
-                yield from self._error_cb(
+                await self._error_cb(
                     ErrSlowConsumer(subject=subject, sid=sid))
 
     def _build_message(self, subject, reply, data):
@@ -1040,8 +1016,7 @@ class Client(object):
                 for srv in connect_urls:
                     self._server_pool.append(srv)
 
-    @asyncio.coroutine
-    def _process_connect_init(self):
+    async def _process_connect_init(self):
         """
         Process INFO received from the server and CONNECT to the server
         with authentication.  It is also responsible of setting up the
@@ -1050,7 +1025,7 @@ class Client(object):
         self._status = Client.CONNECTING
 
         # FIXME: Add readline timeout
-        info_line = yield from self._io_reader.readline()
+        info_line = await self._io_reader.readline()
         if INFO_OP not in info_line:
             raise NatsError("nats: empty response from server when expecting INFO message")
 
@@ -1078,10 +1053,10 @@ class Client(object):
                 # This shouldn't happen
                 raise NatsError('nats: unable to get socket')
 
-            yield from self._io_writer.drain()  # just in case something is left
+            await self._io_writer.drain()  # just in case something is left
 
             self._io_reader, self._io_writer = \
-                yield from asyncio.open_connection(
+                await asyncio.open_connection(
                     loop=self._loop,
                     limit=DEFAULT_BUFFER_SIZE,
                     sock=sock,
@@ -1096,19 +1071,19 @@ class Client(object):
         connect_cmd = self._connect_command()
         self._io_writer.write(connect_cmd)
         self._io_writer.write(PING_PROTO)
-        yield from self._io_writer.drain()
+        await self._io_writer.drain()
 
         # FIXME: Add readline timeout
-        next_op = yield from self._io_reader.readline()
+        next_op = await self._io_reader.readline()
         if self.options["verbose"] and OK_OP in next_op:
-            next_op = yield from self._io_reader.readline()
+            next_op = await self._io_reader.readline()
 
         if ERR_OP in next_op:
             err_line = next_op.decode()
             _, err_msg = err_line.split(" ", 1)
             # FIXME: Maybe handling could be more special here,
             # checking for ErrAuthorization for example.
-            # yield from self._process_err(err_msg)
+            # await self._process_err(err_msg)
             raise NatsError("nats: " + err_msg.rstrip('\r\n'))
 
         if PONG_PROTO in next_op:
@@ -1123,16 +1098,14 @@ class Client(object):
         # Task for kicking the flusher queue
         self._flusher_task = self._loop.create_task(self._flusher())
 
-    @asyncio.coroutine
-    def _send_ping(self, future=None):
+    async def _send_ping(self, future=None):
         if future is None:
             future = asyncio.Future(loop=self._loop)
         self._pongs.append(future)
         self._io_writer.write(PING_PROTO)
-        yield from self._flush_pending()
+        await self._flush_pending()
 
-    @asyncio.coroutine
-    def _flusher(self):
+    async def _flusher(self):
         """
         Coroutine which continuously tries to consume pending commands
         and then flushes them to the socket.
@@ -1142,25 +1115,24 @@ class Client(object):
                 break
 
             try:
-                yield from self._flush_queue.get()
+                await self._flush_queue.get()
 
                 if self._pending_data_size > 0:
                     self._io_writer.writelines(self._pending[:])
                     self._pending = []
                     self._pending_data_size = 0
-                    yield from self._io_writer.drain()
+                    await self._io_writer.drain()
             except OSError as e:
                 if self._error_cb is not None:
-                    yield from self._error_cb(e)
+                    await self._error_cb(e)
                 self._process_op_err(e)
                 break
             except asyncio.CancelledError:
                 break
 
-    @asyncio.coroutine
-    def _ping_interval(self):
+    async def _ping_interval(self):
         while True:
-            yield from asyncio.sleep(self.options["ping_interval"],
+            await asyncio.sleep(self.options["ping_interval"],
                                      loop=self._loop)
             if not self.is_connected:
                 continue
@@ -1169,14 +1141,13 @@ class Client(object):
                 if self._pings_outstanding > self.options["max_outstanding_pings"]:
                     self._process_op_err(ErrStaleConnection)
                     return
-                yield from self._send_ping()
+                await self._send_ping()
             except asyncio.CancelledError:
                 break
             # except asyncio.InvalidStateError:
             #     pass
 
-    @asyncio.coroutine
-    def _read_loop(self):
+    async def _read_loop(self):
         """
         Coroutine which gathers bytes sent by the server
         and feeds them to the protocol parser.
@@ -1190,12 +1161,12 @@ class Client(object):
                     break
                 if self.is_connected and self._io_reader.at_eof():
                     if self._error_cb is not None:
-                        yield from self._error_cb(ErrStaleConnection)
+                        await self._error_cb(ErrStaleConnection)
                     self._process_op_err(ErrStaleConnection)
                     break
 
-                b = yield from self._io_reader.read(DEFAULT_BUFFER_SIZE)
-                yield from self._ps.parse(b)
+                b = await self._io_reader.read(DEFAULT_BUFFER_SIZE)
+                await self._ps.parse(b)
             except ErrProtocol:
                 self._process_op_err(ErrProtocol)
                 break
