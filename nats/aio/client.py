@@ -1689,3 +1689,17 @@ class Client:
     async def __aexit__(self, *exc_info):
         """Close connection to NATS when used in a context manager"""
         await self._close(Client.CLOSED, do_cbs=True)
+
+    def jetstream(self):
+        js = JetStream(nc=self)
+        return js
+
+class JetStream(object):
+    def __init__(self, nc=None, prefix="$JS.API."):
+        self._prefix = prefix
+        self._nc = nc
+
+    async def account_info(self):
+        msg = await self._nc.request(self._prefix+"INFO", b'')
+        account_info = json.loads(msg.data)
+        return account_info

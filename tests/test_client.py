@@ -2098,3 +2098,8 @@ class ClientDrainTest(SingleServerTestCase):
                     reconnect_time_wait=0.2,
                     **{cb: f}
                 )
+
+if __name__ == '__main__':
+    import sys
+    runner = unittest.TextTestRunner(stream=sys.stdout)
+    unittest.main(verbosity=2, exit=False, testRunner=runner)
