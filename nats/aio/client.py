@@ -691,6 +691,9 @@ class Client:
         # Set the client_id back to None
         self._client_id = None
 
+    def new_inbox(self):
+        return new_inbox()
+
     async def drain(self):
         """
         Drain will put a connection into a drain state. All subscriptions will
@@ -1703,3 +1706,29 @@ class JetStream(object):
         msg = await self._nc.request(self._prefix+"INFO", b'')
         account_info = json.loads(msg.data)
         return account_info
+
+    async def add_stream(self,name=None):
+        #print(name)
+        #print("kirby")
+        cfg = {"name": name}
+        data = json.dumps(cfg)
+        msg = await self._nc.request(self._prefix+"STREAM.CREATE."+name,data.encode())
+        #print(msg)
+
+    async def add_consumer(self,stream_name=None, config={}):
+        #print("hagna")
+        cfg = {
+            "stream_name": stream_name,
+            "config": config
+            }
+
+        data=json.dumps(cfg)
+        #print(data)
+        if 'durable_name' not in config:
+            #print("wow it is ephemeral...")
+            msg = await self._nc.request(self._prefix+"CONSUMER.CREATE."+stream_name,data.encode())
+            #print(msg.data)
+        else:
+            #print("jitomate")
+            msg = await self._nc.request(self._prefix+"CONSUMER.DURABLE.CREATE."+stream_name+"."+config["durable_name"],data.encode())
+            #print(msg.data)
