@@ -25,7 +25,7 @@ class HeadersTest(SingleServerTestCase):
         await nc.publish(
             "foo", b'hello world', headers={
                 'foo': 'bar',
-                'hello': 'world'
+                'hello': 'world-1'
             }
         )
 
@@ -34,7 +34,7 @@ class HeadersTest(SingleServerTestCase):
         self.assertEqual(len(msg.headers), 2)
 
         self.assertEqual(msg.headers['foo'], 'bar')
-        self.assertEqual(msg.headers['hello'], 'world')
+        self.assertEqual(msg.headers['hello'], 'world-1')
 
         await nc.close()
 
@@ -233,6 +233,77 @@ class JetStreamTest(SingleJetStreamServerTestCase):
 
         await nc.close()
 
+    @async_test
+    async def test_push_durable_consumer(self):
+        nc = NATS()
+        await nc.connect()
+
+        js = nc.jetstream()
+
+        subject = "foo"
+        await js._jsm._add_stream(
+            config={
+                "name": "TEST",
+                "subjects": [subject]
+            }
+        )
+
+        for i in range(0, 10):
+            await nc.publish(subject, f'msg:{i}'.encode())
+        await nc.flush()
+
+        sub = await js.subscribe(subject, durable="dur")
+        msg = await sub.next_msg()
+        m = msg.metadata()
+        self.assertEqual(m.stream, "TEST")
+        self.assertEqual(m.num_pending, 9)
+        self.assertEqual(m.num_delivered, 1)
+        ackack = await msg.ack_sync()
+        self.assertTrue(ackack is not None)
+
+        msg = await sub.next_msg()
+        m = msg.metadata()
+        self.assertEqual(m.stream, "TEST")
+        self.assertEqual(m.num_pending, 8)
+        self.assertEqual(m.num_delivered, 1)
+        ackack = await msg.ack_sync()
+        self.assertTrue(ackack is not None)
+
+        await nc.close()
+
+    @async_test
+    async def test_start_sequence(self):
+        nc = NATS()
+        await nc.connect()
+
+        js = nc.jetstream()
+
+        subject = "foo"
+        await js._jsm._add_stream(
+            config={
+                "name": "TEST",
+                "subjects": [subject]
+            }
+        )
+
+        for i in range(0, 10):
+            await nc.publish(subject, f'msg:{i}'.encode())
+        await nc.flush()
+
+        with self.assertRaises(JetStreamAPIError):
+            await js.subscribe(subject, deliver_policy="all", start_sequence=3)
+
+        sub = await js.subscribe(subject, start_sequence=3)
+        msg = await sub.next_msg()
+        print(msg.data)
+        m = msg.metadata()
+        self.assertEqual(m.stream, "TEST")
+        self.assertEqual(m.num_pending, 9)
+        self.assertEqual(m.num_delivered, 1)
+        ackack = await msg.ack_sync()
+        self.assertTrue(ackack is not None)
+
+        await nc.close()
 
 if __name__ == '__main__':
     import sys
