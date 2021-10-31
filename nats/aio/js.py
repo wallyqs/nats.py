@@ -18,105 +18,22 @@ import time
 import nats.aio.client
 import nats.aio.errors
 
-LAST_CONSUMER_SEQ_HDR = "Nats-Last-Consumer"
-LAST_STREAM_SEQ_HDR = "Nats-Last-Stream"
-NO_MSGS_STATUS = "404"
-CTRL_MSG_STATUS = "100"
-DEFAULT_JS_API_PREFIX = "$JS.API"
-INBOX_PREFIX = bytearray(b'_INBOX.')
-
 class JetStream():
     """
     JetStream returns a context that can be used to produce and consume
     messages from NATS JetStream.
     """    
 
-    def __init__(self, conn=None, prefix=DEFAULT_JS_API_PREFIX):
+    def __init__(self, conn=None, prefix=_JS.DEFAULT_JS_API_PREFIX):
         self._prefix = prefix
         self._nc = conn
-        self._jsm = JetStream._JSM(conn, prefix)
-
-    async def subscribe(
-        self,
-        subject: str,
-        queue: str = "",
-        cb=None,
-        durable: str = None,
-        stream: str = None,
-        consumer: str = None,
-        ack_policy: str = None,
-        deliver_policy: str = None,
-        start_sequence: int = None,
-        start_time: int = None,
-        max_deliver: int = None,
-        replay_policy: str = None,
-        max_ack_pending: int = None,
-        ack_wait: int = None,
-    ):
-        """
-        subscribe returns a Subscription that will be delivered messages
-        from a JetStream push based consumer.
-        """
-        if stream is None:
-            stream = await self._jsm._lookup_stream_by_subject(subject)
-
-        # Lookup for the consumer based on the durable name in case.
-        found = False
-
-        if durable is not None:
-            cinfo = await self._jsm._consumer_info(stream, durable)
-            if 'error' in cinfo and cinfo['error']['code'] == 404:
-                found = False
-            else:
-                found = True
-
-        # Create the consumer if not present.
-        if not found:
-            deliver_policy = None
-
-            if start_sequence is not None:
-                deliver_policy = JetStream.DeliverByStart
-
-            inbox = nats.aio.client.INBOX_PREFIX[:]
-            inbox.extend(self._nc._nuid.next())
-
-            # FIXME: Should create the consumer first always, then register interest.
-            # This works better with new servers.
-            sub = await self._nc.subscribe(inbox.decode(), queue=queue, cb=cb)
-
-            if deliver_policy is None:
-                deliver_policy = JetStream.DeliverAll
-
-            try:
-                await self._jsm._create_consumer(
-                    stream,
-                    durable=durable,
-                    ack_policy=ack_policy,
-                    deliver_subject=inbox.decode(),
-                    deliver_policy=deliver_policy,
-                    opt_start_seq=start_sequence,
-                    # FIXME: Add more consumer options.
-                    )
-            except Exception as e:
-                print(e)
-
-            return sub
-        else:
-            print("TODO: Bind to found consumer")
+        self._jsm = JetStream._JS(conn, prefix)
 
     async def pull_subscribe(
         self,
         subject: str,
         durable: str,
         stream: str = None,
-        deliver_policy: str = None,
-        start_sequence: int = None,
-        start_time: int = None,
-        max_deliver: int = None,
-        replay_policy: str = None,
-        max_ack_pending: int = None,
-        ack_wait: int = None,
-        num_waiting: int = None
     ):
         """
         pull_subscribe returns a Subscription that can be delivered messages
@@ -125,83 +42,19 @@ class JetStream():
         In case 'stream' is passed, there will not be a lookup of the stream
         based on the subject.
         """
-
         if stream is None:
             stream = await self._jsm._lookup_stream_by_subject(subject)
 
         # Lookup for the consumer based on the durable name.
         cinfo = await self._jsm._consumer_info(stream, durable)
-        found = False
+        found = Falseg
         if 'error' in cinfo and cinfo['error']['code'] == 404:
             # {'code': 404, 'err_code': 10014, 'description': 'consumer not found'}
             found = False
         else:
             found = True
 
-        if not found:
-            # Create the consumer if not present.
-            await self._jsm._create_consumer(
-                stream,
-                durable=durable,
-                ack_policy=JetStream.AckExplicit,
-                deliver_policy=deliver_policy,
-                opt_start_seq=start_sequence,
-                opt_start_time=start_time,
-                max_deliver=max_deliver,
-                replay_policy=replay_policy,
-                max_ack_pending=max_ack_pending,
-                num_waiting=num_waiting
-            )
-
-        # Create per pull subscriber wildcard mux for Fetch(1) use case.
-        resp_sub_prefix = nats.aio.client.INBOX_PREFIX[:]
-        resp_sub_prefix.extend(self._nc._nuid.next())
-        resp_sub_prefix.extend(b'.')
-        resp_mux_subject = resp_sub_prefix[:]
-        resp_mux_subject.extend(b'*')
-
-        jsub = JetStream._Sub(self)
-        jsub._stream = stream
-        jsub._consumer = durable
-        jsub._rpre = resp_mux_subject[:len(resp_mux_subject) - 2]
-        jsub._freqs = asyncio.Queue()
-
-        sub = nats.aio.client.Subscription(self._nc)
-        sub._jsi = jsub
-
-        async def handle_fetch(msg):
-            future = await jsub._freqs.get()
-            if not future.cancelled():
-                future.set_result(msg)
-
-        psub = await self._nc.subscribe(
-            resp_mux_subject.decode(), cb=handle_fetch
-        )
-        sub._jsi.psub = psub
-
         return sub
-
-    ####################################
-    #                                  #
-    # JetStream Configuration Options  #
-    #                                  #
-    ####################################
-
-    # AckPolicy
-    AckExplicit = "explicit"
-    AckAll = "all"
-    AckNone = "none"
-
-    # DeliverPolicy
-    DeliverAll = "all"
-    DeliverLast = "lastt"
-    DeliverNew = "new"
-    DeliverByStart = "by_start_sequence"
-    DeliverByStartTime = "by_start_time"
-    
-    # ReplayPolicy
-    ReplayInstantPolicy = "instant"
-    ReplayOriginal = "original"
 
     class _Sub():
         def __init__(self, js=None):
@@ -264,7 +117,30 @@ class JetStream():
 
             return msgs
 
-    class _JSM():
+    class _JS():
+        LAST_CONSUMER_SEQ_HDR = "Nats-Last-Consumer"
+        LAST_STREAM_SEQ_HDR = "Nats-Last-Stream"
+        NO_MSGS_STATUS = "404"
+        CTRL_MSG_STATUS = "100"
+        DEFAULT_JS_API_PREFIX = "$JS.API"
+        INBOX_PREFIX = bytearray(b'_INBOX.')
+
+        # AckPolicy
+        AckExplicit = "explicit"
+        AckAll = "all"
+        AckNone = "none"
+
+        # DeliverPolicy
+        DeliverAll = "all"
+        DeliverLast = "lastt"
+        DeliverNew = "new"
+        DeliverByStart = "by_start_sequence"
+        DeliverByStartTime = "by_start_time"
+
+        # ReplayPolicy
+        ReplayInstantPolicy = "instant"
+        ReplayOriginal = "original"
+
         def __init__(self, conn=None, prefix=DEFAULT_JS_API_PREFIX):
             self._prefix = prefix
             self._nc = conn
