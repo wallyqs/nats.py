@@ -4,6 +4,7 @@ import json
 import ssl
 import time
 import unittest
+import datetime
 from unittest import mock
 import tempfile
 import shutil
@@ -12,33 +13,19 @@ import nats
 from nats.aio.client import Client as NATS
 from nats.aio.client import __version__
 from nats.aio.errors import *
+from nats.js.errors import *
 from tests.utils import *
 
-
-class JetStreamTest(SingleJetStreamServerTestCase):
-    @async_test
-    async def test_check_account_info(self):
-        nc = NATS()
-        await nc.connect()
-
-        js = nc.jetstream()
-        info = await js._jsm._account_info()
-        self.assertTrue(len(info["limits"]) > 0)
-
-        await nc.close()
+class PublishTest(SingleJetStreamServerTestCase):
 
     @async_test
-    async def test_add_stream(self):
+    async def test_publish_error(self):
         nc = NATS()
         await nc.connect()
-
         js = nc.jetstream()
+        await js.publish("foo", b'bar')
 
-        result = await js._jsm._add_stream(config={"name": "TEST"})
-        info = await js._jsm._account_info()
-        self.assertTrue(info['streams'] >= 1)
-
-        await nc.close()
+class PullSubscribeTest(SingleJetStreamServerTestCase):
 
     @async_test
     async def test_pull_subscribe_fetch_one(self):
@@ -46,6 +33,8 @@ class JetStreamTest(SingleJetStreamServerTestCase):
         await nc.connect()
 
         js = nc.jetstream()
+
+        # TODO: js.add_stream()
         await js._jsm._add_stream(
             config={
                 "name": "TEST",
@@ -53,204 +42,26 @@ class JetStreamTest(SingleJetStreamServerTestCase):
             }
         )
 
-        for i in range(0, 100):
-            await nc.publish("foo", f'msg:{i}'.encode())
+        # TODO: js.add_consumer()
+        await js._jsm._add_consumer(
+            stream="TEST",
+            durable="dur",
+            ack_policy="explicit"
+        )
+
+        ack = await js.publish("foo", f'Hello from NATS!'.encode())
 
         sub = await js.pull_subscribe("foo", "dur")
         msgs = await sub.fetch(1)
-        self.assertEqual(len(msgs), 1)
-
-        # Get the consumer info from the consumer.
-        result = await js._jsm._consumer_info(
-            stream="TEST",
-            consumer="dur",
-        )
-
-        # Have pulled only one message, inflight acks is 1.
-        self.assertEqual(result['num_ack_pending'], 1)
-        # Messages waiting to be consumed.
-        self.assertEqual(result['num_pending'], 99)
-
         for msg in msgs:
             await msg.ack()
 
-        result = await js._jsm._consumer_info(
-            stream="TEST",
-            consumer="dur",
-        )
-        self.assertEqual(result['num_ack_pending'], 0)
-        self.assertEqual(result['num_pending'], 99)
-
-        await nc.close()
-
-    @async_test
-    async def test_pull_subscribe_fetch_one_later(self):
-        nc = NATS()
-        await nc.connect()
-
-        js = nc.jetstream()
-        stream = "TEST"
-        subject = "foo"
-        durable = "dur"
-        await js._jsm._add_stream(
-            config={
-                "name": stream,
-                "subjects": [subject],
-            }
-        )
-
-        sub = await js.pull_subscribe(subject, durable)
-
-        with self.assertRaises(asyncio.TimeoutError):
-            msgs = await sub.fetch(1)
-            msg = msgs[0]
-            print(msg.headers)
-            print(type(msg.headers))
-            print(len(msg.headers))
-
-        for i in range(0, 10):
-            await nc.publish(subject, f'msg:{i}'.encode())
-
-        # Retry now that messages have been published.
-        msgs = await sub.fetch(1)
-        for msg in msgs:
-            await msg.ack()
-
-        result = await js._jsm._consumer_info(
-            stream=stream,
-            consumer=durable,
-        )
-        self.assertEqual(result['num_ack_pending'], 0)
-        self.assertEqual(result['num_pending'], 9)
-
-        await nc.close()
-
-    @async_test
-    async def test_push_ephemeral_consumer(self):
-        nc = NATS()
-        await nc.connect()
-
-        js = nc.jetstream()
-
-        subject = "foo"
-        await js._jsm._add_stream(
-            config={
-                "name": "TEST",
-                "subjects": [subject]
-            }
-        )
-
-        for i in range(0, 10):
-            await nc.publish(subject, f'msg:{i}'.encode())
-        await nc.flush()
-
-        sub = await js.subscribe(subject)
-        msg = await sub.next_msg()
-        m = msg.metadata()
-        self.assertEqual(m.stream, "TEST")
-        self.assertEqual(m.num_pending, 9)
-        self.assertEqual(m.num_delivered, 1)
-        ackack = await msg.ack_sync()
-        self.assertTrue(ackack is not None)
-
-        msg = await sub.next_msg()
-        m = msg.metadata()
-        self.assertEqual(m.stream, "TEST")
-        self.assertEqual(m.num_pending, 8)
-        self.assertEqual(m.num_delivered, 1)
-        ackack = await msg.ack_sync()
-        self.assertTrue(ackack is not None)
-
-        await nc.close()
-
-    @async_test
-    async def test_non_js_msg(self):
-        nc = NATS()
-        await nc.connect()
-
-        subject = "foo"
-        sub = await nc.subscribe(subject)
-        for i in range(0, 10):
-            await nc.publish(subject, f'msg:{i}'.encode())
-
-        msg = await sub.next_msg()
-        with self.assertRaises(ErrNotJSMessage):
-            msg.metadata()
-
-        with self.assertRaises(ErrNotJSMessage):
-            await msg.ack()
-
-        await nc.close()
-
-    @async_test
-    async def test_push_durable_consumer(self):
-        nc = NATS()
-        await nc.connect()
-
-        js = nc.jetstream()
-
-        subject = "foo"
-        await js._jsm._add_stream(
-            config={
-                "name": "TEST",
-                "subjects": [subject]
-            }
-        )
-
-        for i in range(0, 10):
-            await nc.publish(subject, f'msg:{i}'.encode())
-        await nc.flush()
-
-        sub = await js.subscribe(subject, durable="dur")
-        msg = await sub.next_msg()
-        m = msg.metadata()
-        self.assertEqual(m.stream, "TEST")
-        self.assertEqual(m.num_pending, 9)
-        self.assertEqual(m.num_delivered, 1)
-        ackack = await msg.ack_sync()
-        self.assertTrue(ackack is not None)
-
-        msg = await sub.next_msg()
-        m = msg.metadata()
-        self.assertEqual(m.stream, "TEST")
-        self.assertEqual(m.num_pending, 8)
-        self.assertEqual(m.num_delivered, 1)
-        ackack = await msg.ack_sync()
-        self.assertTrue(ackack is not None)
-
-        await nc.close()
-
-    @async_test
-    async def test_start_sequence(self):
-        nc = NATS()
-        await nc.connect()
-
-        js = nc.jetstream()
-
-        subject = "foo"
-        await js._jsm._add_stream(
-            config={
-                "name": "TEST",
-                "subjects": [subject]
-            }
-        )
-
-        for i in range(0, 10):
-            await nc.publish(subject, f'msg:{i}'.encode())
-        await nc.flush()
-
-        with self.assertRaises(JetStreamAPIError):
-            await js.subscribe(subject, deliver_policy="all", start_sequence=3)
-
-        sub = await js.subscribe(subject, start_sequence=3)
-        msg = await sub.next_msg()
-        print(msg.data)
-        m = msg.metadata()
-        self.assertEqual(m.stream, "TEST")
-        self.assertEqual(m.num_pending, 9)
-        self.assertEqual(m.num_delivered, 1)
-        ackack = await msg.ack_sync()
-        self.assertTrue(ackack is not None)
+        msg = msgs[0]
+        self.assertEqual(msg.metadata.sequence.stream, 1)
+        self.assertEqual(msg.metadata.sequence.consumer, 1)
+        self.assertTrue(datetime.datetime.now() > msg.metadata.timestamp)
+        self.assertEqual(msg.metadata.num_pending, 0)
+        self.assertEqual(msg.metadata.num_delivered, 1)
 
         await nc.close()
 

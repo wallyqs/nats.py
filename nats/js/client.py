@@ -1,4 +1,4 @@
-# Copyright 2016-2021 The NATS Authors
+# Copyright 2021 The NATS Authors
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -15,19 +15,52 @@
 import asyncio
 import json
 import time
-import nats.aio.client
 import nats.aio.errors
+from nats.js import api
+from typing import Any, Dict, List, Optional
 
-class JetStream():
+class JetStream:
     """
     JetStream returns a context that can be used to produce and consume
     messages from NATS JetStream.
     """    
 
-    def __init__(self, conn=None, prefix=_JS.DEFAULT_JS_API_PREFIX):
+    def __init__(
+        self,
+        conn=None,
+        prefix=api.DefaultPrefix,
+        domain=None,
+        timeout=5,
+        ):
         self._prefix = prefix
+        if domain is not None:
+            self._prefix = "$JS.f{domain}.API"
         self._nc = conn
+        self._timeout = timeout
+
+        # TODO: Change to proper JSM implementation.
         self._jsm = JetStream._JS(conn, prefix)
+
+    async def publish(
+        self,
+        subject: str,
+        payload: bytes = b'',
+        timeout: float = None,
+        stream: str = None,
+        ) -> api.PubAck:
+        """
+        publish emits a new message to JetStream.
+        """
+        if timeout is None:
+            timeout = self._timeout
+        print("sending thing")
+        
+        msg = await self._nc.request(subject, payload, timeout=timeout)
+
+        # TODO: Check possible failure responses.
+
+        data = json.loads(msg.data)
+        return api.PubAck(**data)
 
     async def pull_subscribe(
         self,
@@ -45,105 +78,103 @@ class JetStream():
         if stream is None:
             stream = await self._jsm._lookup_stream_by_subject(subject)
 
-        # Lookup for the consumer based on the durable name.
-        cinfo = await self._jsm._consumer_info(stream, durable)
-        found = Falseg
-        if 'error' in cinfo and cinfo['error']['code'] == 404:
-            # {'code': 404, 'err_code': 10014, 'description': 'consumer not found'}
-            found = False
-        else:
-            found = True
+        # FIXME: Make this inbox prefix customizable.
+        deliver = api.InboxPrefix[:]
+        deliver.extend(self._nc._nuid.next())
 
-        return sub
+        # FIXME: Add options to customize subscription.
+        consumer = durable
+        sub = await self._nc.subscribe(deliver)
+        return JetStream.PullSubscription(self, sub, stream, consumer, deliver)
 
-    class _Sub():
-        def __init__(self, js=None):
+    class PullSubscription:
+        """
+        PullSubscription is a subscription that can fetch messages.
+        """
+        def __init__(self, js, sub, stream, consumer, deliver):
+            # JS/JSM context
             self._js = js
             self._nc = js._nc
-            self._rpre = None
-            self._psub = None
-            self._freqs = None
-            self._stream = None
-            self._consumer = None
 
-        async def fetch(self, batch: int = 1, timeout: float = 5.0):
+            # NATS Subscription
+            self._sub = sub
+            self._stream = stream
+            self._consumer = consumer
             prefix = self._js._prefix
-            stream = self._stream
-            consumer = self._consumer
+            self._nms = f'{prefix}.CONSUMER.MSG.NEXT.{stream}.{consumer}'
+            self._deliver = deliver
+
+        async def fetch(self, batch: int = 1, timeout: int = 5):
+            # TODO: Check connection is not closed.
+            if batch < 1:
+                raise ValueError("nats: invalid batch size")
+            if timeout <= 0:
+                raise ValueError("nats: invalid fetch timeout")
 
             msgs = []
-
-            # Use async handler for single response.
+            expires = (timeout * 1_000_000_000) - 100_000
             if batch == 1:
-                # Setup inbox to wait for the response.
-                inbox = self._rpre[:]
-                inbox.extend(b'.')
-                inbox.extend(self._nc._nuid.next())
-                subject = f"{prefix}.CONSUMER.MSG.NEXT.{stream}.{consumer}"
-
-                # Publish the message and wait for the response.
-                msg = None
-                future = asyncio.Future()
-                await self._freqs.put(future)
-                req = json.dumps({"no_wait": True, "batch": 1})
-                await self._nc.publish(
-                    subject,
-                    req.encode(),
-                    reply=inbox.decode(),
-                )
-
-                try:
-                    msg = await asyncio.wait_for(future, timeout)
-                except asyncio.TimeoutError:
-                    # Cancel the future and try with longer request.
-                    future.cancel()
-
-                if msg is not None:
-                    if msg.headers is not None and msg.headers[
-                            nats.aio.client.STATUS_HDR] == NO_MSGS_STATUS:
-                        # Now retry with the old style request and set it
-                        # to expire 100ms before the timeout.
-                        expires = (timeout * 1_000_000_000) - 10_000_000
-                        req = json.dumps({"batch": 1, "expires": int(expires)})
-                        msg = await self._nc.request(
-                            subject,
-                            req.encode(),
-                            old_style=True,
-                        )
-                        _check_js_msg(msg)
-
+                msg = await self._fetch_one(batch, expires, timeout)
                 msgs.append(msg)
-                return msgs
-
+            else:
+                msgs = await self._fetch_n(batch, expires, timeout)
             return msgs
 
+        async def _fetch_one(self, batch, expires, timeout):
+            queue = self._sub._pending_queue
+
+            # Check the next message in case there are any.
+            if not queue.empty():
+                try:
+                    msg = queue.get_nowait()
+                    return msg
+                except:
+                    # Fallthrough to make request in case this fails.
+                    pass
+
+            # Make lingering request with expiration.
+            next_req = {}
+            next_req['batch'] = 1
+            next_req['expires'] = expires
+
+            # Make publish request and wait for response.
+            await self._nc.publish(
+                self._nms,
+                json.dumps(next_req).encode(),
+                self._deliver,
+                )
+
+            # Wait for the response.
+            fut = queue.get()
+            msg = await asyncio.wait_for(fut, timeout=timeout)
+
+            # Should have received at least a message at this point,
+            # if that is not the case then error already.
+            # TODO: Handle API errors and status messages.
+
+            return msg
+
+        async def _fetch_n(self, batch, expires, timeout):
+            # FIXME: Implement fetching more than one.
+            raise NotImplementedError
+
     class _JS():
-        LAST_CONSUMER_SEQ_HDR = "Nats-Last-Consumer"
-        LAST_STREAM_SEQ_HDR = "Nats-Last-Stream"
-        NO_MSGS_STATUS = "404"
-        CTRL_MSG_STATUS = "100"
-        DEFAULT_JS_API_PREFIX = "$JS.API"
-        INBOX_PREFIX = bytearray(b'_INBOX.')
-
-        # AckPolicy
-        AckExplicit = "explicit"
-        AckAll = "all"
-        AckNone = "none"
-
-        # DeliverPolicy
-        DeliverAll = "all"
-        DeliverLast = "lastt"
-        DeliverNew = "new"
-        DeliverByStart = "by_start_sequence"
-        DeliverByStartTime = "by_start_time"
-
-        # ReplayPolicy
-        ReplayInstantPolicy = "instant"
-        ReplayOriginal = "original"
-
-        def __init__(self, conn=None, prefix=DEFAULT_JS_API_PREFIX):
+        def is_status_msg(msg):
+            print("STATUS?", msg)
+        
+        def __init__(
+            self,
+            conn=None,
+            prefix=None,
+            stream=None,
+            consumer=None,
+            nms=None,
+            ):
             self._prefix = prefix
             self._nc = conn
+            self._stream = stream
+            self._consumer = consumer
+            self._nms = nms
 
         async def _account_info(self):
             msg = await self._nc.request(f"{self._prefix}.INFO")
@@ -173,7 +204,7 @@ class JetStream():
             result = json.loads(msg.data)
             return result
 
-        async def _create_consumer(
+        async def _add_consumer(
             self,
             stream: str = None,
             durable: str = None,
