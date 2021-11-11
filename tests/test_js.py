@@ -291,6 +291,38 @@ class JSMTest(SingleJetStreamServerTestCase):
         await nc.close()
 
 
+class QueueSubscribeTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_deliver_group(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        await js.add_stream(name="qsub", subjects=["quux"])
+
+        async def cb1(msg):
+            print(msg)
+            await msg.ack()
+
+        async def cb2(msg):
+            print(msg)
+            await msg.ack()
+
+        async def cb3(msg):
+            print(msg)
+            await msg.ack()
+
+        subs = []
+
+        sub1 = await js.subscribe("quux", "wg", cb=cb1)
+        sub2 = await js.subscribe("quux", "wg", cb=cb2)
+        sub3 = await js.subscribe("quux", "wg", cb=cb3)
+
+        subs.append(sub1)
+        subs.append(sub2)
+        subs.append(sub3)
+        print(subs)
+
+
 if __name__ == '__main__':
     import sys
     runner = unittest.TextTestRunner(stream=sys.stdout)

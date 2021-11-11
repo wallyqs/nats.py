@@ -1122,6 +1122,21 @@ class Client:
             future.cancel()
             raise ErrTimeout
 
+    def new_inbox(self) -> str:
+        """
+        new_inbox returns a unique inbox that can be used
+        for NATS requests or subscriptions::
+
+           # Create unique subscription to receive direct messages.
+           inbox = nc.new_inbox()
+           sub = nc.subscribe(inbox)
+           nc.publish('broadcast', b'', reply=inbox)
+           msg = sub.next_msg()
+        """
+        next_inbox = INBOX_PREFIX[:]
+        next_inbox.extend(self._nuid.next())
+        return next_inbox.decode()
+
     async def _request_old_style(self, subject, payload, timeout=0.5):
         """
         Implements the request/response pattern via pub/sub
@@ -1129,9 +1144,7 @@ class Client:
         with a limited interest of 1 reply returning the response
         or raising a Timeout error.
         """
-        next_inbox = INBOX_PREFIX[:]
-        next_inbox.extend(self._nuid.next())
-        inbox = next_inbox.decode()
+        inbox = self.new_inbox()
 
         future = asyncio.Future()
         sub = await self.subscribe(inbox, future=future, max_msgs=1)
