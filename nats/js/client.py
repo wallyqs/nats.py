@@ -17,6 +17,7 @@ import json
 import time
 import nats.errors
 import nats.js.errors
+from nats.aio.subscription import Subscription
 from nats.js.manager import JetStreamManager
 from nats.js import api
 from typing import Any, Dict, List, Optional
@@ -158,6 +159,7 @@ class JetStream:
             stream = await self._jsm.find_stream_name_by_subject(subject)
 
         deliver = None
+        consumer = None
 
         # If using a queue, that will be the consumer/durable name.
         if queue:
@@ -181,6 +183,7 @@ class JetStream:
                 cinfo = await self._jsm.consumer_info(stream, durable)
                 config = cinfo.config
                 consumerFound = True
+                consumer = durable
             except nats.js.errors.NotFoundError:
                 shouldCreate = True
                 consumerFound = False
@@ -235,7 +238,8 @@ class JetStream:
             # Auto created consumers use the filter subject.
             config.filter_subject = subject
 
-            await self._jsm.add_consumer(stream, config=config)
+            cinfo = await self._jsm.add_consumer(stream, config=config)
+            consumer = cinfo.name
 
         # By default, async subscribers wrap the original callback and
         # auto ack the messages as they are delivered.
@@ -248,11 +252,10 @@ class JetStream:
 
             cb = new_cb
 
-        # TODO: Change into PushSubscription after refactoring types.
         sub = await self._nc.subscribe(
             config.deliver_subject, config.deliver_group, cb=cb
         )
-        return sub
+        return JetStream.PushSubscription(self, sub, stream, consumer)
 
     async def pull_subscribe(
         self,
@@ -305,6 +308,40 @@ class JetStream:
             return True
         else:
             return False
+
+    class PushSubscription(Subscription):
+        """
+        PushSubscription is a subscription that is delivered messages.
+        """
+        def __init__(self, js, sub, stream, consumer):
+            self._js = js
+            self._stream = stream
+            self._consumer = consumer
+
+            self._conn = sub._conn
+            self._id = sub._id
+            self._subject = sub._subject
+            self._queue = sub._queue
+            self._max_msgs = sub._max_msgs
+            self._received = sub._received
+            self._cb = sub._cb
+            self._future = sub._future
+            self._closed = sub._closed
+            
+            # Per subscription message processor.
+            self._pending_msgs_limit = sub._pending_msgs_limit
+            self._pending_bytes_limit = sub._pending_bytes_limit
+            self._pending_queue = sub._pending_queue
+            self._pending_size = sub._pending_size
+            self._wait_for_msgs_task = sub._wait_for_msgs_task
+            self._message_iterator = sub._message_iterator
+
+        async def consumer_info(self):
+            """
+            consumer_info gets the current info of the consumer from this subscription.
+            """
+            info = await self._js._jsm.consumer_info(self._stream, self._consumer)
+            return info
 
     class PullSubscription:
         """
