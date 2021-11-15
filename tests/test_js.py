@@ -419,6 +419,35 @@ class SubscribeTest(SingleJetStreamServerTestCase):
 
         await nc.close()
 
+    @async_test
+    async def test_ephemeral_subscribe(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        subject = "ephemeral"
+        await js.add_stream(name=subject, subjects=[subject])
+
+        for i in range(10):
+            await js.publish(subject, f'Hello World {i}'.encode())
+
+        # First subscriber will create.
+        sub1 = await js.subscribe(subject)
+        sub2 = await js.subscribe(subject)
+
+        print(sub1)
+        print(sub2)
+
+        recvd = 0
+        async for msg in sub1.messages:
+            recvd += 1
+            await msg.ack_sync()
+
+            if recvd == 10:
+                break
+
+        # Both should be able to process the messages at their own pace.
+        self.assertEqual(sub1.pending_msgs, 0)
+        self.assertEqual(sub2.pending_msgs, 10)
 
 if __name__ == '__main__':
     import sys

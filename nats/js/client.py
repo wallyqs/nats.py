@@ -139,8 +139,12 @@ class JetStream:
                 await js.subscribe('hello', cb=greetings)
 
                 # Durable Async Subscribe
-                # NOTE: Only one subscription can be bound to a durable name.
+                # NOTE: Only one subscription can be bound to a durable name. It also auto acks by default.
                 await js.subscribe('hello', cb=greetings, durable='foo')
+
+                # Durable Sync Subscribe
+                # NOTE: Sync subscribers do not auto ack.
+                await js.subscribe('hello', durable='bar')
 
                 # Queue Async Subscribe
                 # NOTE: Here 'workers' becomes deliver_group, durable name and queue name.
@@ -164,11 +168,24 @@ class JetStream:
             else:
                 durable = queue
 
-        try:
-            # TODO: Detect configuration drift with the consumer.
-            cinfo = await self._jsm.consumer_info(stream, durable)
-            config = cinfo.config
+        cinfo = None
+        consumerFound = False
+        shouldCreate = False
 
+        # Ephemeral subscribe always has to be auto created.
+        if not durable:
+            shouldCreate = True
+        else:
+            try:
+                # TODO: Detect configuration drift with any present durable consumer.
+                cinfo = await self._jsm.consumer_info(stream, durable)
+                config = cinfo.config
+                consumerFound = True
+            except nats.js.errors.NotFoundError:
+                shouldCreate = True
+                consumerFound = False
+
+        if consumerFound:
             # At this point, we know the user wants push mode, and the JS consumer is
             # really push mode.
             if not config.deliver_group:
@@ -195,9 +212,8 @@ class JetStream:
                     raise nats.js.errors.Error(
                         f"cannot create a queue subscription {queue} for a consumer with a deliver group {config.deliver_group}"
                     )
-
-        except nats.js.errors.NotFoundError:
-            # If not found then attempt to create a consumer.
+        elif shouldCreate: # except nats.js.errors.NotFoundError:
+            # Auto-create consumer if none found.
             if config is None:
                 # Defaults
                 config = api.ConsumerConfig(
@@ -221,6 +237,8 @@ class JetStream:
 
             await self._jsm.add_consumer(stream, config=config)
 
+        # By default, async subscribers wrap the original callback and
+        # auto ack the messages as they are delivered.
         if cb and not manual_ack:
             ocb = cb
 
