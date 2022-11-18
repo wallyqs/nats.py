@@ -584,7 +584,10 @@ class ClientTest(SingleServerTestCase):
 
     @async_test
     async def test_subscribe_next_msg(self):
-        nc = await nats.connect()
+        async def err_cb(err):
+            print("ERROR: ", err)
+
+        nc = await nats.connect(error_cb=err_cb)
 
         # Make subscription that only expects a couple of messages.
         sub = await nc.subscribe('tests.>')
@@ -627,11 +630,22 @@ class ClientTest(SingleServerTestCase):
         # Wait for another message, the future should not linger
         # after the cancellation.
         # FIXME: Flapping...
-        # future = sub.next_msg(timeout=None)
 
-        await nc.close()
+        async def _next_msg():
+            await asyncio.sleep(0.5)
+            try:
+                future = await sub.next_msg(timeout=None)
+            except Exception as e:
+                print(":::::::", e)
 
-        # await future
+        try:
+            asyncio.create_task(_next_msg())
+            sub._pending_queue.task_done()
+            await nc.close()
+            # res = await future
+            # print(res)
+        except Exception as e:
+            print(e)
 
     @async_test
     async def test_subscribe_next_msg_custom_limits(self):

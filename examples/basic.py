@@ -10,6 +10,12 @@ async def main():
     arguments, _ = args.get_args("Run a basic example.")
     nc = await nats.connect(arguments.servers)
 
+    print("-------------------")
+    print(nc.connected_url, type(nc.connected_url))
+    print(nc.servers)
+    print(nc.discovered_servers)
+    print("-------------------")
+
     async def message_handler(msg):
         subject = msg.subject
         reply = msg.reply

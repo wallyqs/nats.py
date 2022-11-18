@@ -172,10 +172,11 @@ class Subscription:
             task.cancel()
             raise errors.TimeoutError
         except asyncio.CancelledError:
+            print("!!!!!!!!!!!")
             future.cancel()
             task.cancel()
             # Call timeout otherwise would get an empty message.
-            raise errors.TimeoutError
+            raise # errors.TimeoutError
 
     def _start(self, error_cb):
         """
