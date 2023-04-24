@@ -821,11 +821,14 @@ class Client:
             raise errors.BadSubjectError
 
         pub_cmd = None
+        headers = {"":""}
+        print("----------------------")
         if headers is None:
             pub_cmd = prot_command.pub_cmd(subject, reply, payload)
         else:
             hdr = bytearray()
             hdr.extend(NATS_HDR_LINE)
+            hdr.extend(b' ')
             hdr.extend(_CRLF_)
             for k, v in headers.items():
                 key = k.strip()
