@@ -50,6 +50,7 @@ from nats.protocol import command as prot_command
 from nats.protocol.parser import (
     AUTHORIZATION_VIOLATION,
     PERMISSIONS_ERR,
+    PING,
     PONG,
     STALE_CONNECTION,
     Parser,
@@ -1703,7 +1704,7 @@ class Client:
 
         # Process flow control messages in case of using a JetStream context.
         ctrl_msg = None
-        fcReply = None
+        fc_reply = None
         if sub._jsi:
             #########################################
             #                                       #
@@ -1711,6 +1712,7 @@ class Client:
             #                                       #
             #########################################
             jsi = sub._jsi
+            jsi._active = True
             if hdr:
                 ctrl_msg = self._is_control_message(data, hdr)
 
@@ -1718,7 +1720,8 @@ class Client:
                 # so, the value is the FC reply to send a nil message to.
                 # We will send it at the end of this function.
                 if ctrl_msg and ctrl_msg.startswith("Idle"):
-                    fcReply = hdr.get(nats.js.api.Header.CONSUMER_STALLED)
+                    fc_reply = hdr.get(nats.js.api.Header.CONSUMER_STALLED)
+                    print("IDLE22222222222222222222222222222222222", fc_reply)
 
             # OrderedConsumer: checkOrderedMsgs
             if not ctrl_msg and jsi._ordered and msg.reply:
@@ -1754,6 +1757,7 @@ class Client:
                 sub._pending_size += payload_size
                 # allow setting pending_bytes_limit to 0 to disable
                 if sub._pending_bytes_limit > 0 and sub._pending_size >= sub._pending_bytes_limit:
+                    print("FULL HERE?????????", sub._pending_bytes_limit, sub._pending_size)
                     # Subtract the bytes since the message will be thrown away
                     # so it would not be pending data.
                     sub._pending_size -= payload_size
@@ -1769,6 +1773,7 @@ class Client:
                     return
                 sub._pending_queue.put_nowait(msg)
             except asyncio.QueueFull:
+                print("FULL!!!!!!", sub._pending_size, sub._pending_queue.qsize())
                 sub._pending_size -= len(msg.data)
                 await self._error_cb(
                     errors.SlowConsumerError(
@@ -1781,22 +1786,27 @@ class Client:
             if sub._jsi:
                 sub._jsi.track_sequences(msg.reply)
         elif ctrl_msg.startswith("Flow") and msg.reply and sub._jsi:
+            print("FLOW CONTROL MESSAGE!!!", msg.reply, sub._pending_size, sub._pending_queue.qsize())
             # This is a flow control message.
             # We will schedule the send of the FC reply once we have delivered the
             # DATA message that was received before this flow control message, which
             # has sequence `jsi.fciseq`. However, it is possible that this message
             # has already been delivered, in that case, we need to send the FC reply now.
-            if sub.delivered >= sub._jsi._fciseq:
-                fcReply = msg.reply
+            if sub._jsi.get_js_delivered() >= sub._jsi._fciseq:
+                fc_reply = msg.reply
+                print("----------- INSTANT FLOW CONTROL RESPONSE")
             else:
                 # Schedule a reply after the previous message is delivered.
                 sub._jsi.schedule_flow_control_response(msg.reply)
+                print("----------- DELAYED FLOW CONTROL RESPONSE", fc_reply)
 
         # Handle flow control response.
-        if fcReply:
-            await self.publish(fcReply)
+        if fc_reply:
+            await self.publish(fc_reply)
+            print("RESPONDING")
 
         if ctrl_msg and not msg.reply and ctrl_msg.startswith("Idle"):
+            print("IDLE1111111111!!!!!!!!!!", fc_reply)
             if sub._jsi:
                 await sub._jsi.check_for_sequence_mismatch(msg)
 
@@ -2008,8 +2018,9 @@ class Client:
         if future is None:
             future = asyncio.Future()
         self._pongs.append(future)
-        self._transport.write(PING_PROTO)
-        self._pending_data_size += len(PING_PROTO)
+        # self._transport.write(PING_PROTO)
+        # self._pending_data_size += len(PING_PROTO)
+        await self._send_command(PING_PROTO)
         await self._flush_pending()
 
     async def _flusher(self) -> None:

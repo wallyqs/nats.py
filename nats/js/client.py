@@ -334,8 +334,7 @@ class JetStreamContext(JetStreamManager):
         #
         # In case ack policy is none then we also do not require to ack.
         #
-        if cb and (not manual_ack) and (config.ack_policy
-                                        is not api.AckPolicy.NONE):
+        if cb and (not manual_ack) and (config.ack_policy is not api.AckPolicy.NONE):
             cb = self._auto_ack_callback(cb)
         if config.deliver_subject is None:
             raise TypeError("config.deliver_subject is required")
@@ -358,6 +357,13 @@ class JetStreamContext(JetStreamManager):
             sub=sub,
             ccreq=config,
         )
+
+        if config.idle_heartbeat:
+            sub._jsi._hbtask = asyncio.create_task(sub._jsi.activity_check())
+
+        if ordered_consumer:
+            sub._jsi._fctask = asyncio.create_task(sub._jsi.check_flow_control_response())
+
         return psub
 
     @staticmethod
@@ -533,21 +539,77 @@ class JetStreamContext(JetStreamManager):
             self._sub = sub
             self._ccreq = ccreq
 
+            # Heartbeat
+            self._hbtask = None
+            self._hbi = None
+            if ccreq and ccreq.idle_heartbeat:
+                self._hbi = ccreq.idle_heartbeat
+
+            # Ordered Consumer implementation.
             self._dseq = 1
             self._sseq = 0
             self._cmeta: Optional[str] = None
+            self._fcr: Optional[str] = None
+            self._fcd = 0
             self._fciseq = 0
-            self._active: Optional[bool] = None
+            self._active: Optional[bool] = True
+            self._fctask = None
 
         def track_sequences(self, reply: str) -> None:
             self._fciseq += 1
             self._cmeta = reply
 
         def schedule_flow_control_response(self, reply: str) -> None:
-            pass
+            self._active = True
+            self._fcr = reply
+            self._fcd = self._fciseq
 
-        async def check_for_sequence_mismatch(self,
-                                              msg: Msg) -> Optional[bool]:
+        def get_js_delivered(self):
+            if self._sub._cb:
+                return self._sub.delivered
+            return self._fciseq - self._sub._pending_queue.qsize()
+
+        async def activity_check(self):
+            # Can at most miss two heartbeats.
+            hbc_threshold = 2
+            while True:
+                # Wait for all idle heartbeats to be received,
+                # one of them would have toggled the state of the 
+                # consumer back to being active.
+                await asyncio.sleep(self._hbi*hbc_threshold)
+                active = self._active
+                self._active = False
+
+                print(time.time(), "                          ACTIVITY_CHECK", active, "->", self._active, self._sub.delivered, self._fciseq, self._sub._pending_queue.qsize())
+                if not active:
+                    if self._ordered:
+                        print("RECREATING!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!1!!!")
+                        did_reset = await self.reset_ordered_consumer(
+                            self._sseq + 1
+                        )
+
+        async def check_flow_control_response(self):
+            while True:
+                # print("Sleeping...", self._sub.delivered, self._fciseq, self._sub._pending_queue.qsize())
+                # if self._sub.delivered >= self._fcd:
+                if (self._fciseq - self._psub._pending_queue.qsize()) >= self._fcd:
+                    print("!!!!!!!!!!!!!!!!!!! NOT Sleeping...", self._fcd, self._sub.delivered, self._fciseq, self._sub._pending_queue.qsize(), self._psub._pending_queue.qsize())
+                    fc_reply = self._fcr
+                    try:
+                        if fc_reply:
+                            # print("FLOW SIGNAL!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!______________________")
+                            await self._conn.publish(fc_reply)
+                            # FIXME: Adding a flush here breaks the ordered consumer somehow.
+                            # await self._conn.flush(0.01)
+                            print("------------------------------Flushed!!!!!!!!")
+                    except Exception as e:
+                        print("              EEEEEEEEEEEEEEE", e)
+                        pass
+                    self._fcr = None
+                    self._fcd = 0
+                await asyncio.sleep(0.25)
+
+        async def check_for_sequence_mismatch(self, msg: Msg) -> Optional[bool]:
             self._active = True
             if not self._cmeta:
                 return None
@@ -661,8 +723,8 @@ class JetStreamContext(JetStreamManager):
             # Per subscription message processor.
             self._pending_msgs_limit = sub._pending_msgs_limit
             self._pending_bytes_limit = sub._pending_bytes_limit
+            # self._pending_bytes = sub._pending_bytes
             self._pending_queue = sub._pending_queue
-            self._pending_size = sub._pending_size
             self._wait_for_msgs_task = sub._wait_for_msgs_task
             self._message_iterator = sub._message_iterator
             self._pending_next_msgs_calls = sub._pending_next_msgs_calls
@@ -683,6 +745,43 @@ class JetStreamContext(JetStreamManager):
             Number of delivered messages to this subscription so far.
             """
             return self._sub._received
+
+        @delivered.setter
+        def delivered(self, value):
+            self._sub._received = value
+
+        @property
+        def _pending_size(self):
+            return self._sub._pending_size
+
+        @_pending_size.setter
+        def _pending_size(self, value):
+            self._sub._pending_size = value
+
+        async def next_msg(self, timeout: Optional[float] = 1.0) -> Msg:
+            """
+            :params timeout: Time in seconds to wait for next message before timing out.
+            :raises nats.errors.TimeoutError:
+
+            next_msg can be used to retrieve the next message from a stream of messages using
+            await syntax, this only works when not passing a callback on `subscribe`::
+            """
+            # self._pending_size = self._sub._pending_size
+            msg = await super().next_msg(timeout)
+            # print(msg)
+            # self._pending_size -= len(msg.data)
+            # self._sub._pending_size -= len(msg.data)
+            # self._pending_size = self._sub._pending_size
+            # print(">>>>>>>>>>>>>>>>>.", self._sub._pending_size)
+            if self._sub and self._sub._jsi:
+                self._sub._jsi._active = True
+                if self._sub._jsi.get_js_delivered() >= self._sub._jsi._fciseq:
+                    print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~", self._sub._jsi._fcr)
+                    fc_reply = self._sub._jsi._fcr
+                    if fc_reply:
+                        await self._conn.publish(fc_reply)
+                        self._sub._jsi._fcr = None
+            return msg
 
     class PullSubscription:
         """

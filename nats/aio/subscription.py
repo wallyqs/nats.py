@@ -187,6 +187,7 @@ class Subscription:
             )
             self._pending_next_msgs_calls[task_name] = future
             msg = await future
+            # print("A:::::::;", msg)
         except asyncio.TimeoutError:
             if self._conn.is_closed:
                 raise errors.ConnectionClosedError
@@ -196,7 +197,18 @@ class Subscription:
                 raise errors.ConnectionClosedError
             raise
         else:
+            # if self._sub and self._sub._jsi:
+            #     try:
+            #         # self._sub._jsi.active = True
+            #         # if self._sub._jsi.get_js_delivered() >= self._sub._jsi._fcd:
+            #         #     reply = self._sub._jsi._fcr
+            #         #     print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~", reply)
+            #         #     # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+            #     except:
+            #         pass
+            # print("B:::::::;", msg.reply)
             self._pending_size -= len(msg.data)
+            # print("PENDING:::::::::", self._pending_size, self._pending_queue.qsize())
             # For sync subscriptions we will consider a message
             # to be done once it has been consumed by the client
             # regardless of whether it has been processed.
