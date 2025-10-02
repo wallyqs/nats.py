@@ -232,23 +232,33 @@ def run_publish_benchmark(args) -> List[BenchResult]:
     overall_msgs_per_sec = total_msgs_sent / total_time if total_time > 0 else 0
     overall_bytes_per_sec = total_bytes_sent / total_time if total_time > 0 else 0
     
+    # Sort results by client_id for consistent ordering
+    results.sort(key=lambda x: x.client_id)
+    
     # Per-client statistics
     client_rates = [r.msgs_per_sec for r in results if r.msgs_per_sec > 0]
     
-    print(f"\nBenchmark Results:")
-    print(f"  Total time: {total_time:.2f}s")
-    print(f"  Total messages: {format_number(total_msgs_sent)}")
-    print(f"  Total bytes: {format_bytes(total_bytes_sent)}")
-    print(f"  Errors: {format_number(total_errors)}")
-    print(f"  Overall rate: {overall_msgs_per_sec:,.0f} msgs/s, {format_bytes(int(overall_bytes_per_sec))}/s")
+    print(f"\nPub stats: {overall_msgs_per_sec:,.0f} msgs/sec ~ {format_bytes(int(overall_bytes_per_sec))}/sec")
     
-    if client_rates:
-        print(f"  Per-client stats:")
-        print(f"    Min rate: {min(client_rates):,.0f} msgs/s")
-        print(f"    Max rate: {max(client_rates):,.0f} msgs/s")
-        print(f"    Avg rate: {statistics.mean(client_rates):,.0f} msgs/s")
-        if len(client_rates) > 1:
-            print(f"    Std dev: {statistics.stdev(client_rates):,.0f} msgs/s")
+    # Print per-connection stats
+    for result in results:
+        client_bytes_per_sec = result.bytes_per_sec
+        print(f" [{result.client_id + 1}] {result.msgs_per_sec:,.0f} msgs/sec ~ {format_bytes(int(client_bytes_per_sec))}/sec ({result.messages_sent:,} msgs)")
+    
+    # Print summary statistics
+    if client_rates and len(client_rates) > 1:
+        min_rate = min(client_rates)
+        max_rate = max(client_rates)
+        avg_rate = statistics.mean(client_rates)
+        stddev_rate = statistics.stdev(client_rates)
+        print(f" min {min_rate:,.0f} | avg {avg_rate:,.0f} | max {max_rate:,.0f} | stddev {stddev_rate:.0f} msgs")
+    elif client_rates:
+        print(f" {client_rates[0]:,.0f} msgs/sec (single client)")
+    
+    if total_errors > 0:
+        print(f"\nErrors: {format_number(total_errors)}")
+    
+    print(f"\nCompleted in {total_time:.2f}s")
     
     return results
 
