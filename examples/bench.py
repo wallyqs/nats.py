@@ -103,14 +103,18 @@ def publish_worker(client_id: int, subject: str, payload: bytes, num_msgs: int,
         messages_sent = 0
         errors = 0
         start_time = time.time()
+        last_reported = 0
         
         for i in range(num_msgs):
             try:
                 nc.publish(subject, payload)
                 messages_sent += 1
                 
-                if progress_callback and i % 100 == 0:  # Update every 100 messages
-                    progress_callback(messages_sent)
+                # Report incremental progress every 100 messages
+                if progress_callback and messages_sent - last_reported >= 100:
+                    increment = messages_sent - last_reported
+                    progress_callback(increment)
+                    last_reported = messages_sent
                     
             except NATSError as e:
                 errors += 1
@@ -119,9 +123,10 @@ def publish_worker(client_id: int, subject: str, payload: bytes, num_msgs: int,
         end_time = time.time()
         total_time = end_time - start_time
         
-        # Final progress update
-        if progress_callback:
-            progress_callback(messages_sent)
+        # Final progress update for remaining messages
+        if progress_callback and messages_sent > last_reported:
+            remaining = messages_sent - last_reported
+            progress_callback(remaining)
         
         # Close connection
         nc.close()
