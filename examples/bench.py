@@ -164,17 +164,26 @@ def run_publish_benchmark(args) -> List[BenchResult]:
     # Create payload
     payload = b'x' * msg_size
     
+    # Divide messages across clients
+    msgs_per_client = args.msgs // args.clients
+    remaining_msgs = args.msgs % args.clients
+    
+    # Create list of message counts for each client
+    client_msg_counts = [msgs_per_client] * args.clients
+    for i in range(remaining_msgs):
+        client_msg_counts[i] += 1
+    
     print(f"Running publish benchmark:")
     print(f"  Subject: {args.subject}")
     print(f"  Clients: {format_number(args.clients)}")
-    print(f"  Messages per client: {format_number(args.msgs)}")
-    print(f"  Total messages: {format_number(args.msgs * args.clients)}")
+    print(f"  Total messages: {format_number(args.msgs)}")
+    print(f"  Messages per client: {format_number(msgs_per_client)} ({remaining_msgs} clients get +1)" if remaining_msgs > 0 else f"  Messages per client: {format_number(msgs_per_client)}")
     print(f"  Message size: {format_bytes(msg_size)}")
-    print(f"  Total data: {format_bytes(msg_size * args.msgs * args.clients)}")
+    print(f"  Total data: {format_bytes(msg_size * args.msgs)}")
     print()
     
     # Progress tracking
-    total_msgs = args.msgs * args.clients
+    total_msgs = args.msgs
     progress_bar = ProgressBar(total_msgs) if not args.no_progress else None
     progress_lock = threading.Lock()
     total_completed = [0]  # Use list for mutable reference
@@ -197,7 +206,7 @@ def run_publish_benchmark(args) -> List[BenchResult]:
                 client_id, 
                 args.subject, 
                 payload, 
-                args.msgs,
+                client_msg_counts[client_id],
                 args.server,
                 progress_callback
             ): client_id 
@@ -266,7 +275,7 @@ Examples:
     pub_parser.add_argument('--size', default='128', 
                            help='Message size (e.g., 128, 1KB, 10MB) (default: 128)')
     pub_parser.add_argument('--msgs', type=int, default=100000,
-                           help='Number of messages per client (default: 100000)')
+                           help='Total number of messages to publish (divided across clients) (default: 100000)')
     pub_parser.add_argument('--clients', type=int, default=1,
                            help='Number of concurrent clients (default: 1)')
     pub_parser.add_argument('--no-progress', action='store_true',
