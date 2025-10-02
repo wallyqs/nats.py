@@ -57,8 +57,8 @@ class NATS:
     def publish(self, subject, payload):
         if isinstance(subject, str):
             subject = subject.encode('utf-8')
-        if isinstance(payload, str):
-            payload = payload.encode('utf-8')
+        # if isinstance(payload, str):
+        #     payload = payload.encode('utf-8')
             
         if self._nc is None:
             raise NATSError("Connection is closed")
