@@ -1799,6 +1799,8 @@ class Client:
 
         # Unblock waiting consumers after reaching max messages for non-callback subscriptions.
         if max_msgs_reached and not sub._cb:
+            # Mark subscription as closed so future async generators exit immediately
+            sub._closed = True
             sub._shutdown_queue()
 
     def _build_message(
