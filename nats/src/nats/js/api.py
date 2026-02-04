@@ -85,6 +85,22 @@ class Base:
             return 0
         return int(val * _NANOSECOND)
 
+    @staticmethod
+    def _python38_iso_parsing(time_string: str) -> str:
+        """Parse ISO 8601 timestamp for Python 3.8 compatibility.
+
+        Converts "Z" timezone indicator to "+00:00" format and truncates
+        fractional seconds to 6 digits (microsecond precision).
+        """
+        # Replace Z with UTC offset
+        s = time_string.replace("Z", "+00:00")
+        # Trim fractional seconds to 6 digits
+        date_part, frac_tz = s.split(".", 1)
+        frac, tz = frac_tz.split("+")
+        frac = frac[:6]  # keep only microseconds
+        s = f"{date_part}.{frac}+{tz}"
+        return s
+
     @classmethod
     def from_response(cls: type[_B], resp: Dict[str, Any]) -> _B:
         """Read the class instance from a server response.
@@ -710,17 +726,6 @@ class RawStreamMsg(Base):
         header returns the headers from a message.
         """
         return self.headers
-
-    @classmethod
-    def _python38_iso_parsing(cls, time_string: str):
-        # Replace Z with UTC offset
-        s = time_string.replace("Z", "+00:00")
-        # Trim fractional seconds to 6 digits
-        date_part, frac_tz = s.split(".", 1)
-        frac, tz = frac_tz.split("+")
-        frac = frac[:6]  # keep only microseconds
-        s = f"{date_part}.{frac}+{tz}"
-        return s
 
     @classmethod
     def from_response(cls, resp: Dict[str, Any]):
