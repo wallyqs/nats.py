@@ -15,7 +15,9 @@
 import datetime
 import unittest
 
+import nats
 from nats.js.api import ClusterInfo, RawStreamMsg
+from tests.utils import SingleJetStreamServerTestCase, async_test
 
 
 class TestPython38ISOParsing(unittest.TestCase):
@@ -160,6 +162,95 @@ class TestPython38ISOParsing(unittest.TestCase):
         self.assertEqual(msg.time.hour, 12)
         self.assertEqual(msg.time.minute, 0)
         self.assertEqual(msg.time.second, 0)
+
+
+class TestRawStreamMsgIntegration(SingleJetStreamServerTestCase):
+    """Integration tests for RawStreamMsg time field parsing.
+
+    These tests verify that the time field is correctly parsed when doing
+    actual JetStream get_msg operations against a real NATS server.
+    """
+
+    @async_test
+    async def test_get_msg_time_field_parsing(self):
+        """Test that get_msg returns RawStreamMsg with properly parsed time field."""
+        # Record start time for validation
+        start_time = datetime.datetime.now(datetime.timezone.utc)
+
+        # Connect to NATS and set up JetStream
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        # Create a stream
+        await js.add_stream(name="TIME_TEST", subjects=["time.test"])
+
+        # Publish a message
+        ack = await js.publish("time.test", b"test message with timestamp")
+
+        # Get the message directly from the stream
+        msg = await js.get_msg("TIME_TEST", seq=ack.seq)
+
+        # Verify the message was retrieved
+        self.assertEqual(msg.data, b"test message with timestamp")
+        self.assertEqual(msg.seq, ack.seq)
+
+        # Verify the time field is properly parsed
+        self.assertIsNotNone(msg.time, "time field should not be None")
+        self.assertIsInstance(msg.time, datetime.datetime, "time should be a datetime object")
+
+        # Verify timezone is UTC
+        self.assertEqual(msg.time.tzinfo, datetime.timezone.utc, "time should be in UTC timezone")
+
+        # Verify the timestamp is reasonable (between start time and now)
+        end_time = datetime.datetime.now(datetime.timezone.utc)
+        self.assertGreaterEqual(msg.time, start_time,
+                               f"message time {msg.time} should be >= start time {start_time}")
+        self.assertLessEqual(msg.time, end_time,
+                            f"message time {msg.time} should be <= end time {end_time}")
+
+        # Verify we can access datetime components (proving it's properly parsed)
+        self.assertIsInstance(msg.time.year, int)
+        self.assertIsInstance(msg.time.month, int)
+        self.assertIsInstance(msg.time.day, int)
+        self.assertIsInstance(msg.time.hour, int)
+        self.assertIsInstance(msg.time.minute, int)
+        self.assertIsInstance(msg.time.second, int)
+        self.assertIsInstance(msg.time.microsecond, int)
+
+        await nc.close()
+
+    @async_test
+    async def test_direct_get_msg_time_field(self):
+        """Test that direct get_msg also properly parses the time field."""
+        start_time = datetime.datetime.now(datetime.timezone.utc)
+
+        nc = await nats.connect()
+
+        # Check if server supports direct get (requires v2.9.0+)
+        version = nc.connected_server_version
+        if version.major < 2 or (version.major == 2 and version.minor < 9):
+            await nc.close()
+            self.skipTest("Direct Get requires nats-server v2.9.0+")
+
+        js = nc.jetstream()
+
+        # Create a stream and publish a message
+        await js.add_stream(name="DIRECT_TIME_TEST", subjects=["direct.test"])
+        ack = await js.publish("direct.test", b"direct get test")
+
+        # Use direct get
+        msg = await js.get_msg("DIRECT_TIME_TEST", seq=ack.seq, direct=True)
+
+        # Verify time field is properly parsed with direct get too
+        self.assertIsNotNone(msg.time)
+        self.assertIsInstance(msg.time, datetime.datetime)
+        self.assertEqual(msg.time.tzinfo, datetime.timezone.utc)
+
+        end_time = datetime.datetime.now(datetime.timezone.utc)
+        self.assertGreaterEqual(msg.time, start_time)
+        self.assertLessEqual(msg.time, end_time)
+
+        await nc.close()
 
 
 if __name__ == '__main__':
