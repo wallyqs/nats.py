@@ -5067,6 +5067,84 @@ class V210FeaturesTest(SingleJetStreamServerTestCase):
         await nc.close()
 
     @async_test
+    async def test_stream_source_opt_start_time(self):
+        """Test that opt_start_time can be set on stream sources and mirrors."""
+        nc = await nats.connect()
+
+        js = nc.jetstream()
+
+        # Create source stream
+        await js.add_stream(
+            name="SOURCE",
+            subjects=["events.>"],
+        )
+
+        # Publish some messages with a delay to create distinct timestamps
+        for i in range(5):
+            await js.publish(f"events.{i}", f"message-{i}".encode())
+            if i == 2:
+                # Record approximate time after message 2
+                await asyncio.sleep(0.1)
+                reference_time = datetime.datetime.now(datetime.timezone.utc)
+                await asyncio.sleep(0.1)
+
+        # Create a source configuration with opt_start_time
+        # Using RFC3339 format timestamp
+        time_str = reference_time.isoformat()
+        source_config = nats.js.api.StreamSource(
+            name="SOURCE",
+            opt_start_time=time_str,
+        )
+
+        # Create sourcing stream with opt_start_time
+        await js.add_stream(
+            name="SOURCING",
+            sources=[source_config],
+        )
+
+        # Verify the configuration was saved correctly
+        sinfo = await js.stream_info("SOURCING")
+        assert sinfo.config.sources is not None
+        assert len(sinfo.config.sources) == 1
+        assert sinfo.config.sources[0].name == "SOURCE"
+        assert sinfo.config.sources[0].opt_start_time is not None
+
+        # Create a mirror configuration with opt_start_time
+        mirror_config = nats.js.api.StreamSource(
+            name="SOURCE",
+            opt_start_time=time_str,
+        )
+
+        # Create mirror stream with opt_start_time
+        await js.add_stream(
+            name="MIRROR",
+            mirror=mirror_config,
+        )
+
+        # Verify the mirror configuration was saved correctly
+        sinfo = await js.stream_info("MIRROR")
+        assert sinfo.config.mirror is not None
+        assert sinfo.config.mirror.name == "SOURCE"
+        assert sinfo.config.mirror.opt_start_time is not None
+
+        # Test that opt_start_time can be omitted (None)
+        source_config_no_time = nats.js.api.StreamSource(name="SOURCE")
+        await js.add_stream(
+            name="SOURCING2",
+            sources=[source_config_no_time],
+        )
+
+        sinfo = await js.stream_info("SOURCING2")
+        assert sinfo.config.sources is not None
+        assert len(sinfo.config.sources) == 1
+        # opt_start_time should be None or not present
+        if sinfo.config.sources[0].opt_start_time is not None:
+            # Some server versions may return empty string instead of None
+            assert sinfo.config.sources[0].opt_start_time == ""
+
+        await nc.close()
+
+    @async_test
     async def test_fetch_pull_subscribe_bind(self):
         nc = NATS()
         await nc.connect()

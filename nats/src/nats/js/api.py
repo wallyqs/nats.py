@@ -151,8 +151,7 @@ class ExternalStream(Base):
 class StreamSource(Base):
     name: str
     opt_start_seq: Optional[int] = None
-    # FIXME: Handle time type, omit for now.
-    # opt_start_time: Optional[str] = None
+    opt_start_time: Optional[str] = None
     filter_subject: Optional[str] = None
     external: Optional[ExternalStream] = None
     subject_transforms: Optional[List[SubjectTransform]] = None
