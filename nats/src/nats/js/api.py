@@ -346,10 +346,15 @@ class StreamConfig(Base):
     # Metadata are user defined string key/value pairs.
     metadata: Optional[Dict[str, str]] = None
 
+    # TTL of subject delete markers.
+    # Introduced in nats-server 2.11.0.
+    subject_delete_marker_ttl: Optional[float] = None  # in seconds
+
     @classmethod
     def from_response(cls, resp: Dict[str, Any]):
         cls._convert_nanoseconds(resp, "max_age")
         cls._convert_nanoseconds(resp, "duplicate_window")
+        cls._convert_nanoseconds(resp, "subject_delete_marker_ttl")
         cls._convert(resp, "placement", Placement)
         cls._convert(resp, "mirror", StreamSource)
         cls._convert(resp, "sources", StreamSource)
@@ -361,6 +366,7 @@ class StreamConfig(Base):
         result = super().as_dict()
         result["duplicate_window"] = self._to_nanoseconds(self.duplicate_window)
         result["max_age"] = self._to_nanoseconds(self.max_age)
+        result["subject_delete_marker_ttl"] = self._to_nanoseconds(self.subject_delete_marker_ttl)
         if self.sources:
             result["sources"] = [src.as_dict() for src in self.sources]
         if self.compression and (self.compression != StoreCompression.NONE and self.compression != StoreCompression.S2):
@@ -748,9 +754,14 @@ class KeyValueConfig(Base):
     republish: Optional[RePublish] = None
     direct: Optional[bool] = None
 
+    # TTL of limit (delete) markers for KV.
+    # Introduced in nats-server 2.11.0.
+    limit_marker_ttl: Optional[float] = None  # in seconds
+
     def as_dict(self) -> Dict[str, object]:
         result = super().as_dict()
         result["ttl"] = self._to_nanoseconds(self.ttl)
+        result["limit_marker_ttl"] = self._to_nanoseconds(self.limit_marker_ttl)
         return result
 
 

@@ -19,7 +19,7 @@ import datetime
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import nats.errors
 import nats.js.errors
@@ -32,6 +32,8 @@ KV_OP = "KV-Operation"
 KV_DEL = "DEL"
 KV_PURGE = "PURGE"
 MSG_ROLLUP_SUBJECT = "sub"
+NATS_MARKER_REASON = "Nats-Marker-Reason"
+NATS_MARKER_MAX_AGE = "MaxAge"
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +88,7 @@ class KeyValue:
         delta: Optional[int]
         created: Optional[int]
         operation: Optional[str]
+        headers: Optional[Dict[str, str]] = None
 
     @dataclass(frozen=True)
     class BucketStatus:
@@ -472,8 +475,11 @@ class KeyValue:
 
             meta = msg.metadata
             op = None
-            if msg.header and KV_OP in msg.header:
-                op = msg.header.get(KV_OP)
+            if msg.header:
+                if KV_OP in msg.header:
+                    op = msg.header.get(KV_OP)
+                elif msg.header.get(NATS_MARKER_REASON) == NATS_MARKER_MAX_AGE:
+                    op = KV_DEL
 
                 # keys() uses this
                 if ignore_deletes:
@@ -491,6 +497,7 @@ class KeyValue:
                 delta=meta.num_pending,
                 created=meta.timestamp,
                 operation=op,
+                headers=msg.header,
             )
             await watcher._updates.put(entry)
 
