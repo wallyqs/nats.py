@@ -1,210 +1,184 @@
-# Re-Review: nats.py main branch (post-merge of JetStream, datetime, and test fixes)
-
-**Reviewed at:** `a9bfe71` (origin/main)
-**Original PR:** #829 (`add-custom-server-pool`)
-**Date:** 2026-02-20
-
----
-
-## Context
-
-The original PR #829 was split into separate commits now merged to main:
-
-| Commit | PR | Description |
-|--------|----|-------------|
-| `f7a3c3d` | #734 | Add nats-jetstream package |
-| `1e6c44d` | #823 | Fix opt_start_time and other datetime fields |
-| `1506159` | #824 | Fix flaky example tests |
-| `3f13f5d` | #822 | Release nats-jetstream v0.1.0 |
-| `a9bfe71` | #644 | Fix watching past history replay |
-
-**Not merged:** The server pool management and reconnect handler changes (issues #1-8 from the original review). The `add-custom-server-pool` branch has been deleted.
-
----
-
-## Re-Review Status
-
-### Issues from original review that were addressed
-
-| # | Issue | Status | Notes |
-|---|-------|--------|-------|
-| 1-8 | Server pool management issues | **OUT OF SCOPE** | Not merged; will need re-review when/if resubmitted |
-| 39 | `run_example_with_retry` can return `None` | **MOSTLY FIXED** | Now returns `result` (last attempt) instead of `None` in most cases. Still returns `None` if deadline expires before any attempt runs, but this is a theoretical edge case |
-
-### Issues from original review that are STILL PRESENT on main
-
-All JetStream package issues remain unchanged. The merged code is identical to what was in the PR branch.
-
----
-
-## 1. Datetime Handling Fixes (merged as #823)
-
-**Files:** `nats/src/nats/js/api.py`
-
-### Positive
-
-- Resolves multiple long-standing `# FIXME` comments
-- Consolidates duplicated ISO 8601 parsing into shared `_parse_utc_iso` and `_to_utc_iso` helpers
-- Good test coverage with 14 unit tests plus an integration test
-
-### Still Present
-
-1. **`_parse_utc_iso` fails on negative UTC offsets** (Low): The line `frac, tz = frac_tz.split("+")` will raise `ValueError` for timestamps like `2024-01-01T00:00:00.000-05:00`. NATS server always emits `Z`, so this is low risk, but the method name implies general ISO 8601 support.
-
-2. **`ConsumerInfo.created` is now a required field** (Medium): Previously omitted, now `created: datetime.datetime` with no default. Breaking change for anyone constructing `ConsumerInfo` directly (e.g., in tests/mocks).
-
-3. **`_to_utc_iso` string passthrough** (Low): Accepting `str` and passing through without validation could silently allow malformed timestamps.
-
----
-
-## 2. New `nats-jetstream` Package (merged as #734, released as #822)
-
-**Files:** `nats-jetstream/` (entire package, now at v0.1.0)
-
-### Architecture
-
-Well-structured package:
-- `__init__.py` — `JetStream` entry point, publish, stream/consumer CRUD, pagination
-- `api/client.py` — Low-level API request/response handling with error mapping
-- `api/types.py` — TypedDict definitions generated from JSON schemas
-- `consumer/` — `Consumer` Protocol, `ConsumerInfo`, `MessageBatch`/`MessageStream`
-- `consumer/pull.py` — `PullConsumer`, `PullMessageBatch`, `PullMessageStream`
-- `stream.py` — `Stream`, `StreamConfig`, `StreamInfo`, `StreamMessage`, etc.
-- `message.py` — `Message` with ack/nak/term, `Metadata` parsed from reply subjects
-- `errors.py` — Error hierarchy with specific error types mapped from server error codes
-
-### Positive
-
-- Uses `match/case` for reply subject parsing — clean and idiomatic
-- Well-documented with docstrings, ADR-37 references, and clear type annotations
-- `from_response` pattern with `strict` mode for forward compatibility
-- Proper heartbeat pause/resume on disconnect/reconnect (ADR-37)
-- Priority group and priority support in pull consumer
-- Clean separation between `fetch` (one-shot batch) and `messages` (continuous stream)
-- Generated TypedDict types from JSON schemas ensure API coverage
-- Good test coverage (5 test files, ~3300 lines)
-
-### Issues — Still Present
-
-#### Critical
-
-4. **PEP 695 generic syntax breaks Python 3.11 (`api/client.py:92,360,370,379`)**: Uses `def check_response[ResponseT](...)` syntax (Python 3.12+). `pyproject.toml` claims `requires-python = ">=3.11"` and lists `Programming Language :: Python :: 3.11` in classifiers. This causes `SyntaxError` on Python 3.11. **This is a ship-blocker for any 3.11 user — the package is broken on import.**
-
-#### High — Bugs
-
-5. **`PullConsumer.get_info()` doesn't refresh from server (`consumer/pull.py:518-520`)**: Comment says "Refresh info from server" but implementation just returns cached `self._info`. No API call is made.
-
-6. **`publish()` doesn't handle JetStream error responses (`__init__.py:334`)**: `json.loads(response.data)` is passed directly to `PublishAck.from_response`. If the server returns `{"error": {...}}`, the code raises `KeyError` on `data.pop("stream")` instead of a meaningful `JetStreamError`.
-
-7. **Direct message get hardcodes `$JS.API` prefix (`stream.py:1086,1091`)**: `_get_message` uses `f"$JS.API.DIRECT.GET.{self._name}"` ignoring the configurable `_prefix` on the API client. Custom domain configurations will break.
-
-#### High — Resource Leaks
-
-8. **Disconnect/reconnect callbacks never unregistered (`consumer/pull.py:82-83,279-280`)**: `PullMessageBatch.__init__` and `PullMessageStream.__init__` call `add_disconnected_callback` / `add_reconnected_callback` but never remove them. In long-running applications that create many batches/streams, this leaks callbacks and prevents garbage collection of completed batch/stream objects.
-
-#### High — Performance
-
-9. **Polling loops with `asyncio.sleep(0.1)` (`consumer/pull.py:430,451`)**: Both `_request_loop` and `_heartbeat_monitor` poll every 100ms. Should use `asyncio.Event` or `asyncio.Condition` for event-driven wakeup.
-
-#### High — Code Duplication
-
-10. **Triplicated message decoding (`__init__.py:727-813`, `stream.py:_get_message`)**: `get_message()`, `get_last_message_for_subject()`, and `Stream._get_message()` all contain nearly identical ~40-line blocks for decoding base64 data, parsing headers, and constructing `StreamMessage`.
-
-#### Medium
-
-11. **`asyncio.get_event_loop()` deprecated (`__init__.py:303,310,344`)**: Should use `asyncio.get_running_loop()`. `get_event_loop()` is deprecated since Python 3.10, emits `DeprecationWarning` in 3.12+, and may create a new event loop if none is running.
-
-12. **`PullConsumer` doesn't satisfy `Consumer` Protocol**: Protocol's `fetch` has positional `max_messages`; `PullConsumer.fetch` uses keyword-only. Static type checkers flag this as non-conforming.
-
-13. **`ConsumerConfig.opt_start_time` typed as `int | None` (`consumer/__init__.py:111`)**: API sends/receives as ISO 8601 string. Should be `str | None` or `datetime | None`. Same for `StreamSource.opt_start_time` (`stream.py:135`).
-
-14. **`ConsumerConfig.to_request()` skips default-valued fields (`consumer/__init__.py:229-233`)**: `if self.ack_policy != "none"` means explicitly setting `ack_policy="none"` won't include it in the request. Same pattern for other fields.
-
-15. **`PullMessageStream.__anext__` swallows all exceptions (`consumer/pull.py:319`)**: `except Exception: ... raise StopAsyncIteration` silently converts `ConnectionClosedError`, `RuntimeError`, etc. into stream termination with no diagnostics.
-
-16. **`from_response` mutates input dicts**: Every `from_response` uses `data.pop()`, destructively consuming the input. If a caller logs or debugs the response after parsing, it's empty.
-
-17. **`Message.__init__` silently swallows reply parse errors (`message.py:168-172`)**: Malformed reply subjects get default metadata with zeroed sequences and `datetime.now()`, masking bugs.
-
-18. **Deep private attribute chains (`consumer/pull.py:279,387`)**: `self._consumer._stream._jetstream._client` — 4 levels of private access. Fragile and hard to refactor.
-
-19. **`config`/`state` typed as `Any` in API types (`api/types.py:547,558`)**: `StreamInfo`, response types, etc. lose type safety.
-
-20. **`request_json` hardcoded 5s timeout (`api/client.py:386`)**: No caller overrides it; no user-facing configuration for long-running operations.
-
-21. **`NoRespondersError` handling inconsistent**: Only `account_info()` wraps it into `JetStreamNotEnabledError`. Other methods propagate the raw NATS error.
-
-22. **No `__repr__` on `Message`, `Consumer`, `Stream`**: Makes debugging harder — these non-dataclass types show unhelpful default repr.
-
-23. **`stream_names`/`list_streams` annotated as `AsyncIterator` but are `AsyncGenerator`s**: Technically works but imprecise for tooling.
-
-#### Low
-
-24. **~50+ manually mapped fields in `StreamConfig.from_kwargs`/`to_request`**: Error-prone when new fields are added. Consider generating.
-
-25. **`setuptools` backend vs `uv` workspace**: Package uses `setuptools` while root uses `uv`.
-
-26. **`nats-jetstream` -> `nats-core` dependency undocumented**: Users need guidance on installing.
-
-27. **`StreamNamesResponse` has `consumers` field (`api/types.py:1473`)**: Schema generation bug — stream names response shouldn't have this.
-
-28. **Duplicate `DeliverPolicy` TypedDicts (`api/types.py:270-333`)**: Two identical sets; first appears unused.
-
-29. **Empty `README.md`, no `py.typed` marker**: Package released as v0.1.0 without documentation or PEP 561 support.
-
-30. **Redundant `new()` factory (`__init__.py:816-828`)**: Identical to `JetStream()` constructor.
-
----
-
-## 3. New: Fix Watching Past History Replay (commit `a9bfe71`, #644)
-
-**Files:** `nats/src/nats/js/kv.py`, `nats/src/nats/js/object_store.py`
-
-### What it does
-
-Fixes a bug where `None` entries in the watcher queue prematurely stopped async iteration. Previously, `__anext__` checked `if not entry: raise StopAsyncIteration`, which stopped on `None` values (used for "caught up" signaling) as well as the actual end-of-iteration. The fix introduces a `StopIterSentinel` class so only explicit stop signals terminate iteration.
-
-### Positive
-
-- Clean sentinel pattern avoids the `None` ambiguity
-- Applied consistently to both `KeyValue.KeyWatcher` and `ObjectStore.ObjectWatcher`
-- The `keys()` method now correctly breaks on `None` (caught-up signal) rather than relying on the iterator
-
-### Issues
-
-31. **`asyncio.get_event_loop()` in `run_example_with_retry` (`nats-core/tests/test_examples.py:44,46`)**: Same deprecation as issue #11, now in test code. Should use `asyncio.get_running_loop()`.
-
-32. **`StopIterSentinel` is module-level in `kv.py` and imported by `object_store.py`**: A minor coupling concern — both watchers share the same sentinel class. This is fine for now but could be moved to a shared `_utils` module if more watchers are added.
-
----
-
-## 4. Build/Config
-
-33. **Ruff `target-version` = `py312` (`pyproject.toml`)**: Coordinated with actual usage of 3.12+ syntax in the JetStream package. However, `nats-jetstream/pyproject.toml` still claims `>=3.11`. These should agree.
+# Review: PR #829 — Add server pool management and reconnect handler
+
+**PR:** https://github.com/nats-io/nats.py/pull/829
+**Author:** caspervonb
+**Branch:** `add-custom-server-pool` → `main`
+**Reviewed at:** commit `f98db4d`
+**Diff base:** upstream/main (`1e6c44d`)
 
 ---
 
 ## Summary
 
-| Severity | Count | Fixed | Still Present |
-|----------|-------|-------|---------------|
-| Critical | 1     | 0     | 1             |
-| High     | 6     | 0     | 6             |
-| Medium   | 13    | 0     | 13            |
-| Low      | 10    | 0     | 10            |
-| Out of scope | 8 | — | — |
-| **Total** | **33** (+ 8 deferred) | **0** | **33** |
+This PR adds two features to the NATS client:
 
-### Top Priorities
+1. **Dynamic server pool management** — `server_pool` property and `set_server_pool()` method to inspect and replace the server pool at runtime
+2. **Custom reconnect handler** — `reconnect_to_server_handler` callback that lets applications control which server to reconnect to and with what delay
 
-1. **Fix Python 3.11 compatibility** (#4) — package is broken on import for 3.11 users. Either bump `requires-python` to `>=3.12` or rewrite PEP 695 generics using `TypeVar`
-2. **Fix `PullConsumer.get_info()`** (#5) — documented as refreshing but returns stale data
-3. **Fix `publish()` error handling** (#6) — `KeyError` instead of proper `JetStreamError`
-4. **Fix direct message hardcoded prefix** (#7) — breaks custom domain configs
-5. **Fix callback leaks** (#8) — memory leak in long-running applications
-6. **Replace polling loops** (#9) — 100ms polling is wasteful; use event-driven signaling
-7. **Fix `get_event_loop()` deprecation** (#11) — emits warnings on Python 3.12+
+**Files changed:** 3 (`client.py` +211/-51, `errors.py` +5, `test_client.py` +323)
 
 ### What's Good
 
-The overall code quality remains strong. The package is well-architected, well-tested, and the ADR-37 implementation (heartbeats, fetch semantics, message batching) is thorough. The datetime fixes are clean and well-tested. The #644 sentinel fix is a correct and clean solution. The main concerns are runtime correctness issues that should be addressed before users rely on the v0.1.0 release.
+- Clean public API surface: `Server` dataclass exposes only `uri` + `reconnects`, keeping internal `Srv` state private
+- `server_pool` returns a copy, preventing accidental mutation of internal state
+- `set_server_pool()` validates all URLs atomically before modifying state
+- State preservation: reconnect counts, `did_connect`, `last_attempt` are carried over when servers match by `netloc`
+- `_current_server` is updated to point into the new pool, preventing stale references
+- Connection logic extracted into `_connect_to_server()` — good refactoring that reduces duplication between `_select_next_server` and the new handler path
+- URL parsing extracted into `_parse_server_uri()` static method — reusable and testable
+- Test coverage is thorough: 9 test cases covering pool property, pool replacement, state preservation, closed-state error, reconnect with updated pool, handler selection, delay, invalid server fallback, and server_info passthrough
+- Handler receives server snapshots (not internal objects), so user code can't corrupt client state
+
+---
+
+## Issues
+
+### 1. BUG: Handler exceptions crash the reconnection task (High)
+
+**File:** `nats/src/nats/aio/client.py`, reconnect loop in `_attempt_reconnect`
+
+The handler is called inside the reconnect `while True` loop:
+
+```python
+selected, callback_delay = self._reconnect_to_server_handler(server_snapshot, self._server_info)
+```
+
+The exception handlers only catch `errors.NoServersError`, `(OSError, errors.Error, asyncio.TimeoutError)`, and `asyncio.CancelledError`. If the user's handler raises any other exception (e.g., `TypeError`, `ValueError`, `KeyError`, `RuntimeError`), it propagates out of the loop uncaught, killing the reconnection task. The client then sits in `RECONNECTING` status forever with no way to recover.
+
+**Suggestion:** Wrap the handler call in a `try/except Exception` that reports the error via `_error_cb` and falls back to `eligible[0]`:
+
+```python
+try:
+    selected, callback_delay = self._reconnect_to_server_handler(server_snapshot, self._server_info)
+except Exception as e:
+    await self._error_cb(e)
+    selected = None
+    callback_delay = 0
+```
+
+---
+
+### 2. BUG: Handler is synchronous but `_server_info` dict is mutable (Medium)
+
+**File:** `nats/src/nats/aio/client.py`, line with `self._reconnect_to_server_handler(server_snapshot, self._server_info)`
+
+The handler receives `self._server_info` directly — the same mutable dict used internally by the client. While the `Server` objects in the snapshot are copies, the `server_info` dict is not. A handler that modifies it (e.g., `server_info.pop("nonce")`) would corrupt client state.
+
+**Suggestion:** Pass a shallow copy: `dict(self._server_info)` or `self._server_info.copy()`.
+
+---
+
+### 3. BUG: `_connect_to_server` doesn't increment `reconnects` on failure (Medium)
+
+**File:** `nats/src/nats/aio/client.py`, `_attempt_reconnect` — handler path
+
+In the default `_select_next_server` path, when a connection attempt fails, both `s.reconnects` and `s.last_attempt` are incremented/updated in the `except` block:
+
+```python
+except Exception as e:
+    s.last_attempt = time.monotonic()
+    s.reconnects += 1
+```
+
+In the handler path, when `_connect_to_server` raises, the outer `except` block does update `self._current_server.reconnects += 1`. However, the eligible-server filtering happens *before* the connection attempt:
+
+```python
+eligible = [s for s in self._server_pool if s.reconnects <= max_reconnect]
+```
+
+This means the reconnect count is correctly tracked. But there's a subtle issue: the handler path doesn't cycle through servers on failure — it calls the handler again on the next iteration, which may return the same server repeatedly. The `_select_next_server` path pops servers from the pool and rotates them, giving each server a turn. With the handler, a poorly-written handler that always returns the same down server will cause a tight retry loop (mitigated only by `reconnect_time_wait` in the default path... which is skipped in the handler path).
+
+**Suggestion:** Consider adding a minimum backoff between handler-path reconnect attempts, or at least document that the handler is responsible for implementing its own backoff via the `delay` return value. Without any delay, a failing server causes a tight loop of connect attempts.
+
+---
+
+### 4. `_setup_server_pool` list path not updated to use `_parse_server_uri` (Low)
+
+**File:** `nats/src/nats/aio/client.py`, `_setup_server_pool`
+
+The single-string path was refactored to call `_parse_server_uri()`, but the list path still uses raw `urlparse()`:
+
+```python
+elif isinstance(connect_url, list):
+    try:
+        for server in connect_url:
+            uri = urlparse(server)  # <-- raw urlparse, no scheme/port defaults
+            self._server_pool.append(Srv(uri))
+```
+
+This means `set_server_pool(["localhost"])` correctly becomes `nats://localhost:4222` (via `_parse_server_uri`), but `connect(servers=["localhost"])` would create a `Srv` with scheme `""` and port `None`.
+
+**Note:** This is a pre-existing issue, not introduced by this PR. But since `_parse_server_uri` was extracted specifically to centralize this logic, the list path in `_setup_server_pool` should also use it for consistency.
+
+---
+
+### 5. `set_server_pool` doesn't validate against mixed protocols (Low)
+
+**File:** `nats/src/nats/aio/client.py`, `set_server_pool`
+
+`_setup_server_pool` validates that WebSocket and non-WebSocket URLs aren't mixed:
+
+```python
+if not (
+    all(server.uri.scheme in ("nats", "tls") for server in self._server_pool)
+    or all(server.uri.scheme in ("ws", "wss") for server in self._server_pool)
+):
+    raise errors.Error("nats: mixing of websocket and non websocket URLs is not allowed")
+```
+
+`set_server_pool` skips this check. A user could replace the pool with `["nats://a:4222", "ws://b:80"]`, which would cause unpredictable transport behavior on reconnect.
+
+**Suggestion:** Add the same protocol-mixing validation to `set_server_pool`.
+
+---
+
+### 6. `Server` and `Srv` duplication could be confusing (Nit)
+
+**File:** `nats/src/nats/aio/client.py`
+
+Having both `Server` (public) and `Srv` (internal) is reasonable for encapsulation, but the names are very similar. Consider renaming `Server` to `ServerInfo` or `ServerEntry` to better distinguish it, or adding a brief note in the `Server` docstring that it's the public-facing subset of the internal `Srv` type.
+
+---
+
+### 7. `ReconnectToServerHandler` is synchronous-only (Nit)
+
+**File:** `nats/src/nats/aio/client.py`, type alias
+
+```python
+ReconnectToServerHandler = Callable[[List[Server], Dict[str, Any]], Tuple[Optional[Server], float]]
+```
+
+The handler is defined as a synchronous callable. This is fine and arguably correct (simpler, no event loop concerns), but it means handlers cannot do async work like DNS lookups or health checks. This is worth documenting explicitly, since other NATS callbacks (`reconnected_cb`, `disconnected_cb`, etc.) are all async.
+
+---
+
+### 8. Type annotation: `_setup_server_pool` parameter (Nit)
+
+**File:** `nats/src/nats/aio/client.py`
+
+```python
+def _setup_server_pool(self, connect_url: Union[List[str]]) -> None:
+```
+
+`Union[List[str]]` is equivalent to `List[str]` — `Union` with a single type is a no-op. Based on the body, this should be `Union[str, List[str]]`.
+
+**Note:** Pre-existing issue, not introduced by this PR.
+
+---
+
+## Summary Table
+
+| # | Issue | Severity | New/Pre-existing |
+|---|-------|----------|------------------|
+| 1 | Handler exceptions crash reconnect task | **High** | New |
+| 2 | `_server_info` passed by reference to handler | **Medium** | New |
+| 3 | No backoff in handler path on connection failure | **Medium** | New |
+| 4 | `_setup_server_pool` list path doesn't use `_parse_server_uri` | Low | Pre-existing |
+| 5 | `set_server_pool` missing protocol-mixing validation | Low | New |
+| 6 | `Server` vs `Srv` naming | Nit | New |
+| 7 | Handler is sync-only (should document) | Nit | New |
+| 8 | `Union[List[str]]` type annotation | Nit | Pre-existing |
+
+### Recommendation
+
+**Request changes** on issues #1 and #2 — the handler exception crash and mutable `_server_info` exposure are correctness bugs that should be fixed before merge. Issue #3 (no backoff) is worth discussing. The rest are low-severity or nits.
