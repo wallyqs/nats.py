@@ -112,47 +112,79 @@ The new package is well-structured:
 
 ### Issues
 
+#### Critical
+
+12. **PEP 695 generic syntax breaks Python 3.11 (`api/client.py:92,360,370,379`)**: The code uses `def check_response[ResponseT](...)` syntax which requires Python 3.12+. However, `pyproject.toml` claims `requires-python = ">=3.11"`. This will cause a `SyntaxError` on Python 3.11. Either bump the minimum to 3.12 or rewrite using `TypeVar`.
+
 #### High
 
-12. **Duplicate code in `get_message` and `get_last_message_for_subject` (`__init__.py:727-813`)**: These two methods are nearly identical, differing only in the API call parameters. Extract a shared helper for decoding the message response.
+13. **Duplicate code in `get_message` and `get_last_message_for_subject` (`__init__.py:727-813`)**: These two methods are nearly identical (~40 lines each), differing only in the API call parameters. The same decoding logic also appears a third time in `stream.py:_get_message()`. Extract a shared helper.
 
-13. **`PullMessageBatch` disconnect/reconnect callbacks are never unregistered (`consumer/pull.py:79-83`)**: `add_disconnected_callback` and `add_reconnected_callback` are called in `__init__`, but there's no corresponding removal in cleanup. If many batches are created, this could leak callbacks. The same issue exists for `PullMessageStream` (line 277-279).
+14. **`PullMessageBatch` disconnect/reconnect callbacks are never unregistered (`consumer/pull.py:79-83`)**: `add_disconnected_callback` and `add_reconnected_callback` are called in `__init__`, but there's no corresponding removal in cleanup. If many batches are created, this leaks callbacks and keeps batch objects alive. The same issue exists for `PullMessageStream` (line 277-279).
 
-14. **`_request_loop` uses polling (`consumer/pull.py:430`)**: `await asyncio.sleep(0.1)` in a tight loop is wasteful. Consider using an `asyncio.Event` or `asyncio.Condition` to wake the loop only when thresholds are crossed, rather than polling every 100ms.
+15. **`_request_loop` uses polling (`consumer/pull.py:430`)**: `await asyncio.sleep(0.1)` in a tight loop is wasteful. The `_heartbeat_monitor` (line 451) has the same issue. Consider using an `asyncio.Event` or `asyncio.Condition` to wake only when thresholds are crossed.
 
-15. **`PullConsumer.get_info()` doesn't actually refresh (`consumer/pull.py:518-520`)**: The docstring says "Refresh info from server" but the method just returns `self._info` without making any API call. This is misleading.
+16. **`PullConsumer.get_info()` doesn't actually refresh (`consumer/pull.py:518-520`)**: The comment says "Refresh info from server" but the method just returns `self._info` without making any API call. This is a bug.
+
+17. **`publish()` doesn't check for JetStream API errors in response (`__init__.py:334`)**: `json.loads(response.data)` is called and passed directly to `PublishAck.from_response`. If the server returns a JetStream error response (e.g., `{"error": {...}}`), the code will get a `KeyError` on `data.pop("stream")` instead of a meaningful error.
+
+18. **Direct message get hardcodes `$JS.API` prefix (`stream.py:1086`)**: `_get_message` uses `f"$JS.API.DIRECT.GET.{self._name}"` ignoring the configurable `_prefix`. If a custom domain is used, direct gets will fail.
 
 #### Medium
 
-16. **`publish` method uses `asyncio.get_event_loop()` (`__init__.py:303,310,344`)**: Should be `asyncio.get_running_loop()` — `get_event_loop()` is deprecated since Python 3.10 and may create a new loop if none is running.
+19. **`publish` method uses `asyncio.get_event_loop()` (`__init__.py:303,310,344`)**: Should be `asyncio.get_running_loop()` — `get_event_loop()` is deprecated since Python 3.10 and may create a new loop if none is running.
 
-17. **`stream_names` and `list_streams` return `AsyncIterator` but are `async def` with `yield` (`__init__.py:352-415`)**: These are actually `AsyncGenerator`s, not `AsyncIterator`s. While `AsyncGenerator` is a subtype of `AsyncIterator`, the return type annotation could be more precise for tooling.
+20. **`PullConsumer` does not satisfy the `Consumer` Protocol**: The Protocol's `fetch` defines positional `max_messages`, while `PullConsumer.fetch` uses keyword-only `max_messages`. A static type checker would flag this as non-conforming.
 
-18. **`from_response` pattern mutates input dicts**: Every `from_response` call uses `data.pop()`, which mutates the input dictionary. If a caller needs to inspect the original response after calling `from_response`, the data will be gone. Consider working on a copy, or document this behavior clearly.
+21. **`ConsumerConfig.opt_start_time` typed as `int | None` (`consumer/__init__.py:111`)**: The API sends/receives this as an ISO 8601 string. Should be `str | None` or `datetime | None`. Same issue with `StreamSource.opt_start_time` (`stream.py:135`).
 
-19. **`Message.__init__` silently swallows `ValueError` from reply parsing (`message.py:168-172`)**: If the reply subject is malformed, the message gets default metadata with zeroed sequences and `datetime.now()`. This could mask bugs. At minimum, log a warning.
+22. **`ConsumerConfig.to_request()` skips default-valued fields (`consumer/__init__.py:229-233`)**: If `ack_policy` is explicitly set to `"none"`, it won't be included in the request due to `if self.ack_policy != "none"`. This means you can't explicitly set default values in an update request.
 
-20. **No `__repr__` on key types**: `Message`, `Consumer`, `Stream` lack `__repr__`, making debugging harder. The dataclasses (`StreamConfig`, `ConsumerInfo`, etc.) get this for free, but the non-dataclass types don't.
+23. **`from_response` pattern mutates input dicts**: Every `from_response` call uses `data.pop()`, which mutates the input dictionary. If a caller needs to inspect the original response after calling `from_response`, the data will be gone. Consider working on a copy, or document this behavior clearly.
+
+24. **`Message.__init__` silently swallows `ValueError` from reply parsing (`message.py:168-172`)**: If the reply subject is malformed, the message gets default metadata with zeroed sequences and `datetime.now()`. This could mask bugs. At minimum, log a warning.
+
+25. **`PullMessageStream.__anext__` swallows all exceptions (`consumer/pull.py:319`)**: `except Exception: await self._cleanup(); raise StopAsyncIteration` converts any exception (including `ConnectionClosedError`) into a silent stream termination. The user will never know why the stream stopped.
+
+26. **Deep private attribute chains**: `self._consumer._stream._jetstream._client` (4 levels of private access, `consumer/pull.py:279,387`). This violates Law of Demeter and is fragile. Consider passing the client or a facade directly.
+
+27. **`stream_names` and `list_streams` return `AsyncIterator` but are `async def` with `yield` (`__init__.py:352-415`)**: These are actually `AsyncGenerator`s. While `AsyncGenerator` is a subtype of `AsyncIterator`, the return type annotation could be more precise for tooling.
+
+28. **`config` and `state` typed as `Any` in API types (`api/types.py:547,558`)**: `StreamInfo`, `StreamInfoResponse`, etc. type these as `Any` instead of `StreamConfig`/`StreamState`. This defeats the purpose of TypedDict type safety.
+
+29. **`request_json` has hardcoded 5s timeout (`api/client.py:386`)**: No caller overrides it and there's no user-facing configuration. Long operations (e.g., stream purge on large streams) could time out unexpectedly.
+
+30. **`NoRespondersError` handling is inconsistent across API methods**: Only `account_info()` wraps `NoRespondersError` into `JetStreamNotEnabledError`. All other methods propagate the raw error.
+
+31. **No `__repr__` on key types**: `Message`, `Consumer`, `Stream` lack `__repr__`, making debugging harder. Dataclasses get this for free but these non-dataclass types don't.
 
 #### Low
 
-21. **`StreamConfig.from_kwargs` / `to_request` round-trip**: There are many fields (~50+) being manually mapped. This is a common source of subtle bugs when new fields are added. Consider generating these mappings or using a more automated approach.
+32. **`StreamConfig.from_kwargs` / `to_request` round-trip**: Many fields (~50+) are manually mapped. This is a common source of subtle bugs when new fields are added. Consider generating these mappings.
 
-22. **Package uses `setuptools` (`pyproject.toml:1-3`)**: The root project appears to use `uv`. Consider aligning build backends.
+33. **Package uses `setuptools` (`pyproject.toml:1-3`)**: The root project appears to use `uv`. Consider aligning build backends.
 
-23. **`nats-jetstream` depends on `nats-core` but this internal dependency isn't documented**: The relationship between the workspace packages and how users should install them needs clarification.
+34. **`nats-jetstream` depends on `nats-core` but this internal dependency isn't documented**: The relationship between workspace packages needs clarification for users.
+
+35. **`StreamNamesResponse` has a `consumers` field (`api/types.py:1473`)**: A stream names response should not have a `consumers` field. Likely a schema generation bug.
+
+36. **Duplicate `DeliverPolicy` types (`api/types.py:270-333`)**: Two sets of identical deliver policy TypedDicts exist; the first set appears unused.
+
+37. **Empty `README.md` and missing `py.typed` marker**: The README is 0 bytes. For PEP 561 type-checking support, a `py.typed` marker file should be included.
+
+38. **Redundant `new()` factory function (`__init__.py:816-828`)**: Adds no value over calling the `JetStream()` constructor directly.
 
 ---
 
 ## 4. Test Reliability (`nats-core/tests/test_examples.py`)
 
-24. **`run_example_with_retry` can return `None`**: If the overall timeout expires before any attempt completes, the function returns `None`, but callers do `assert req_result.returncode == 0` without a None guard. This would produce a confusing `AttributeError` instead of a clear test failure.
+39. **`run_example_with_retry` can return `None`**: If the overall timeout expires before any attempt completes, the function returns `None`, but callers do `assert req_result.returncode == 0` without a None guard. This would produce a confusing `AttributeError` instead of a clear test failure.
 
 ---
 
 ## 5. Build/Config Changes
 
-25. **Ruff `target-version` bumped from `py311` to `py312` (`pyproject.toml`)**: This should be coordinated with the actual minimum supported Python version. If the project still supports 3.11, this could mask lint warnings about 3.12-only syntax.
+40. **Ruff `target-version` bumped from `py311` to `py312` (`pyproject.toml`)**: This should be coordinated with the actual minimum supported Python version. If the project still supports 3.11, this could mask lint warnings about 3.12-only syntax. (This is directly related to issue #12 — the new JetStream package uses 3.12+ syntax.)
 
 ---
 
@@ -160,16 +192,22 @@ The new package is well-structured:
 
 | Severity | Count |
 |----------|-------|
-| High     | 5     |
-| Medium   | 8     |
-| Low      | 6     |
+| Critical | 1     |
+| High     | 10    |
+| Medium   | 13    |
+| Low      | 7     |
 
-### Recommendations
+### Top Recommendations
 
-1. **Split the PR**: Server pool changes, datetime fixes, and the new JetStream package should be separate PRs
-2. **Address high-severity issues**: Especially the transport reuse bug (#4), callback leaks (#13), and the polling loop (#14)
-3. **Add async handler support** (#2) or document the limitation
-4. **Fix `get_event_loop()` deprecation** (#16)
-5. **Unify `Server`/`Srv`** or clearly document the relationship (#1)
+1. **Fix Python 3.11 compatibility** (#12) or explicitly bump minimum version — this is a ship-blocker
+2. **Split the PR**: Server pool changes, datetime fixes, and the new JetStream package should be separate PRs
+3. **Fix the transport reuse bug** (#4) in the reconnect handler path
+4. **Fix callback leaks** (#14) — add unregistration in cleanup paths
+5. **Replace polling loops** (#15) with event-driven signaling
+6. **Implement `PullConsumer.get_info()`** (#16) — currently a no-op despite its docstring
+7. **Handle JetStream errors in `publish()`** (#17) — currently raises `KeyError`
+8. **Fix hardcoded prefix** (#18) in direct message get
+9. **Fix `get_event_loop()` deprecation** (#19)
+10. **Add async handler support** (#2) or document the limitation
 
-The overall code quality is good — well-documented, well-tested, and follows consistent patterns. The new JetStream package is a significant step forward in API design compared to the existing `nats.js` module.
+The overall code quality is good — well-documented, well-tested, and follows consistent patterns. The new JetStream package is a significant step forward in API design compared to the existing `nats.js` module. The main concerns are the Python 3.11 compatibility break, several bugs in the pull consumer, and the sheer scope of the PR making it hard to review holistically.
