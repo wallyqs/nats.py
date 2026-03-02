@@ -1,7 +1,8 @@
-"""Benchmarks for NATS protocol encoding operations."""
+"""Benchmarks for NATS protocol encoding and parsing operations."""
 
 import pytest
 from nats.client.protocol import command
+from nats.client.protocol.message import parse_headers
 
 
 def test_bench_encode_connect(benchmark):
@@ -123,3 +124,55 @@ def test_bench_encode_ping(benchmark):
 def test_bench_encode_pong(benchmark):
     """Benchmark encoding PONG command."""
     benchmark(command.encode_pong)
+
+
+# --- Header parsing benchmarks ---
+
+
+def test_bench_parse_headers_status_only(benchmark):
+    """Benchmark parsing status-only headers (fast path).
+
+    This is the most common pattern in JetStream for heartbeats,
+    no-messages responses, and timeouts.
+    """
+    data = b"NATS/1.0 100\r\n\r\n"
+    benchmark(parse_headers, data)
+
+
+def test_bench_parse_headers_status_with_description(benchmark):
+    """Benchmark parsing status headers with description (fast path)."""
+    data = b"NATS/1.0 503 No Responders\r\n\r\n"
+    benchmark(parse_headers, data)
+
+
+def test_bench_parse_headers_no_status(benchmark):
+    """Benchmark parsing headers without status line."""
+    data = b"NATS/1.0\r\n\r\n"
+    benchmark(parse_headers, data)
+
+
+def test_bench_parse_headers_single(benchmark):
+    """Benchmark parsing a single header."""
+    data = b"NATS/1.0\r\nX-Custom: value\r\n\r\n"
+    benchmark(parse_headers, data)
+
+
+def test_bench_parse_headers_multiple(benchmark):
+    """Benchmark parsing multiple headers."""
+    data = b"NATS/1.0\r\nX-Custom-1: value1\r\nX-Custom-2: value2\r\nX-Custom-3: value3\r\nContent-Type: application/json\r\nX-Request-ID: 12345-67890-abcdef\r\n\r\n"
+    benchmark(parse_headers, data)
+
+
+def test_bench_parse_headers_multivalue(benchmark):
+    """Benchmark parsing multi-value headers."""
+    data = b"NATS/1.0\r\nX-Custom: value1\r\nX-Custom: value2\r\nX-Custom: value3\r\nX-Tags: tag1\r\nX-Tags: tag2\r\nX-Tags: tag3\r\nX-Tags: tag4\r\n\r\n"
+    benchmark(parse_headers, data)
+
+
+def test_bench_parse_headers_jetstream_heartbeat(benchmark):
+    """Benchmark parsing JetStream idle heartbeat with status and headers.
+
+    This pattern is common in JetStream consumer heartbeat messages.
+    """
+    data = b"NATS/1.0 100\r\nNats-Last-Consumer: 1016\r\nNats-Last-Stream: 1024\r\n\r\n"
+    benchmark(parse_headers, data)

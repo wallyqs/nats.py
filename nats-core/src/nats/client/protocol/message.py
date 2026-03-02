@@ -108,6 +108,34 @@ class ParseError(Exception):
     """Parser error when handling NATS protocol messages."""
 
 
+_NATS_PREFIX: Final[bytes] = b"NATS/"
+_CRLF_CRLF: Final[bytes] = b"\r\n\r\n"
+_EMPTY_HEADERS: Final[dict[str, list[str]]] = {}
+
+
+def _parse_status_line_bytes(
+    status_line: bytes,
+) -> tuple[str | None, str | None]:
+    """Parse status code and description from a status line in bytes.
+
+    Args:
+        status_line: Raw bytes of the status line (without CRLF)
+
+    Returns:
+        Tuple of (status_code, status_description)
+    """
+    space_idx = status_line.find(b" ")
+    if space_idx < 0:
+        return None, None
+
+    rest = status_line[space_idx + 1 :]
+    space_idx2 = rest.find(b" ")
+    if space_idx2 < 0:
+        return rest.decode(), None
+
+    return rest[:space_idx2].decode(), rest[space_idx2 + 1 :].decode()
+
+
 def parse_headers(data: bytes) -> tuple[dict[str, list[str]], str | None, str | None]:
     """Parse header data into multi-value dictionary and status information.
 
@@ -120,6 +148,22 @@ def parse_headers(data: bytes) -> tuple[dict[str, list[str]], str | None, str | 
     Raises:
         ParseError: If headers are invalid
     """
+    # Fast path: detect status-only messages without full decode + split.
+    # Common in JetStream for heartbeats, no-messages, timeouts, etc.
+    # Patterns: b"NATS/1.0 100\r\n\r\n", b"NATS/1.0 404\r\n\r\n",
+    #           b"NATS/1.0 503 No Responders\r\n\r\n", b"NATS/1.0\r\n\r\n"
+    first_crlf = data.find(b"\r\n")
+    if first_crlf > 0:
+        # Check if the first \r\n is immediately followed by \r\n (no header lines)
+        if first_crlf + 2 < len(data) and data[first_crlf + 2 : first_crlf + 4] == b"\r\n":
+            status_line = data[:first_crlf]
+            if not status_line.startswith(_NATS_PREFIX):
+                msg = "Invalid header format: missing NATS version"
+                raise ParseError(msg)
+            status_code, status_description = _parse_status_line_bytes(status_line)
+            return _EMPTY_HEADERS, status_code, status_description
+
+    # General path: decode and parse all lines
     try:
         lines = data.decode().split("\r\n")
     except UnicodeDecodeError as e:
@@ -134,8 +178,8 @@ def parse_headers(data: bytes) -> tuple[dict[str, list[str]], str | None, str | 
         msg = "Invalid header format: missing NATS version"
         raise ParseError(msg)
 
-    status_line = lines[0]
-    status_parts = status_line.split(" ", 2)
+    status_line_str = lines[0]
+    status_parts = status_line_str.split(" ", 2)
     if len(status_parts) >= MIN_STATUS_PARTS:
         status_code = status_parts[1]
 
@@ -240,13 +284,13 @@ async def parse_hmsg(reader: Reader, args: list[bytes]) -> HMsg:
         msg = f"Total message too large: {total_size} bytes (max {MAX_PAYLOAD_SIZE})"
         raise ParseError(msg)
 
-    header_bytes = await reader.readexactly(header_size)
+    # Single read for headers + payload + trailing CRLF to reduce syscalls.
+    data = await reader.readexactly(total_size + 2)
+    header_bytes = data[:header_size]
 
     headers, status_code, status_description = parse_headers(header_bytes)
 
-    payload_size = total_size - header_size
-    payload_with_crlf = await reader.readexactly(payload_size + 2)
-    payload = payload_with_crlf[:payload_size]
+    payload = data[header_size:total_size]
 
     subject = subject_bytes.decode()
     sid = sid_bytes.decode()

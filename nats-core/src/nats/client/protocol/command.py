@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
     from nats.client.protocol.types import ConnectInfo
@@ -49,6 +49,11 @@ def encode_pub(
     return command + payload + b"\r\n"
 
 
+_HPUB_HDR_PREFIX: Final[bytes] = b"NATS/1.0\r\n"
+_HPUB_HDR_SEP: Final[bytes] = b": "
+_HPUB_CRLF: Final[bytes] = b"\r\n"
+
+
 def encode_hpub(
     subject: bytes,
     payload: bytes,
@@ -67,11 +72,24 @@ def encode_hpub(
     Returns:
         Encoded HPUB command with headers and payload
     """
-    header_lines = ["NATS/1.0"] + [
-        f"{key}: {item}" for key, value in headers.items() for item in (value if isinstance(value, list) else [value])
-    ]
-
-    header_data = ("\r\n".join(header_lines) + "\r\n\r\n").encode()
+    # Build header data directly in bytes to avoid str→bytes conversion
+    # of the entire joined string.
+    parts: list[bytes] = [_HPUB_HDR_PREFIX]
+    for key, value in headers.items():
+        key_bytes = key.encode()
+        if isinstance(value, list):
+            for item in value:
+                parts.append(key_bytes)
+                parts.append(_HPUB_HDR_SEP)
+                parts.append(item.encode())
+                parts.append(_HPUB_CRLF)
+        else:
+            parts.append(key_bytes)
+            parts.append(_HPUB_HDR_SEP)
+            parts.append(value.encode())
+            parts.append(_HPUB_CRLF)
+    parts.append(_HPUB_CRLF)
+    header_data = b"".join(parts)
 
     hdr_len = len(header_data)
     total_len = hdr_len + len(payload)
