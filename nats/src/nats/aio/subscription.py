@@ -109,6 +109,7 @@ class Subscription:
             self._active_consumers = None
         self._pending_size = 0
         self._wait_for_msgs_task = None
+        self._shutdown_called = False
 
         # For JetStream enabled subscriptions.
         self._jsi: Optional[JetStreamContext._JSI] = None
@@ -370,6 +371,9 @@ class Subscription:
         For Python 3.13+, uses queue.shutdown() for clean termination.
         For older Python versions, sends sentinel values to unblock consumers.
         """
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
         try:
             if _HAS_QUEUE_SHUTDOWN:
                 # Python 3.13+: Use queue shutdown for graceful termination.
