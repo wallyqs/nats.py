@@ -42,6 +42,10 @@ else:
         pass
 
 
+# Sentinel placed into the pending queue during reconnect to unblock
+# consumers immediately so they can re-issue pull requests.
+_RECONNECT_SENTINEL = object()
+
 DEFAULT_SUB_PENDING_MSGS_LIMIT = 512 * 1024
 DEFAULT_SUB_PENDING_BYTES_LIMIT = 128 * 1024 * 1024
 
@@ -96,10 +100,11 @@ class Subscription:
         self._pending_bytes_limit = pending_bytes_limit
         self._pending_queue: asyncio.Queue[Msg] = asyncio.Queue(maxsize=pending_msgs_limit)
 
-        # For Python < 3.13, we need to track active consumers for sentinel-based termination
-        # For Python 3.13+, we use QueueShutDown which doesn't require tracking.
-        if not _HAS_QUEUE_SHUTDOWN and cb is None:
-            self._active_consumers = 0  # Counter of active consumers waiting for messages
+        # Track active consumers waiting for messages on sync subscriptions.
+        # Used by _shutdown_queue (Python < 3.13 sentinel termination) and
+        # _signal_reconnect (to unblock only when consumers are waiting).
+        if cb is None:
+            self._active_consumers = 0
         else:
             self._active_consumers = None
         self._pending_size = 0
@@ -274,6 +279,11 @@ class Subscription:
                 raise errors.ConnectionClosedError
             raise errors.TimeoutError
 
+        # Check for reconnect sentinel — connection was lost and is reconnecting.
+        if msg is _RECONNECT_SENTINEL:
+            self._pending_queue.task_done()
+            raise errors.ConnectionReconnectingError
+
         self._pending_size -= len(msg.data)
 
         # NOTE: For sync subscriptions we will consider a message
@@ -363,6 +373,22 @@ class Subscription:
 
         if not self._conn.is_reconnecting:
             await self._conn._send_unsubscribe(self._id, limit=limit)
+
+    def _signal_reconnect(self) -> None:
+        """
+        Unblock waiting consumers by placing reconnect sentinels into the queue.
+
+        Unlike _shutdown_queue, this does not permanently close the queue —
+        consumers can continue using it after the reconnect completes.
+        Only sends sentinels when consumers are actively waiting.
+        """
+        if self._active_consumers is None or self._active_consumers <= 0:
+            return
+        try:
+            for _ in range(self._active_consumers):
+                self._pending_queue.put_nowait(_RECONNECT_SENTINEL)
+        except asyncio.QueueFull:
+            pass
 
     def _shutdown_queue(self) -> None:
         """
