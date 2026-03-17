@@ -4071,7 +4071,7 @@ class ObjectStoreTest(SingleJetStreamServerTestCase):
         assert sinfo.config.max_bytes == -1
         assert sinfo.config.discard == "new"
         version = nc.connected_server_version
-        if version.major == 2 and version.minor > 12:
+        if version.major == 2 and version.minor == 13:
             assert sinfo.config.max_age is None
         else:
             assert sinfo.config.max_age == 0
@@ -4081,7 +4081,7 @@ class ObjectStoreTest(SingleJetStreamServerTestCase):
         assert sinfo.config.num_replicas == 1
         assert sinfo.config.allow_rollup_hdrs == True
         assert sinfo.config.allow_direct == True
-        if version.major == 2 and version.minor > 12:
+        if version.major == 2 and version.minor == 13:
             assert sinfo.config.mirror_direct is None
         else:
             assert sinfo.config.mirror_direct == False
@@ -5098,7 +5098,7 @@ class V210FeaturesTest(SingleJetStreamServerTestCase):
         )
         sinfo = await js.stream_info("NONE")
         version = nc.connected_server_version
-        if version.major == 2 and version.minor > 12:
+        if version.major == 2 and version.minor == 13:
             assert sinfo.config.compression is None
         else:
             assert sinfo.config.compression == nats.js.api.StoreCompression.NONE
@@ -5110,7 +5110,7 @@ class V210FeaturesTest(SingleJetStreamServerTestCase):
             subjects=["quux"],
         )
         sinfo = await js.stream_info("NONE2")
-        if version.major == 2 and version.minor > 12:
+        if version.major == 2 and version.minor == 13:
             assert sinfo.config.compression is None
         else:
             assert sinfo.config.compression == nats.js.api.StoreCompression.NONE
