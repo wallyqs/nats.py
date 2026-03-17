@@ -151,48 +151,19 @@ class Subscription:
     async def _message_generator(self) -> AsyncIterator[Msg]:
         """
         Async generator that yields messages directly from the subscription queue.
+
+        Uses next_msg(timeout=0) internally so that both next_msg() and
+        async-for share the same code path for retrieving messages.
         """
-        yielded_count = 0
+        while True:
+            try:
+                msg = await self.next_msg(timeout=0)
+            except (errors.ConnectionClosedError, errors.TimeoutError, errors.ConnectionReconnectingError):
+                break
+            except asyncio.CancelledError:
+                break
 
-        if self._active_consumers is not None:
-            self._active_consumers += 1
-
-        try:
-            while True:
-                # Check if subscription was cancelled/closed.
-                if self._closed:
-                    break
-
-                # Check max message limit based on how many we've yielded so far.
-                if self._max_msgs > 0 and yielded_count >= self._max_msgs:
-                    break
-
-                try:
-                    msg = await self._pending_queue.get()
-                except asyncio.CancelledError:
-                    break
-                except QueueShutDown:
-                    break
-
-                # Check for sentinel value which signals generator to stop.
-                if msg is None:
-                    self._pending_queue.task_done()
-                    break
-
-                self._pending_queue.task_done()
-                self._pending_size -= len(msg.data)
-
-                yield msg
-                yielded_count += 1
-
-                # Check if we should auto-unsubscribe after yielding this message.
-                if self._max_msgs > 0 and yielded_count >= self._max_msgs:
-                    break
-        except asyncio.CancelledError:
-            pass
-        finally:
-            if self._active_consumers is not None:
-                self._active_consumers -= 1
+            yield msg
 
     @property
     def pending_msgs(self) -> int:
@@ -384,11 +355,13 @@ class Subscription:
         """
         if self._active_consumers is None or self._active_consumers <= 0:
             return
-        try:
-            for _ in range(self._active_consumers):
+        for _ in range(self._active_consumers):
+            try:
                 self._pending_queue.put_nowait(_RECONNECT_SENTINEL)
-        except asyncio.QueueFull:
-            pass
+            except asyncio.QueueFull:
+                # Queue is full — consumer will see messages before the sentinel,
+                # so it will naturally process and eventually drain. Best effort.
+                break
 
     def _shutdown_queue(self) -> None:
         """
@@ -408,6 +381,8 @@ class Subscription:
                 for _ in range(sentinels_to_send):
                     self._pending_queue.put_nowait(None)
         except Exception:
+            # QueueFull: best effort — consumers will unblock when they drain messages.
+            # QueueShutDown (3.13+): queue was already shut down by a concurrent call.
             pass
 
     def _stop_processing(self) -> None:
