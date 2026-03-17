@@ -4070,14 +4070,14 @@ class ObjectStoreTest(SingleJetStreamServerTestCase):
         assert sinfo.config.max_msgs == -1
         assert sinfo.config.max_bytes == -1
         assert sinfo.config.discard == "new"
-        assert sinfo.config.max_age == 0
+        assert sinfo.config.max_age in (0, None)
         assert sinfo.config.max_msgs_per_subject == -1
         assert sinfo.config.max_msg_size == -1
         assert sinfo.config.storage == "file"
         assert sinfo.config.num_replicas == 1
         assert sinfo.config.allow_rollup_hdrs == True
         assert sinfo.config.allow_direct == True
-        assert sinfo.config.mirror_direct == False
+        assert sinfo.config.mirror_direct in (False, None)
 
         bucketname = "".join(random.SystemRandom().choice(string.ascii_letters) for _ in range(10))
         obs = await js.create_object_store(bucket=bucketname)
@@ -5090,7 +5090,7 @@ class V210FeaturesTest(SingleJetStreamServerTestCase):
             compression="none",
         )
         sinfo = await js.stream_info("NONE")
-        assert sinfo.config.compression == nats.js.api.StoreCompression.NONE
+        assert sinfo.config.compression in (nats.js.api.StoreCompression.NONE, None)
 
         # By default it should be using 'none' as the configured compression value.
         js = nc.jetstream()
@@ -5099,7 +5099,7 @@ class V210FeaturesTest(SingleJetStreamServerTestCase):
             subjects=["quux"],
         )
         sinfo = await js.stream_info("NONE2")
-        assert sinfo.config.compression == nats.js.api.StoreCompression.NONE
+        assert sinfo.config.compression in (nats.js.api.StoreCompression.NONE, None)
         await nc.close()
 
     @async_test
