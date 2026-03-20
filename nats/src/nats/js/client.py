@@ -32,7 +32,7 @@ from typing import (
 import nats.errors
 import nats.js.errors
 from nats.aio.msg import Msg
-from nats.aio.subscription import Subscription
+from nats.aio.subscription import _RECONNECT_SENTINEL, Subscription
 from nats.js import api
 from nats.js.errors import (
     BadBucketError,
@@ -1112,6 +1112,10 @@ class JetStreamContext(JetStreamManager):
             while not queue.empty():
                 try:
                     msg = queue.get_nowait()
+                    if msg is _RECONNECT_SENTINEL:
+                        # Connection was lost — skip cached messages and fall
+                        # through to re-issue the pull request below.
+                        break
                     self._sub._pending_size -= len(msg.data)
                     status = JetStreamContext.is_status_msg(msg)
                     if status:
@@ -1207,6 +1211,10 @@ class JetStreamContext(JetStreamManager):
             while not queue.empty():
                 try:
                     msg = queue.get_nowait()
+                    if msg is _RECONNECT_SENTINEL:
+                        # Connection was lost — stop draining stale messages
+                        # and fall through to re-issue the pull request.
+                        break
                     self._sub._pending_size -= len(msg.data)
                     status = JetStreamContext.is_status_msg(msg)
                     if status:
