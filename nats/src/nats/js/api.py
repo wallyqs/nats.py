@@ -110,15 +110,19 @@ class Base:
 
     @staticmethod
     def _parse_utc_iso(time_string: str) -> datetime.datetime:
-        """Parse an ISO 8601 timestamp (with nanoseconds) into a UTC datetime."""
+        """Parse an ISO 8601 UTC timestamp into a datetime."""
         # Replace Z with UTC offset
         s = time_string.replace("Z", "+00:00")
-        # Trim fractional seconds to 6 digits (microsecond precision) when microseconds are present.
+        # Trim fractional seconds to 6 digits (microsecond precision) when present.
         if "." in s:
             date_part, frac_tz = s.split(".", 1)
-            frac, tz = frac_tz.split("+")
-            frac = frac[:6]  # keep only microseconds
-            s = f"{date_part}.{frac}+{tz}"
+            # Split timezone offset which starts with + or -
+            for i, c in enumerate(frac_tz):
+                if c in ("+", "-"):
+                    frac = frac_tz[:i][:6]  # keep only microseconds
+                    tz = frac_tz[i:]
+                    s = f"{date_part}.{frac}{tz}"
+                    break
         return datetime.datetime.fromisoformat(s).astimezone(datetime.timezone.utc)
 
     @classmethod

@@ -4969,6 +4969,31 @@ class DatetimeFieldsTest(unittest.TestCase):
             tzinfo=datetime.timezone.utc,
         )
 
+    def test_opt_start_time_zero_microseconds_roundtrip(self):
+        # When microseconds are zero, _to_utc_iso strips the fractional part.
+        # _parse_utc_iso must be able to parse it back.
+        dt = datetime.datetime(2026, 6, 1, 0, 0, 0, tzinfo=datetime.timezone.utc)
+        cfg = nats.js.api.ConsumerConfig(opt_start_time=dt)
+        serialized = cfg.as_dict()
+        assert serialized["opt_start_time"] == "2026-06-01T00:00:00Z"
+        restored = nats.js.api.ConsumerConfig.from_response(serialized)
+        assert restored.opt_start_time == dt
+
+    def test_opt_start_time_negative_utc_offset(self):
+        # -05:00 offset with fractional seconds
+        blob = '{"name": "s", "opt_start_time": "2024-02-19T14:20:50.500000-05:00"}'
+        src = nats.js.api.StreamSource.from_response(json.loads(blob))
+        assert src.opt_start_time == datetime.datetime(
+            2024,
+            2,
+            19,
+            19,
+            20,
+            50,
+            500000,
+            tzinfo=datetime.timezone.utc,
+        )
+
 
 class V210FeaturesTest(SingleJetStreamServerTestCase):
     @async_test
