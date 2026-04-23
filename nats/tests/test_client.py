@@ -23,9 +23,11 @@ from tests.utils import (
     MultiTLSServerAuthTestCase,
     NoAuthUserServerTestCase,
     SingleServerTestCase,
+    TLSAllowNonTLSServerTestCase,
     TLSServerHandshakeFirstTestCase,
     TLSServerTestCase,
     async_test,
+    get_config_file,
 )
 
 
@@ -183,6 +185,63 @@ class ClientTest(SingleServerTestCase):
         await nc.close()
         self.assertTrue(nc.is_closed)
         self.assertFalse(nc.is_connected)
+
+    @async_test
+    async def test_tls_scheme_against_plaintext_server_is_rejected(self):
+        nc = NATS()
+        with self.assertRaises(nats.errors.SecureConnWantedError):
+            await nc.connect("tls://127.0.0.1:4222", allow_reconnect=False)
+        self.assertFalse(nc.is_connected)
+
+    @async_test
+    async def test_explicit_ssl_context_against_plaintext_server_is_rejected(self):
+        nc = NATS()
+        ctx = ssl.create_default_context()
+        with self.assertRaises(nats.errors.SecureConnWantedError):
+            await nc.connect(
+                servers=["nats://127.0.0.1:4222"],
+                tls=ctx,
+                allow_reconnect=False,
+            )
+        self.assertFalse(nc.is_connected)
+
+    @async_test
+    async def test_connect_urls_from_pre_handshake_info_are_not_merged(self):
+        """When a client opting into TLS reads the initial INFO before the
+        handshake has completed, cluster discovery fields on that line are
+        deferred and only honored from a subsequent INFO received after the
+        transport is secured."""
+
+        connections = []
+
+        async def fake_server(reader, writer):
+            connections.append((reader, writer))
+            info = {
+                "server_id": "test",
+                "version": "2.10.0",
+                "go": "x",
+                "host": "127.0.0.1",
+                "port": 4222,
+                "max_payload": 1048576,
+                "proto": 1,
+                "connect_urls": ["peer.example:4222"],
+            }
+            writer.write(b"INFO " + json.dumps(info).encode() + b"\r\n")
+            await writer.drain()
+
+        srv = await asyncio.start_server(fake_server, "127.0.0.1", 0)
+        port = srv.sockets[0].getsockname()[1]
+
+        nc = NATS()
+        try:
+            with self.assertRaises(nats.errors.SecureConnWantedError):
+                await nc.connect(f"tls://127.0.0.1:{port}", allow_reconnect=False)
+            self.assertTrue(all("peer.example" not in s.uri.netloc for s in nc._server_pool))
+        finally:
+            for _, writer in connections:
+                writer.close()
+            srv.close()
+            await srv.wait_closed()
 
     def test_connect_syntax_sugar(self):
         nc = NATS()
@@ -1937,6 +1996,122 @@ class ClientTLSTest(TLSServerTestCase):
         self.assertEqual(payload, msg.data)
         self.assertEqual(1, sub._received)
         await nc.close()
+
+
+class ClientTLSAllowNonTLSTest(TLSAllowNonTLSServerTestCase):
+    """A server with `tls {} + allow_non_tls = true` advertises
+    tls_available: true (not tls_required). Clients opting in via tls:// or an
+    explicit ssl.SSLContext should upgrade; plain nats:// should stay
+    plaintext; neither path should raise."""
+
+    @async_test
+    async def test_tls_scheme_upgrades_when_server_advertises_tls_available(self):
+        nc = NATS()
+        await nc.connect("tls://127.0.0.1:4224", tls=self.ssl_ctx, allow_reconnect=False)
+        self.assertTrue(nc.is_connected)
+        self.assertFalse(nc._server_info.get("tls_required", False))
+        self.assertTrue(nc._server_info.get("tls_available", False))
+        await nc.close()
+
+    @async_test
+    async def test_explicit_ssl_context_upgrades_when_server_advertises_tls_available(self):
+        nc = NATS()
+        await nc.connect("nats://127.0.0.1:4224", tls=self.ssl_ctx, allow_reconnect=False)
+        self.assertTrue(nc.is_connected)
+        self.assertFalse(nc._server_info.get("tls_required", False))
+        self.assertTrue(nc._server_info.get("tls_available", False))
+        await nc.close()
+
+    @async_test
+    async def test_plain_scheme_stays_plaintext_when_server_advertises_tls_available(self):
+        nc = NATS()
+        await nc.connect("nats://127.0.0.1:4224", allow_reconnect=False)
+        self.assertTrue(nc.is_connected)
+        self.assertFalse(nc._server_info.get("tls_required", False))
+        self.assertTrue(nc._server_info.get("tls_available", False))
+        await nc.close()
+
+
+class ClientTLSTerminationProxyTest(SingleServerTestCase):
+    """Simulate a load balancer / TLS-termination proxy fronting a plain
+    nats-server: the proxy listens with TLS and forwards decrypted bytes to
+    the backend. The client connects with tls_handshake_first=True so TLS
+    is negotiated with the proxy before any NATS protocol bytes are
+    exchanged."""
+
+    async def _start_tls_proxy(self, backend_host, backend_port):
+        server_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        server_ctx.load_cert_chain(
+            certfile=get_config_file("certs/server-cert.pem"),
+            keyfile=get_config_file("certs/server-key.pem"),
+        )
+
+        async def pipe(reader, writer):
+            try:
+                while True:
+                    data = await reader.read(4096)
+                    if not data:
+                        break
+                    writer.write(data)
+                    await writer.drain()
+            except Exception:
+                pass
+            finally:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
+        async def handler(client_reader, client_writer):
+            try:
+                backend_reader, backend_writer = await asyncio.open_connection(backend_host, backend_port)
+            except Exception:
+                client_writer.close()
+                return
+            a = asyncio.create_task(pipe(client_reader, backend_writer))
+            b = asyncio.create_task(pipe(backend_reader, client_writer))
+            await asyncio.gather(a, b, return_exceptions=True)
+
+        return await asyncio.start_server(handler, "127.0.0.1", 0, ssl=server_ctx)
+
+    @async_test
+    async def test_connect_via_tls_termination_proxy_with_handshake_first(self):
+        proxy = await self._start_tls_proxy("127.0.0.1", 4222)
+        proxy_port = proxy.sockets[0].getsockname()[1]
+
+        client_ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
+        client_ctx.load_verify_locations(get_config_file("certs/ca.pem"))
+
+        nc = NATS()
+        try:
+            await nc.connect(
+                f"tls://127.0.0.1:{proxy_port}",
+                tls=client_ctx,
+                tls_handshake_first=True,
+                allow_reconnect=False,
+            )
+            self.assertTrue(nc.is_connected)
+            # Backend is a plain nats-server so INFO carries neither flag.
+            self.assertFalse(nc._server_info.get("tls_required", False))
+            self.assertFalse(nc._server_info.get("tls_available", False))
+
+            # End-to-end round-trip through the proxy.
+            msgs = []
+
+            async def cb(msg):
+                msgs.append(msg)
+
+            await nc.subscribe("proxy.test", cb=cb)
+            await nc.publish("proxy.test", b"via-proxy")
+            await nc.flush()
+            await asyncio.sleep(0.2)
+
+            self.assertEqual(1, len(msgs))
+            self.assertEqual(b"via-proxy", msgs[0].data)
+        finally:
+            await nc.close()
+            proxy.close()
+            await proxy.wait_closed()
 
 
 class ClientTLSReconnectTest(MultiTLSServerAuthTestCase):

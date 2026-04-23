@@ -255,6 +255,22 @@ class TLSServerHandshakeFirstTestCase(unittest.TestCase):
         self.loop.close()
 
 
+class TLSAllowNonTLSServerTestCase(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.loop = asyncio.new_event_loop()
+
+        self.natsd = NATSD(port=4224, config_file=get_config_file("conf/tls_allow_non_tls.conf"))
+        start_natsd(self.natsd)
+
+        self.ssl_ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
+        self.ssl_ctx.load_verify_locations(get_config_file("certs/ca.pem"))
+
+    def tearDown(self):
+        self.natsd.stop()
+        self.loop.close()
+
+
 class MultiTLSServerAuthTestCase(unittest.TestCase):
     def setUp(self):
         super().setUp()

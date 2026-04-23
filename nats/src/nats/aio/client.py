@@ -2125,11 +2125,46 @@ class Client:
         except Exception:
             raise errors.Error("nats: info message, json parse error")
 
+        # Decide on a TLS upgrade before merging any cluster discovery fields
+        # from the INFO line. When the first INFO arrives before the TLS
+        # handshake (tls:// without tls_handshake_first, or nats:// with an
+        # explicit ssl.SSLContext), defer connect_urls until a later INFO is
+        # received over the secured transport.
+        scheme = self._current_server.uri.scheme
+        server_requires_tls = bool(self._server_info.get("tls_required"))
+        server_allows_tls = server_requires_tls or bool(self._server_info.get("tls_available"))
+        client_wants_tls = scheme == "tls" or "tls" in self.options
+        info_received_over_tls = handshake_first or scheme == "wss"
+
+        if scheme != "ws" and (server_requires_tls or (client_wants_tls and server_allows_tls)):
+            if not handshake_first:
+                await self._transport.drain()  # just in case something is left
+
+                # connect to transport via tls
+                await self._transport.connect_tls(
+                    hostname,
+                    self.ssl_context,
+                    DEFAULT_BUFFER_SIZE,
+                    self.options["connect_timeout"],
+                )
+        elif not handshake_first and scheme not in ("ws", "wss") and client_wants_tls:
+            # Client asked for TLS (tls:// URL or an explicit ssl.SSLContext),
+            # but the server advertises neither tls_required nor tls_available.
+            # Refuse to fall back to plaintext so credentials in CONNECT
+            # aren't exposed.
+            raise errors.SecureConnWantedError()
+
         # In case 'auth_required' is part of INFO, then need to send credentials.
         if srv_info.get("auth_required", False):
             self._auth_configured = True
 
-        await self._process_info(srv_info, initial_connection=True)
+        # Only merge cluster discovery fields from INFO if the line arrived
+        # after the TLS handshake (handshake_first / wss), or if the client
+        # never asked for TLS in the first place. For tls:// or an explicit
+        # ssl.SSLContext, the initial INFO came in before the handshake, so
+        # defer and let a later INFO populate the pool.
+        if info_received_over_tls or not client_wants_tls:
+            await self._process_info(srv_info, initial_connection=True)
 
         if "version" in self._server_info:
             self._current_server.server_version = self._server_info["version"]
@@ -2142,22 +2177,6 @@ class Client:
 
         if "client_ip" in self._server_info:
             self._client_ip = self._server_info["client_ip"]
-
-        if (
-            "tls_required" in self._server_info
-            and self._server_info["tls_required"]
-            and self._current_server.uri.scheme != "ws"
-        ):
-            if not handshake_first:
-                await self._transport.drain()  # just in case something is left
-
-                # connect to transport via tls
-                await self._transport.connect_tls(
-                    hostname,
-                    self.ssl_context,
-                    DEFAULT_BUFFER_SIZE,
-                    self.options["connect_timeout"],
-                )
 
         # Refresh state of parser upon reconnect.
         if self.is_reconnecting:
