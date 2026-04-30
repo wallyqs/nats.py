@@ -3112,7 +3112,7 @@ class KVTest(SingleJetStreamServerTestCase):
         assert config.template_owner == None
 
         version = nc.connected_server_version
-        if version.major == 2 and (version.minor < 9 or version.minor > 12):
+        if version.major == 2 and version.minor < 9:
             assert config.allow_direct == None
         else:
             assert config.allow_direct == False
