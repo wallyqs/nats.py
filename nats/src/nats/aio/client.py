@@ -1804,7 +1804,18 @@ class Client:
             name, sep, value = line.partition(b": ")
             if not sep:
                 continue
-            out[name.strip().decode("ascii", "replace")] = value.strip().decode("utf-8", "replace")
+            try:
+                key = name.strip().decode("ascii")
+            except UnicodeDecodeError:
+                # Malformed name (non-ASCII bytes) -- skip rather than emit
+                # a U+FFFD-laced key that's unreachable via normal lookup.
+                continue
+            # Header names are tokens; whitespace inside the name is
+            # invalid (RFC 5322 sec 3.6.8 -- same rule the existing
+            # `fast_mail_parser` post-pass enforces).
+            if any(c in key for c in string.whitespace):
+                continue
+            out[key] = value.strip().decode("utf-8", "replace")
         return out
 
     def _is_control_message(self, data, header: Dict[str, str]) -> Optional[str]:
