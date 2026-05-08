@@ -145,6 +145,16 @@ class ClientUtilsTest(unittest.TestCase):
             self.assertEqual(v.minor, 2)
             self.assertTrue(v.patch, 2)
 
+    def test_header_with_non_ascii_value(self):
+        # Repro for #491 / #924 -- non-ASCII bytes in a header value
+        # must not silently empty the headers dict.
+        nc = NATS()
+        raw = b"NATS/1.0\r\nNats-Msg-Id: ABC\xc2\xa3DEF\r\nfoo: bar\r\n\r\n"
+        hdr = asyncio.run(nc._process_headers(raw))
+        self.assertIsNotNone(hdr)
+        self.assertEqual(hdr["Nats-Msg-Id"], "ABC£DEF")
+        self.assertEqual(hdr["foo"], "bar")
+
 
 class ClientTest(SingleServerTestCase):
     @async_test

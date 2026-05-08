@@ -25,7 +25,6 @@ import string
 import time
 from collections import UserString
 from dataclasses import dataclass
-from email.parser import BytesParser
 from io import BytesIO
 from pathlib import Path
 from random import shuffle
@@ -303,7 +302,6 @@ class Client:
         self._flush_queue: Optional[asyncio.Queue[asyncio.Future[Any]]] = None
         self._flusher_task: Optional[asyncio.Task] = None
         self._flush_timeout: Optional[float] = 0
-        self._hdr_parser: BytesParser = BytesParser()
 
         # New style request/response
         self._resp_map: Dict[str, asyncio.Future] = {}
@@ -1789,6 +1787,26 @@ class Client:
             self._pongs_received += 1
             self._pings_outstanding = 0
 
+    @staticmethod
+    def _parse_header_lines(raw: bytes) -> Dict[str, str]:
+        """Parse a NATS message-header block (`Name: Value\\r\\n` per line).
+
+        NATS headers are HTTP-flavoured but not emails -- no RFC 2047
+        encoded-words, no folding, no charset decoding. A byte-level
+        split + decode avoids `email.parser.BytesParser`'s Header-object
+        return for non-ASCII values, which silently dropped the entire
+        headers dict via `_default_error_callback` (see #491, #924).
+        """
+        out: Dict[str, str] = {}
+        for line in raw.split(_CRLF_):
+            if not line:
+                continue
+            name, sep, value = line.partition(b": ")
+            if not sep:
+                continue
+            out[name.strip().decode("ascii", "replace")] = value.strip().decode("utf-8", "replace")
+        return out
+
     def _is_control_message(self, data, header: Dict[str, str]) -> Optional[str]:
         if len(data) > 0:
             return None
@@ -1838,9 +1856,7 @@ class Client:
                 i = desc.find(_CRLF_)
                 if i > 0:
                     hdr[nats.js.api.Header.DESCRIPTION] = desc[:i].decode()
-                    parsed_hdr = self._hdr_parser.parsebytes(desc[i + _CRLF_LEN_ :])
-                    for k, v in parsed_hdr.items():
-                        hdr[k] = v
+                    hdr.update(self._parse_header_lines(desc[i + _CRLF_LEN_ :]))
                 else:
                     # Just inline status...
                     hdr[nats.js.api.Header.DESCRIPTION] = desc.decode()
@@ -1858,7 +1874,7 @@ class Client:
             if parse_email:
                 parsed_hdr = parse_email(raw_headers).headers
             else:
-                parsed_hdr = {k.strip(): v.strip() for k, v in self._hdr_parser.parsebytes(raw_headers).items()}
+                parsed_hdr = self._parse_header_lines(raw_headers)
             if hdr:
                 hdr.update(parsed_hdr)
             else:
