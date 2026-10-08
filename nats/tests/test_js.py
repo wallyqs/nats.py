@@ -4971,6 +4971,32 @@ class ObjectStoreTest(SingleJetStreamServerTestCase):
         await nc.close()
 
     @async_test
+    async def test_object_watch_stop_ends_iteration(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        obs = await js.create_object_store("WATCHSTOP")
+        await obs.put("A", b"A")
+
+        watcher = await obs.watch()
+        received = []
+
+        async def iterate():
+            async for info in watcher:
+                received.append(info)
+
+        task = asyncio.create_task(iterate())
+        # Let the iterator receive the initial entry and wait for more.
+        await asyncio.sleep(0.5)
+        assert not task.done()
+
+        await watcher.stop()
+        await asyncio.wait_for(task, timeout=2)
+
+        assert [info.name for info in received if info is not None] == ["A"]
+        await nc.close()
+
+    @async_test
     async def test_object_list(self):
         errors = []
 

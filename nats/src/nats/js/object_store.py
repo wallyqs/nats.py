@@ -431,6 +431,16 @@ class ObjectStore:
             stop will stop this watcher.
             """
             await self._sub.unsubscribe()
+            # Wake any iterator waiting for an update so that it ends.
+            while True:
+                try:
+                    self._updates.put_nowait(ObjectStore.ObjectWatcher.STOP_ITER)
+                    return
+                except asyncio.QueueFull:
+                    try:
+                        self._updates.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
 
         async def updates(self, timeout=5.0):
             """
