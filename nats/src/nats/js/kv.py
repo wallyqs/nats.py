@@ -19,6 +19,7 @@ import datetime
 import logging
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import nats.errors
@@ -36,6 +37,27 @@ MSG_ROLLUP_SUBJECT = "sub"
 KV_MARKER_REASON = "Nats-Marker-Reason"
 
 logger = logging.getLogger(__name__)
+
+
+class KeyValueOp(str, Enum):
+    """
+    KeyValueOp is the operation of a KeyValue entry (nats.go KeyValueOp).
+
+    The values are the KV-Operation header tokens, so they compare equal
+    to Entry.operation; str() gives nats.go's names.
+    """
+
+    PUT = "PUT"
+    DELETE = KV_DEL
+    PURGE = KV_PURGE
+
+    def __str__(self) -> str:
+        if self is KeyValueOp.PUT:
+            return "KeyValuePutOp"
+        if self is KeyValueOp.DELETE:
+            return "KeyValueDeleteOp"
+        return "KeyValuePurgeOp"
+
 
 VALID_KEY_RE = re.compile(r"^[-/_=\.a-zA-Z0-9]+$")
 VALID_SEARCH_KEY_RE = re.compile(r"^[-/_=\.a-zA-Z0-9*]*[>]?$")
@@ -104,6 +126,18 @@ class KeyValue:
         delta: Optional[int]
         created: Optional[int]
         operation: Optional[str]
+
+        @property
+        def op(self) -> KeyValueOp:
+            """
+            op returns the entry's operation as a KeyValueOp; unlike
+            operation, which is None for a value, it is PUT then.
+            """
+            if self.operation == KV_DEL:
+                return KeyValueOp.DELETE
+            if self.operation == KV_PURGE:
+                return KeyValueOp.PURGE
+            return KeyValueOp.PUT
 
     @dataclass(frozen=True)
     class BucketStatus:
@@ -225,6 +259,13 @@ class KeyValue:
         if use_js_prefix and js._prefix != api.DEFAULT_PREFIX:
             self._mutation_pre = f"{js._prefix}.{self._mutation_pre}"
 
+    @property
+    def bucket(self) -> str:
+        """
+        bucket returns the name of the bucket.
+        """
+        return self._name
+
     async def get(self, key: str, revision: Optional[int] = None, validate_keys: bool = True) -> Entry:
         """
         get returns the latest value for the key.
@@ -298,6 +339,13 @@ class KeyValue:
 
         pa = await self._js.publish(f"{self._mutation_pre}{key}", value)
         return pa.seq
+
+    async def put_string(self, key: str, value: str, validate_keys: bool = True) -> int:
+        """
+        put_string places a string value for the key, encoded as UTF-8,
+        and returns the revision number.
+        """
+        return await self.put(key, value.encode(), validate_keys=validate_keys)
 
     async def create(self, key: str, value: bytes, validate_keys: bool = True, msg_ttl: Optional[float] = None) -> int:
         """

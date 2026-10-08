@@ -5,6 +5,7 @@ import nats.errors
 import nats.js.api
 import nats.js.kv
 import pytest
+from nats.js.kv import KeyValueOp
 from nats.js.errors import (
     APIError,
     BadRequestError,
@@ -520,5 +521,41 @@ class KVListKeysTest(SingleJetStreamServerTestCase):
 
         # keys() keeps its substring filters.
         assert sorted(await kv.keys(filters=["ders"])) == ["orders.1", "orders.2"]
+
+        await nc.close()
+
+
+class KVHandleTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_bucket_put_string_and_op(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        kv = await js.create_key_value(bucket="HANDLE", history=5)
+        assert kv.bucket == "HANDLE"
+        assert (await js.key_value("HANDLE")).bucket == "HANDLE"
+
+        rev = await kv.put_string("greeting", "héllo")
+        entry = await kv.get("greeting")
+        assert entry.value == "héllo".encode()
+        assert entry.revision == rev
+        # A value keeps operation None, as before; op names it.
+        assert entry.operation is None
+        assert entry.op is KeyValueOp.PUT
+
+        await kv.delete("greeting")
+        await kv.put("p", b"1")
+        await kv.purge("p")
+        history = await kv.history("greeting")
+        assert [e.op for e in history] == [KeyValueOp.PUT, KeyValueOp.DELETE]
+        assert history[1].operation == "DEL"
+        assert history[1].op == "DEL"
+        purged = await kv.history("p")
+        assert purged[0].op is KeyValueOp.PURGE
+
+        assert str(KeyValueOp.PUT) == "KeyValuePutOp"
+        assert str(KeyValueOp.DELETE) == "KeyValueDeleteOp"
+        assert str(KeyValueOp.PURGE) == "KeyValuePurgeOp"
+        assert f"{KeyValueOp.PURGE}" == "KeyValuePurgeOp"
+        assert KeyValueOp.DELETE.value == "DEL"
 
         await nc.close()
