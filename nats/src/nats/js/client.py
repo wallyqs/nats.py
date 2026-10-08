@@ -64,6 +64,7 @@ _CRLF_LEN_ = len(_CRLF_)
 KV_STREAM_TEMPLATE = "KV_{bucket}"
 KV_STREAM_PREFIX = "KV_"
 KV_PRE_TEMPLATE = "$KV.{bucket}."
+KV_ALL_SUBJECTS = "$KV.*.>"
 Callback = Callable[["Msg"], Awaitable[None]]
 
 # For JetStream the default pending limits are larger.
@@ -1787,6 +1788,58 @@ class JetStreamContext(JetStreamManager):
             put_pre=put_pre,
             use_js_prefix=use_js_prefix,
         )
+
+    async def key_value_store_names(self) -> AsyncIterator[str]:
+        """
+        key_value_store_names yields the names of the KeyValue stores
+        (nats.go KeyValueStoreNames). Errors are raised while iterating.
+
+        ::
+
+            async for name in js.key_value_store_names():
+                print(name)
+        """
+        offset = 0
+        while True:
+            resp = await self._api_request(
+                f"{self._prefix}.STREAM.NAMES",
+                json.dumps({"offset": offset, "subject": KV_ALL_SUBJECTS}).encode(),
+                timeout=self._timeout,
+            )
+            names = resp.get("streams") or []
+            for name in names:
+                if name.startswith(KV_STREAM_PREFIX):
+                    yield name[len(KV_STREAM_PREFIX) :]
+            offset += len(names)
+            if not names or offset >= resp.get("total", 0):
+                return
+
+    async def key_value_stores(self) -> AsyncIterator[KeyValue.BucketStatus]:
+        """
+        key_value_stores yields the status of each KeyValue store
+        (nats.go KeyValueStores). Errors are raised while iterating.
+
+        ::
+
+            async for status in js.key_value_stores():
+                print(status.bucket, status.values)
+        """
+        offset = 0
+        while True:
+            resp = await self._api_request(
+                f"{self._prefix}.STREAM.LIST",
+                json.dumps({"offset": offset, "subject": KV_ALL_SUBJECTS}).encode(),
+                timeout=self._timeout,
+            )
+            infos = resp.get("streams") or []
+            for info in infos:
+                si = api.StreamInfo.from_response(info)
+                name = si.config.name or ""
+                if name.startswith(KV_STREAM_PREFIX):
+                    yield KeyValue.BucketStatus(stream_info=si, bucket=name[len(KV_STREAM_PREFIX) :])
+            offset += len(infos)
+            if not infos or offset >= resp.get("total", 0):
+                return
 
     async def delete_key_value(self, bucket: str) -> bool:
         """

@@ -342,3 +342,33 @@ class KVStatusTest(SingleJetStreamServerTestCase):
         assert status.bytes == 0
 
         await nc.close()
+
+
+class KVListTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_key_value_store_names_and_stores(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        assert [name async for name in js.key_value_store_names()] == []
+        assert [status async for status in js.key_value_stores()] == []
+
+        buckets = {f"LIST_{i}" for i in range(5)}
+        for bucket in buckets:
+            kv = await js.create_key_value(bucket=bucket)
+            await kv.put("k", b"v")
+        # Streams that are not buckets are left out.
+        await js.add_stream(name="NOT_A_KV", subjects=["foo"])
+        await js.add_stream(name="KV_LOOKALIKE", subjects=["bar"])
+
+        names = [name async for name in js.key_value_store_names()]
+        assert sorted(names) == sorted(buckets)
+
+        statuses = [status async for status in js.key_value_stores()]
+        assert sorted(s.bucket for s in statuses) == sorted(buckets)
+        for status in statuses:
+            assert isinstance(status, nats.js.kv.KeyValue.BucketStatus)
+            assert status.values == 1
+            assert status.backing_store == "JetStream"
+
+        await nc.close()
