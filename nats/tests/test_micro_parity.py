@@ -3,6 +3,7 @@ import dataclasses
 import json
 
 import nats
+import nats.aio.msg
 import nats.errors
 import nats.micro
 from nats.micro import add_service
@@ -127,6 +128,82 @@ class MicroErrorsTest(SingleServerTestCase):
 
         await svc.stop()
         await nc.close()
+
+
+class MicroRespondErrorTest(SingleServerTestCase):
+    @async_test
+    async def test_respond_publish_error_is_respond_error(self):
+        failures = []
+
+        async def handler(request: Request):
+            try:
+                await request.respond(b"x" * (nc.max_payload + 1))
+            except nats.errors.MaxPayloadError as e:
+                # Existing except clauses for the publish error still match.
+                failures.append(e)
+            await request.respond(b"small")
+
+        nc = await nats.connect()
+        svc = await add_service(nc, name="svc", version="0.1.0")
+        await svc.add_endpoint(name="e", subject="svc.e", handler=handler)
+
+        resp = await nc.request("svc.e", b"", timeout=1)
+        self.assertEqual(resp.data, b"small")
+        self.assertEqual(len(failures), 1)
+        err = failures[0]
+        # As nats.go: the publish error is wrapped in ErrRespond.
+        self.assertIsInstance(err, RespondError)
+        self.assertIsInstance(err, MicroError)
+        self.assertIsInstance(err.__cause__, nats.errors.MaxPayloadError)
+        self.assertNotIsInstance(err.__cause__, RespondError)
+        self.assertEqual(str(err), "NATS error when sending response: nats: maximum payload exceeded")
+
+        await svc.stop()
+        await nc.close()
+
+    @async_test
+    async def test_respond_on_closed_connection(self):
+        nc = await nats.connect()
+        sub = await nc.subscribe("svc.closed")
+        await nc.publish("svc.closed", b"", reply="reply.inbox")
+        msg = await sub.next_msg(timeout=1)
+        await nc.close()
+
+        request = Request(msg)
+        calls = [
+            lambda: request.respond(b"ok"),
+            lambda: request.respond_json({"a": 1}),
+            lambda: request.respond_error("500", "failed"),
+        ]
+        for i, call in enumerate(calls):
+            with self.subTest(call=i):
+                with self.assertRaises(RespondError) as ctx:
+                    await call()
+                self.assertIsInstance(ctx.exception, nats.errors.ConnectionClosedError)
+                self.assertIsInstance(ctx.exception.__cause__, nats.errors.ConnectionClosedError)
+                self.assertEqual(str(ctx.exception), "NATS error when sending response: nats: connection closed")
+                # And the old except clause catches it too.
+                try:
+                    await call()
+                except nats.errors.ConnectionClosedError as e:
+                    self.assertIsInstance(e, RespondError)
+        # One subclass per error class.
+        with self.assertRaises(RespondError) as again:
+            await request.respond(b"ok")
+        self.assertIs(type(again.exception), type(ctx.exception))
+
+    @async_test
+    async def test_respond_error_fallback(self):
+        class Client:
+            async def publish(self, subject, data, headers=None):
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+        msg = nats.aio.msg.Msg(_client=Client(), subject="svc.e", reply="reply.inbox")
+        with self.assertRaises(RespondError) as ctx:
+            await Request(msg).respond(b"ok")
+        # The error's class cannot be built from a message: a plain RespondError.
+        self.assertIs(type(ctx.exception), RespondError)
+        self.assertIsInstance(ctx.exception.__cause__, UnicodeDecodeError)
 
 
 class MicroRequestTest(SingleServerTestCase):

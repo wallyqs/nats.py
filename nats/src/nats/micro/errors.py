@@ -23,7 +23,7 @@ working.
 from __future__ import annotations
 
 import json
-from typing import Optional
+from typing import Dict, Optional
 
 import nats.errors
 
@@ -63,6 +63,47 @@ class RespondError(MicroError, ValueError):
     """A response could not be sent (``ErrRespond``)."""
 
     default_message = "NATS error when sending response"
+
+
+_respond_error_classes: Dict[type, type] = {}
+
+
+def _respond_error_class(cls: type) -> type:
+    """
+    A subclass of both RespondError and ``cls``, cached per class, so that
+    except clauses for the error a response failed with keep catching it.
+    RespondError itself when the two classes cannot be combined.
+    """
+    wrapped = _respond_error_classes.get(cls)
+    if wrapped is None:
+        try:
+            wrapped = type("RespondError_" + cls.__name__, (RespondError, cls), {"__module__": __name__})
+        except TypeError:
+            wrapped = RespondError
+        _respond_error_classes[cls] = wrapped
+    return wrapped
+
+
+def _wrap_respond_error(error: Exception) -> RespondError:
+    """
+    The RespondError for a response that failed with ``error``, as nats.go
+    wraps the failure in ``ErrRespond`` (``"NATS error when sending
+    response: <error>"``). Where possible, it is also an instance of the
+    error's class. The caller raises it ``from error``.
+    """
+    if isinstance(error, RespondError):
+        return error
+    message = f"{RespondError.default_message}: {error}"
+    wrapped = _respond_error_class(type(error))
+    try:
+        respond_error = wrapped(message)
+    except Exception:
+        # The error's class takes other constructor arguments.
+        return RespondError(message)
+    # Keep the attributes handlers may read from the original error.
+    for name, value in vars(error).items():
+        respond_error.__dict__.setdefault(name, value)
+    return respond_error
 
 
 class MarshalResponseError(MicroError, ValueError):

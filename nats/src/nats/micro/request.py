@@ -14,13 +14,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from nats.aio.msg import Msg
 
-from .errors import ArgRequiredError, MarshalResponseError, RespondError
+from .errors import ArgRequiredError, MarshalResponseError, RespondError, _wrap_respond_error
 
 ERROR_HEADER = "Nats-Service-Error"
 ERROR_CODE_HEADER = "Nats-Service-Error-Code"
@@ -58,16 +59,25 @@ class Request:
 
         :param data: The response data.
         :param headers: Additional response headers.
-        :raises RespondError: If the request has no reply subject.
+        :raises RespondError: If the request has no reply subject, or the
+            response could not be published. As in nats.go, the publish
+            error is wrapped: the RespondError is chained to it and, where
+            possible, also an instance of its class (e.g.
+            ``ConnectionClosedError`` or ``MaxPayloadError``).
         """
         if not self._msg.reply:
             raise RespondError("NATS error when sending response: no reply subject set")
 
-        await self._msg._client.publish(
-            self._msg.reply,
-            data,
-            headers=headers,
-        )
+        try:
+            await self._msg._client.publish(
+                self._msg.reply,
+                data,
+                headers=headers,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            raise _wrap_respond_error(error) from error
 
     async def respond_json(self, data: Any, headers: Optional[Dict[str, str]] = None) -> None:
         """Marshal a value to JSON and send it as the response.
@@ -75,6 +85,7 @@ class Request:
         :param data: The value to marshal.
         :param headers: Additional response headers.
         :raises MarshalResponseError: If the value cannot be marshalled to JSON.
+        :raises RespondError: If the response could not be sent.
         """
         try:
             payload = json.dumps(data, separators=(",", ":")).encode()
@@ -98,6 +109,7 @@ class Request:
         :param headers: Additional response headers. As in nats.go, they are
             applied after the error headers and so may replace them.
         :raises ArgRequiredError: If the code or the description is empty.
+        :raises RespondError: If the response could not be sent.
         """
         if not code:
             raise ArgRequiredError("argument required: error code")
