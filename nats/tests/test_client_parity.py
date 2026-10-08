@@ -1339,6 +1339,21 @@ class UserInfoTest(ConfiguredServerTestCase):
         with self.assertRaises(nats.errors.AuthorizationError):
             await nc.connect("nats://127.0.0.1:4222", user_info_cb=lambda: ("foo", "wrong"), allow_reconnect=False)
 
+    @async_test
+    async def test_user_info_cb_with_url_credentials(self):
+        calls = []
+
+        def user_info():
+            calls.append(True)
+            return "foo", "secret"
+
+        # As nats.go's ErrUserInfoAlreadySet: the URL's user:password conflicts.
+        nc = NATS()
+        with self.assertRaises(nats.errors.UserInfoAlreadySetError):
+            await nc.connect("nats://foo:secret@127.0.0.1:4222", user_info_cb=user_info, allow_reconnect=False)
+        self.assertEqual(calls, [])
+        self.assertFalse(nc.is_connected)
+
 
 class AuthOptionErrorsTest(unittest.IsolatedAsyncioTestCase):
     async def check(self, error, servers="nats://127.0.0.1:4999", **options):
@@ -1357,6 +1372,11 @@ class AuthOptionErrorsTest(unittest.IsolatedAsyncioTestCase):
         await self.check(nats.errors.UserButNoSigCBError, user_jwt_cb=jwt)
         await self.check(nats.errors.NoUserCBError, signature_cb=foo_user_signature)
         await self.check(nats.errors.UserInfoAlreadySetError, user="foo", user_info_cb=lambda: ("a", "b"))
+        await self.check(
+            nats.errors.UserInfoAlreadySetError,
+            servers=["nats://127.0.0.1:4998", "nats://foo:bar@127.0.0.1:4999"],
+            user_info_cb=lambda: ("a", "b"),
+        )
         await self.check(nats.errors.TokenAlreadySetError, servers="nats://token@127.0.0.1:4999", token=lambda: "other")
 
 

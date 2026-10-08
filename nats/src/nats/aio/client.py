@@ -953,6 +953,12 @@ class Client:
             raise errors.NoUserCBError
         if user_info_cb is not None and (user or password):
             raise errors.UserInfoAlreadySetError
+        if user_info_cb is not None:
+            # A server URL's user:password counts as set too, as in nats.go's
+            # connectProto (a URL with only a user name carries a token).
+            for server in self._server_pool:
+                if server.uri.username and server.uri.password is not None:
+                    raise errors.UserInfoAlreadySetError
         if callable(token):
             for server in self._server_pool:
                 if server.uri.username and server.uri.password is None:
