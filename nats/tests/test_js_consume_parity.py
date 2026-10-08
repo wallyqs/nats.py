@@ -424,3 +424,44 @@ class PublishAsyncTest(SingleJetStreamServerTestCase):
         assert ack.stream == "ARETRY"
         await task
         await nc.close()
+
+
+class StatusErrorsTest(SingleJetStreamServerTestCase):
+    def test_status_error_classes(self):
+        cases = [
+            ("409", "Message Size Exceeds MaxBytes", MaxBytesExceededError),
+            ("409", "Batch Completed", BatchCompletedError),
+            ("409", "Consumer Deleted", ConsumerDeletedError),
+            ("409", "Leadership Change", ConsumerLeadershipChangedError),
+            ("409", "Server Shutdown", ServerShutdownError),
+            ("409", "Consumer is push based", NotPullConsumerError),
+            ("409", "Exceeded MaxWaiting", APIError),
+            ("423", "Nats-Pin-Id mismatch", PinIdMismatchError),
+            ("400", "Bad Request", APIError),
+        ]
+        for code, desc, cls in cases:
+            with self.subTest(desc=desc):
+                msg = Msg(_client=None, headers={api.Header.STATUS: code, api.Header.DESCRIPTION: desc})
+                with pytest.raises(APIError) as err:
+                    APIError.from_msg(msg)
+                assert type(err.value) is cls
+                assert err.value.code == int(code)
+                assert err.value.description == desc
+        assert str(NoHeartbeatError()) == "nats: no heartbeat received"
+        assert str(MsgIteratorClosedError()) == "nats: messages iterator closed"
+
+    @async_test
+    async def test_fetch_consumer_deleted_error(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="CDEL", subjects=["cdel"])
+        await js.add_consumer("CDEL", durable_name="dur", ack_policy="explicit")
+        sub = await js.pull_subscribe_bind("dur", "CDEL")
+
+        fetch = asyncio.create_task(sub.fetch(1, timeout=5))
+        await asyncio.sleep(0.5)
+        await js.delete_consumer("CDEL", "dur")
+        with pytest.raises(ConsumerDeletedError) as err:
+            await asyncio.wait_for(fetch, timeout=2)
+        assert err.value.code == 409
+        await nc.close()

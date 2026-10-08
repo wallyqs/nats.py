@@ -123,13 +123,19 @@ class APIError(Error):
             raise ServiceUnavailableError
         else:
             desc = msg.header[api.Header.DESCRIPTION]
-            err_cls: Type[APIError] = APIError
-            if code == api.StatusCode.CONFLICT and desc:
-                if desc.startswith("Consumer Deleted"):
-                    err_cls = ConsumerDeletedError
-                elif desc.startswith("Consumer is push based"):
-                    err_cls = NotPullConsumerError
-            raise err_cls(code=int(code), description=desc)
+            raise cls._status_error_class(code, desc)(code=int(code), description=desc)
+
+    @staticmethod
+    def _status_error_class(code: str, description: Optional[str]) -> Type[APIError]:
+        """The error class of a pull status message, as nats.go's checkMsg tells them apart."""
+        if code == api.StatusCode.PIN_ID_MISMATCH:
+            return PinIdMismatchError
+        if code == api.StatusCode.CONFLICT and description:
+            desc = description.lower()
+            for reason, err in _CONFLICT_ERRORS:
+                if reason in desc:
+                    return err
+        return APIError
 
     @classmethod
     def from_error(cls, err: Dict[str, Any]):
@@ -622,6 +628,67 @@ class OrderConsumerUsedAsConsumeError(Error):
 
     def __str__(self) -> str:
         return "nats: ordered consumer initialized as consume"
+
+
+class MaxBytesExceededError(APIError):
+    """
+    A 409 status: a message was larger than the max_bytes of the pull request.
+    """
+
+    pass
+
+
+class BatchCompletedError(APIError):
+    """
+    A 409 status: the pull request was completed by the server.
+    """
+
+    pass
+
+
+class ConsumerLeadershipChangedError(APIError):
+    """
+    A 409 status: the consumer leader changed while pulling from it.
+    """
+
+    pass
+
+
+class ServerShutdownError(APIError):
+    """
+    A 409 status: the server is shutting down.
+    """
+
+    pass
+
+
+# 409 descriptions (lower case) and their errors, checked in nats.go's order.
+_CONFLICT_ERRORS = (
+    ("message size exceeds maxbytes", MaxBytesExceededError),
+    ("batch completed", BatchCompletedError),
+    ("consumer deleted", ConsumerDeletedError),
+    ("leadership change", ConsumerLeadershipChangedError),
+    ("server shutdown", ServerShutdownError),
+    ("consumer is push based", NotPullConsumerError),
+)
+
+
+class NoHeartbeatError(Error):
+    """
+    Raised when the idle heartbeats of a consumer stopped arriving.
+    """
+
+    def __str__(self) -> str:
+        return "nats: no heartbeat received"
+
+
+class MsgIteratorClosedError(Error):
+    """
+    Raised when getting the next message of a stopped messages iterator.
+    """
+
+    def __str__(self) -> str:
+        return "nats: messages iterator closed"
 
 
 class NoStreamResponseError(Error):
