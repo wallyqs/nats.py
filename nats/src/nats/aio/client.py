@@ -203,6 +203,7 @@ class Srv:
     discovered: bool = False
     tls_name: Optional[str] = None
     server_version: Optional[str] = None
+    last_auth_error: Optional[type] = None
 
 
 ReconnectToServerHandler = Callable[[List[Server], Dict[str, Any]], Tuple[Optional[Server], float]]
@@ -479,6 +480,7 @@ class Client:
         disconnected_err_cb: Optional[DisconnectedErrorCallback] = None,
         reconnect_error_cb: Optional[ErrorCallback] = None,
         no_callbacks_after_client_close: bool = False,
+        ignore_auth_error_abort: bool = False,
     ) -> None:
         """
         Establishes a connection to NATS.
@@ -503,6 +505,9 @@ class Client:
         :param reconnect_error_cb: Callback to report each failed reconnect attempt.
         :param no_callbacks_after_client_close: Do not call the disconnected and
             closed callbacks when the connection is closed by close() or drain().
+        :param ignore_auth_error_abort: Keep reconnecting to a server that rejected
+            the credentials twice in a row with the same authentication error.
+            By default the connection is closed then, as in nats.go.
 
         Connecting setting all callbacks::
 
@@ -641,6 +646,7 @@ class Client:
         self.options["skip_subject_validation"] = skip_subject_validation
         self._skip_subject_validation = skip_subject_validation
         self.options["no_callbacks_after_client_close"] = no_callbacks_after_client_close
+        self.options["ignore_auth_error_abort"] = ignore_auth_error_abort
 
         if tls:
             self.options["tls"] = tls
@@ -1842,6 +1848,7 @@ class Client:
                 # since have successfully connected.
                 self._current_server.did_connect = True
                 self._current_server.reconnects = 0
+                self._current_server.last_auth_error = None
 
                 # Replay all the subscriptions in case there were some.
                 subs_to_remove = []
@@ -1890,6 +1897,10 @@ class Client:
                 self._err = e
                 await self._error_cb(e)
                 await self._notify_reconnect_error(e)
+                if self._abort_on_auth_error(e):
+                    self._close_err = e
+                    await self._close(Client.CLOSED)
+                    break
                 self._status = Client.RECONNECTING
                 self._current_server.last_attempt = time.monotonic()
                 self._current_server.reconnects += 1
@@ -1898,6 +1909,25 @@ class Client:
 
         if self._reconnection_task_future is not None and not self._reconnection_task_future.cancelled():
             self._reconnection_task_future.set_result(True)
+
+    def _abort_on_auth_error(self, e: Exception) -> bool:
+        """
+        Whether reconnecting should stop because the current server rejected
+        the credentials twice in a row with the same authentication error,
+        as nats.go's processAuthError unless IgnoreAuthErrorAbort is set.
+        """
+        if not isinstance(
+            e,
+            (errors.AuthorizationError, errors.AuthenticationExpiredError, errors.AuthRevokedError),
+        ):
+            return False
+        server = self._current_server
+        if server is None:
+            return False
+        if server.last_auth_error is type(e) and not self.options.get("ignore_auth_error_abort", False):
+            return True
+        server.last_auth_error = type(e)
+        return False
 
     async def _dispatch_error(self, e: Exception) -> None:
         """

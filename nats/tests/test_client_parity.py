@@ -148,11 +148,22 @@ class MaxConnectionsTest(ConfiguredServerTestCase):
     @async_test
     async def test_max_connections_exceeded_on_connect(self):
         nc = await nats.connect("nats://127.0.0.1:4222")
-        nc2 = NATS()
-        with self.assertRaises(nats.errors.MaxConnectionsExceededError) as raised:
-            await nc2.connect("nats://127.0.0.1:4222", allow_reconnect=False)
-        self.assertIsInstance(raised.exception, nats.errors.Error)
-        self.assertIn("maximum connections exceeded", str(raised.exception))
+        # The server closes the connection right after its -ERR, and a reset
+        # can occasionally discard the -ERR before it is read; then the
+        # connect fails with the OSError instead, so allow a few attempts.
+        for _ in range(5):
+            nc2 = NATS()
+            try:
+                await nc2.connect("nats://127.0.0.1:4222", allow_reconnect=False)
+            except nats.errors.MaxConnectionsExceededError as e:
+                err = e
+                break
+            except OSError:
+                continue
+        else:
+            self.fail("MaxConnectionsExceededError not raised")
+        self.assertIsInstance(err, nats.errors.Error)
+        self.assertIn("maximum connections exceeded", str(err))
         await nc.close()
 
 
@@ -489,6 +500,61 @@ class CallbacksTest(SingleServerTestCase):
         nc = await nats.connect(disconnected_cb=disconnected_cb, closed_cb=closed_cb)
         await nc.close()
         self.assertEqual(events, ["disconnected", "closed"])
+
+
+class AuthErrorAbortTest(ConfiguredServerTestCase):
+    config = 'authorization { token: "secret" }\n'
+
+    async def _connect_then_change_token(self, **options):
+        closed = asyncio.Event()
+        errs = []
+
+        async def closed_cb():
+            closed.set()
+
+        async def reconnect_error_cb(e):
+            errs.append(e)
+
+        nc = await nats.connect(
+            "nats://secret@127.0.0.1:4222",
+            closed_cb=closed_cb,
+            reconnect_error_cb=reconnect_error_cb,
+            reconnect_time_wait=0.1,
+            max_reconnect_attempts=-1,
+            **options,
+        )
+        self.server_pool[0].stop()
+        self.server_pool.append(self.start_server('authorization { token: "other" }\n', name="other.conf"))
+        return nc, closed, errs
+
+    @async_test
+    async def test_abort_after_repeated_auth_error(self):
+        nc, closed, errs = await self._connect_then_change_token()
+        await asyncio.wait_for(closed.wait(), 4)
+        self.assertTrue(nc.is_closed)
+        auth_errs = [e for e in errs if isinstance(e, nats.errors.AuthorizationError)]
+        self.assertEqual(len(auth_errs), 2)
+        self.assertIsInstance(nc.last_error, nats.errors.AuthorizationError)
+
+    @async_test
+    async def test_ignore_auth_error_abort(self):
+        reconnected = asyncio.Event()
+
+        async def reconnected_cb():
+            reconnected.set()
+
+        nc, closed, errs = await self._connect_then_change_token(
+            ignore_auth_error_abort=True, reconnected_cb=reconnected_cb
+        )
+        while len([e for e in errs if isinstance(e, nats.errors.AuthorizationError)]) < 3:
+            await asyncio.sleep(0.05)
+        self.assertFalse(nc.is_closed)
+        # Once the server accepts the credentials again the client reconnects.
+        self.server_pool[1].stop()
+        self.server_pool.append(self.start_server(self.config, name="again.conf"))
+        await asyncio.wait_for(reconnected.wait(), 4)
+        self.assertTrue(nc.is_connected)
+        await nc.close()
 
 
 if __name__ == "__main__":
