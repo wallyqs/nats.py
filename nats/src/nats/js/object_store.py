@@ -618,8 +618,6 @@ class ObjectStore:
         info = None
         try:
             info = await self.get_info(name)
-        except ObjectNameRequiredError:
-            raise
         except ObjectNotFoundError:
             raise UpdateMetaDeletedError
 

@@ -136,8 +136,8 @@ class ObjectStoreErrorsTest(SingleJetStreamServerTestCase):
         ):
             with pytest.raises(ObjectNameRequiredError) as e:
                 await call()
-            # Compatible with what an empty name lookup raised before.
-            assert isinstance(e.value, ObjectNotFoundError)
+            # As nats.go, an empty name is not a missing object.
+            assert not isinstance(e.value, ObjectNotFoundError)
             assert isinstance(e.value, InvalidObjectNameError)
             assert str(e.value) == "nats: name is required"
 

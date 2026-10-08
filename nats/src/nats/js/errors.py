@@ -1113,12 +1113,10 @@ class InvalidStoreNameError(InvalidBucketNameError):
         return "nats: invalid object-store name"
 
 
-class ObjectNameRequiredError(InvalidObjectNameError, ObjectNotFoundError):
+class ObjectNameRequiredError(InvalidObjectNameError):
     """
-    Raised when an Object Store operation is given an empty object name.
-
-    It is an ObjectNotFoundError too, which is what looking up an empty
-    name used to raise.
+    Raised when an Object Store operation is given an empty object name
+    (nats.go ErrNameRequired).
     """
 
     def __str__(self) -> str:
