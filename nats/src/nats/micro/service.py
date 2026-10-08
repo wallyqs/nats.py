@@ -5,7 +5,7 @@ import re
 import time
 from asyncio import Event
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
 from typing import (
     Any,
@@ -243,7 +243,8 @@ class Endpoint:
         self._num_errors = 0
 
         self._processing_time = 0
-        self._average_processing_time = timedelta()
+        self._average_processing_time = 0
+        self._last_error = None
 
     async def _handle_request(self, msg: Msg) -> None:
         """Handle an endpoint message."""
@@ -750,6 +751,9 @@ class Service(AsyncContextManager):
         """
         Resets all statistics for all endpoints on a service instance.
         """
+        for endpoint in self._endpoints:
+            endpoint._reset()
+
         self._started = datetime.utcnow()
 
     async def stop(self) -> None:

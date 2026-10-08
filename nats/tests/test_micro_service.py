@@ -486,6 +486,48 @@ class MicroServiceTest(SingleServerTestCase):
                 await svc.stop()
 
     @async_test
+    async def test_service_reset(self):
+        async def handler(request: Request):
+            await request.respond(b"ok")
+
+        nc = await nats.connect()
+        svc = await add_service(nc, ServiceConfig(name="test_service", version="0.1.0"))
+        await svc.add_endpoint(EndpointConfig(name="default", subject="test.func", handler=handler))
+
+        for _ in range(3):
+            response = await nc.request("test.func", b"msg", timeout=1)
+            assert response.data == b"ok"
+        await nc.publish("test.func", b"err")
+        await nc.flush()
+        await asyncio.sleep(0.5)
+
+        stats = svc.stats()
+        assert stats.endpoints[0].num_requests == 4
+        assert stats.endpoints[0].num_errors == 1
+        assert stats.endpoints[0].last_error
+        started = stats.started
+
+        await svc.reset()
+
+        stats = svc.stats()
+        assert stats.endpoints[0].num_requests == 0
+        assert stats.endpoints[0].num_errors == 0
+        assert stats.endpoints[0].last_error is None
+        assert stats.endpoints[0].processing_time == 0
+        assert stats.endpoints[0].average_processing_time == 0
+        assert stats.started >= started
+
+        stats_subject = control_subject(ServiceVerb.STATS, "test_service")
+        stats_response = await nc.request(stats_subject, b"", timeout=1)
+        stats = ServiceStats.from_dict(json.loads(stats_response.data))
+        assert stats.endpoints[0].num_requests == 0
+        assert stats.endpoints[0].num_errors == 0
+        assert stats.endpoints[0].last_error == ""
+
+        await svc.stop()
+        await nc.close()
+
+    @async_test
     async def test_request_respond(self):
         sub_tests = {
             "empty_response": {
