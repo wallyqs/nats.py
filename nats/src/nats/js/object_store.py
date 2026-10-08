@@ -381,35 +381,37 @@ class ObjectStore:
         except ObjectNotFoundError:
             raise ObjectDeletedError
 
-        # Can change it only if it has been deleted.
+        # A rename may only take a name that is unused or deleted.
         if name != meta.name:
-            einfo = await self.get_info(name, show_deleted=True)
-            if not einfo.deleted:
+            try:
+                einfo = await self.get_info(meta.name, show_deleted=True)
+            except ObjectNotFoundError:
+                einfo = None
+            if einfo is not None and not einfo.deleted:
                 raise ObjectAlreadyExists
 
         info.name = meta.name
         info.description = meta.description
         info.headers = meta.headers
 
-        # Prepare the meta message.
+        # Publish the meta message under the (possibly new) name.
         meta_subj = OBJ_META_PRE_TEMPLATE.format(
             bucket=self._name,
-            obj=base64.urlsafe_b64encode(bytes(name, "utf-8")).decode(),
+            obj=base64.urlsafe_b64encode(bytes(meta.name, "utf-8")).decode(),
         )
-        # Publish the meta message.
-        try:
-            await self._js.publish(
-                meta_subj,
-                json.dumps(info.as_dict()).encode(),
-                headers={api.Header.ROLLUP: MSG_ROLLUP_SUBJECT},
-            )
-        except Exception as err:
-            raise err
+        await self._js.publish(
+            meta_subj,
+            json.dumps(info.as_dict()).encode(),
+            headers={api.Header.ROLLUP: MSG_ROLLUP_SUBJECT},
+        )
 
-        # If the name changed, then need to store the meta under the new name.
+        # The meta now lives under the new name, so remove it from the old one.
         if name != meta.name:
-            # TODO: purge the stream
-            await self._js.purge_stream(self._stream, subject=meta_subj)
+            old_meta_subj = OBJ_META_PRE_TEMPLATE.format(
+                bucket=self._name,
+                obj=base64.urlsafe_b64encode(bytes(name, "utf-8")).decode(),
+            )
+            await self._js.purge_stream(self._stream, subject=old_meta_subj)
 
     class ObjectWatcher:
         STOP_ITER = StopIterSentinel()

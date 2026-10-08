@@ -4919,14 +4919,36 @@ class ObjectStoreTest(SingleJetStreamServerTestCase):
         with pytest.raises(ObjectDeletedError):
             await obs.update_meta("X", deleted_meta)
 
-        # Update meta
+        # Renaming onto an existing object is not allowed.
         res = await obs.get("A")
         assert res.data == b"A"
         to_update_meta = res.info.meta
-        to_update_meta.name = "Z"
-        to_update_meta.description = "changed"
+        to_update_meta.name = "C"
         with pytest.raises(ObjectAlreadyExists):
             await obs.update_meta("A", to_update_meta)
+
+        # Rename to an unused name.
+        to_update_meta.name = "Z"
+        to_update_meta.description = "changed"
+        await obs.update_meta("A", to_update_meta)
+
+        e = await watcher.updates()
+        assert e.name == "Z"
+        assert e.description == "changed"
+
+        res = await obs.get("Z")
+        assert res.data == b"A"
+        assert res.info.name == "Z"
+        assert res.info.description == "changed"
+        with pytest.raises(ObjectNotFoundError):
+            await obs.get_info("A")
+
+        # Renaming onto a deleted object's name is allowed.
+        to_update_meta = res.info.meta
+        to_update_meta.name = "B"
+        await obs.update_meta("Z", to_update_meta)
+        res = await obs.get("B")
+        assert res.data == b"A"
 
         await nc.close()
 
