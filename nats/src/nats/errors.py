@@ -333,6 +333,41 @@ class InvalidUserCredentialsError(Error):
         return "nats: invalid user credentials"
 
 
+class NkeyAndUserError(Error):
+    def __str__(self) -> str:
+        return "nats: user callback and nkey defined"
+
+
+class NkeyButNoSigCBError(Error):
+    def __str__(self) -> str:
+        return "nats: nkey defined without a signature handler"
+
+
+class UserButNoSigCBError(Error):
+    def __str__(self) -> str:
+        return "nats: user callback defined without a signature handler"
+
+
+class NoUserCBError(Error):
+    def __str__(self) -> str:
+        return "nats: user callback not defined"
+
+
+class TokenAlreadySetError(Error):
+    def __str__(self) -> str:
+        return "nats: token and token handler both set"
+
+
+class UserInfoAlreadySetError(Error):
+    def __str__(self) -> str:
+        return "nats: cannot set user info callback and user/pass"
+
+
+class NkeysNotSupportedError(Error):
+    def __str__(self) -> str:
+        return "nats: nkeys not supported by the server"
+
+
 class InvalidCallbackTypeError(Error):
     def __str__(self) -> str:
         return "nats: callbacks must be coroutine functions"

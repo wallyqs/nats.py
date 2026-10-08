@@ -174,6 +174,8 @@ TokenCallback = Callable[[], str]
 # so it must not block (e.g. return a cached or pre-fetched value rather
 # than fetching credentials over the network).
 CredentialCallback = Callable[[], str]
+# Returns the (user, password) pair; same constraints as CredentialCallback.
+UserInfoCallback = Callable[[], Tuple[str, str]]
 
 
 class RawCredentials(UserString):
@@ -521,6 +523,9 @@ class Client:
         reconnect_jitter: float = 0,
         reconnect_jitter_tls: float = 0,
         ignore_discovered_servers: bool = False,
+        nkey: Optional[str] = None,
+        user_info_cb: Optional[UserInfoCallback] = None,
+        user_jwt_and_seed: Optional[Tuple[str, str]] = None,
     ) -> None:
         """
         Establishes a connection to NATS.
@@ -565,6 +570,12 @@ class Client:
         :param reconnect_jitter_tls: Like reconnect_jitter, for TLS connections.
         :param ignore_discovered_servers: Do not add the servers the cluster
             announces to the server pool; only the given servers are used.
+        :param nkey: Public nkey to authenticate with, together with a
+            signature_cb that signs the server's nonce with its seed.
+        :param user_info_cb: Function returning the (user, password) pair,
+            called on each connection attempt.
+        :param user_jwt_and_seed: The user JWT and nkey seed as strings,
+            instead of a credentials file.
 
         Connecting setting all callbacks::
 
@@ -675,12 +686,28 @@ class Client:
         assert isinstance(inbox_prefix, bytes)
         self._inbox_prefix = bytearray(inbox_prefix)
 
+        self._check_auth_options(
+            user=user,
+            password=password,
+            token=token,
+            signature_cb=signature_cb,
+            user_jwt_cb=user_jwt_cb,
+            user_credentials=user_credentials,
+            nkeys_seed=nkeys_seed,
+            nkeys_seed_str=nkeys_seed_str,
+            nkey=nkey,
+            user_info_cb=user_info_cb,
+            user_jwt_and_seed=user_jwt_and_seed,
+        )
+
         # NKEYS support
         self._signature_cb = signature_cb
         self._user_jwt_cb = user_jwt_cb
         self._user_credentials = user_credentials
         self._nkeys_seed = nkeys_seed
         self._nkeys_seed_str = nkeys_seed_str
+        self.options["nkey"] = nkey
+        self.options["user_info_cb"] = user_info_cb
 
         # Customizable options
         self.options["verbose"] = verbose
@@ -725,12 +752,18 @@ class Client:
                 if server.uri.username or server.uri.password:
                     server_auth_configured = True
                     break
-        if user or password or token or server_auth_configured:
+        if user or password or token or server_auth_configured or user_info_cb is not None:
             self._auth_configured = True
 
         if self._user_credentials is not None or self._nkeys_seed is not None or self._nkeys_seed_str is not None:
             self._auth_configured = True
             self._setup_nkeys_connect()
+        elif user_jwt_and_seed is not None:
+            self._auth_configured = True
+            self._setup_jwt_and_seed_connect(*user_jwt_and_seed)
+        elif nkey:
+            self._auth_configured = True
+            self._public_nkey = nkey
 
         # Queue used to trigger flushes to the socket.
         self._flush_queue = asyncio.Queue(maxsize=flusher_queue_size)
@@ -805,6 +838,65 @@ class Client:
         if self._current_server is None and self._server_pool:
             self._current_server = self._server_pool[0]
         return False
+
+    def _check_auth_options(
+        self,
+        user: Any,
+        password: Any,
+        token: Any,
+        signature_cb: Optional[SignatureCallback],
+        user_jwt_cb: Optional[JWTCallback],
+        user_credentials: Optional[Credentials],
+        nkeys_seed: Optional[str],
+        nkeys_seed_str: Optional[str],
+        nkey: Optional[str],
+        user_info_cb: Optional[UserInfoCallback],
+        user_jwt_and_seed: Optional[Tuple[str, str]],
+    ) -> None:
+        """
+        Rejects conflicting authentication options, as nats.go's UserJWT,
+        Nkey, UserInfoHandler and TokenHandler options and connectProto.
+        """
+        generated = user_credentials is not None or nkeys_seed is not None or nkeys_seed_str is not None
+        if nkey:
+            if user_jwt_cb is not None or user_credentials is not None or user_jwt_and_seed is not None:
+                raise errors.NkeyAndUserError
+            if signature_cb is None:
+                raise errors.NkeyButNoSigCBError
+        if user_jwt_cb is not None and not generated and user_jwt_and_seed is None:
+            if not callable(user_jwt_cb):
+                raise errors.NoUserCBError
+            if signature_cb is None:
+                raise errors.UserButNoSigCBError
+        if (
+            signature_cb is not None
+            and user_jwt_cb is None
+            and not nkey
+            and not generated
+            and user_jwt_and_seed is None
+        ):
+            raise errors.NoUserCBError
+        if user_info_cb is not None and (user or password):
+            raise errors.UserInfoAlreadySetError
+        if callable(token):
+            for server in self._server_pool:
+                if server.uri.username and server.uri.password is None:
+                    raise errors.TokenAlreadySetError
+
+    def _setup_jwt_and_seed_connect(self, user_jwt: str, seed: str) -> None:
+        import nkeys
+
+        def user_cb() -> bytearray:
+            return bytearray(user_jwt.encode())
+
+        def sig_cb(nonce: str) -> bytes:
+            kp = nkeys.from_seed(bytearray(seed.encode()))
+            sig = base64.b64encode(kp.sign(nonce.encode()))
+            kp.wipe()
+            return sig
+
+        self._user_jwt_cb = user_cb
+        self._signature_cb = sig_cb
 
     def _setup_nkeys_connect(self) -> None:
         if self._user_credentials is not None:
@@ -2385,6 +2477,8 @@ class Client:
                     password = password()
                 options["user"] = user
                 options["pass"] = password
+            elif self.options.get("user_info_cb") is not None:
+                options["user"], options["pass"] = self.options["user_info_cb"]()
             elif self.options["token"] is not None:
                 token = self.options["token"]
                 if callable(token):
@@ -2813,6 +2907,9 @@ class Client:
 
         if "client_ip" in self._server_info:
             self._client_ip = self._server_info["client_ip"]
+
+        if self.options.get("nkey") and "nonce" not in self._server_info:
+            raise errors.NkeysNotSupportedError
 
         if self.options["no_echo"] and self._server_info.get("proto", 0) < 1:
             raise errors.NoEchoNotSupportedError

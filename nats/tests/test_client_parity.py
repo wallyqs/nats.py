@@ -20,10 +20,13 @@ from nats.aio.msg import Msg
 from tests.utils import (
     NATSD,
     ClusteringTestCase,
+    NkeysServerTestCase,
     SingleServerTestCase,
     SingleWebSocketServerTestCase,
     TLSServerTestCase,
+    TrustedServerTestCase,
     async_test,
+    get_config_file,
     start_natsd,
 )
 
@@ -889,6 +892,93 @@ class TLSIntrospectionTest(TLSServerTestCase):
         self.assertIsNotNone(state.getpeercert())
         self.assertTrue(nc.tls_required)
         await nc.close()
+
+
+FOO_USER_SEED = "SUAMLK2ZNL35WSMW37E7UD4VZ7ELPKW7DHC3BWBSD2GCZ7IUQQXZIORRBU"
+FOO_USER_NKEY = "UCK5N7N66OBOINFXAYC2ACJQYFSOD4VYNU6APEJTAVFZB2SVHLKGEW7L"
+
+
+def foo_user_signature(nonce):
+    import base64
+
+    import nkeys
+
+    kp = nkeys.from_seed(bytearray(FOO_USER_SEED.encode()))
+    return base64.b64encode(kp.sign(nonce.encode()))
+
+
+class NkeyAuthTest(NkeysServerTestCase):
+    @async_test
+    async def test_nkey_with_signature_cb(self):
+        nc = await nats.connect(nkey=FOO_USER_NKEY, signature_cb=foo_user_signature, allow_reconnect=False)
+
+        async def help_handler(msg):
+            await msg.respond(b"OK!")
+
+        await nc.subscribe("help", cb=help_handler)
+        msg = await nc.request("help", b"", timeout=1)
+        self.assertEqual(msg.data, b"OK!")
+        await nc.close()
+
+
+class NkeysNotSupportedTest(SingleServerTestCase):
+    @async_test
+    async def test_nkeys_not_supported(self):
+        nc = NATS()
+        with self.assertRaises(nats.errors.NkeysNotSupportedError):
+            await nc.connect(nkey=FOO_USER_NKEY, signature_cb=foo_user_signature, allow_reconnect=False)
+
+
+class UserJWTAndSeedTest(TrustedServerTestCase):
+    @async_test
+    async def test_user_jwt_and_seed(self):
+        with open(get_config_file("nkeys/foo-user.creds")) as f:
+            lines = f.read().splitlines()
+        user_jwt = lines[lines.index("-----BEGIN NATS USER JWT-----") + 1]
+        nc = await nats.connect(user_jwt_and_seed=(user_jwt, FOO_USER_SEED), allow_reconnect=False)
+        self.assertTrue(nc.is_connected)
+        await nc.close()
+
+
+class UserInfoTest(ConfiguredServerTestCase):
+    config = 'authorization { user: "foo", password: "secret" }\n'
+
+    @async_test
+    async def test_user_info_cb(self):
+        calls = []
+
+        def user_info():
+            calls.append(True)
+            return "foo", "secret"
+
+        nc = await nats.connect("nats://127.0.0.1:4222", user_info_cb=user_info, allow_reconnect=False)
+        self.assertTrue(nc.is_connected)
+        self.assertEqual(len(calls), 1)
+        await nc.close()
+
+        nc = NATS()
+        with self.assertRaises(nats.errors.AuthorizationError):
+            await nc.connect("nats://127.0.0.1:4222", user_info_cb=lambda: ("foo", "wrong"), allow_reconnect=False)
+
+
+class AuthOptionErrorsTest(unittest.IsolatedAsyncioTestCase):
+    async def check(self, error, servers="nats://127.0.0.1:4999", **options):
+        nc = NATS()
+        with self.assertRaises(error):
+            await nc.connect(servers, allow_reconnect=False, **options)
+
+    async def test_conflicting_auth_options(self):
+        def jwt():
+            return b"jwt"
+
+        await self.check(nats.errors.NkeyButNoSigCBError, nkey=FOO_USER_NKEY)
+        await self.check(
+            nats.errors.NkeyAndUserError, nkey=FOO_USER_NKEY, signature_cb=foo_user_signature, user_jwt_cb=jwt
+        )
+        await self.check(nats.errors.UserButNoSigCBError, user_jwt_cb=jwt)
+        await self.check(nats.errors.NoUserCBError, signature_cb=foo_user_signature)
+        await self.check(nats.errors.UserInfoAlreadySetError, user="foo", user_info_cb=lambda: ("a", "b"))
+        await self.check(nats.errors.TokenAlreadySetError, servers="nats://token@127.0.0.1:4999", token=lambda: "other")
 
 
 if __name__ == "__main__":
