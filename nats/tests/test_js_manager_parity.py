@@ -797,9 +797,16 @@ class StreamHandleTest(SingleJetStreamServerTestCase):
         async def cb(msg):
             await received.put(msg)
 
-        await stream.push_consumer("push", cb=cb)
+        # The push consumer handle (nats.go Stream.PushConsumer).
+        push = await stream.push_consumer("push")
+        assert isinstance(push, nats.js.consume.PushConsumer)
+        assert (push.stream, push.name) == ("HANDLE", "push")
+        assert push.cached_info().config.deliver_subject == "deliver.one"
+        ctx = await push.consume(cb)
         msg = await asyncio.wait_for(received.get(), 1)
         assert msg.subject == "handle.b"
+        ctx.stop()
+        await asyncio.wait_for(ctx.closed(), 1)
         with pytest.raises(NotPushConsumerError):
             await stream.push_consumer("pull")
 

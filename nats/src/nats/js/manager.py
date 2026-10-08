@@ -49,7 +49,7 @@ from nats.js.errors import (
 if TYPE_CHECKING:
     from nats import NATS
     from nats.aio.msg import Msg
-    from nats.js.consume import PullConsumer
+    from nats.js.consume import PullConsumer, PushConsumer
 
 NATS_HDR_LINE = bytearray(b"NATS/1.0")
 NATS_HDR_LINE_SIZE = len(NATS_HDR_LINE)
@@ -1156,19 +1156,15 @@ class Stream:
         """
         return await self._context().pull_consumer(self._name, name)
 
-    async def push_consumer(self, name: str, cb: Optional[Any] = None, **params) -> Any:
+    async def push_consumer(self, name: str) -> PushConsumer:
         """
-        Returns a push subscription bound to the stream's push consumer
-        (nats.go Stream.PushConsumer), delivering to ``cb`` if given.
-        ``params`` are passed to JetStreamContext.subscribe_bind.
+        Returns a handle on the stream's push consumer, to consume its
+        messages (nats.go Stream.PushConsumer); see
+        JetStreamContext.push_consumer.
 
         :raises NotPushConsumerError: if the consumer is a pull consumer.
         """
-        js = self._context()
-        info = await self._jsm.consumer_info(self._name, name)
-        if not info.config.deliver_subject:
-            raise NotPushConsumerError(description="consumer is not a push consumer")
-        return await js.subscribe_bind(stream=self._name, config=info.config, consumer=name, cb=cb, **params)
+        return await self._context().push_consumer(self._name, name)
 
     async def ordered_consumer(self, subject: str = ">", cb: Optional[Any] = None, **params) -> Any:
         """
