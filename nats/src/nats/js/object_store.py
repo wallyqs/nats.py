@@ -112,6 +112,118 @@ class ObjectStore:
         info: api.ObjectInfo
         data: Optional[bytes] = bytes()
 
+    class ObjectReader:
+        """
+        ObjectReader streams the data of an object chunk by chunk as it
+        arrives from the stream. The digest of the data is checked once the
+        last chunk is read, raising DigestMismatchError when it differs.
+        """
+
+        def __init__(self, info: api.ObjectInfo, sub=None) -> None:
+            self.info = info
+            self._sub = sub
+            self._sha = sha256()
+            self._buffer = b""
+            self._done = sub is None
+            self._closed = False
+            self._error: Optional[Exception] = None
+
+        @property
+        def error(self) -> Optional[Exception]:
+            """
+            error is the error the read ended with, if any.
+            """
+            return self._error
+
+        async def read(self, size: int = -1) -> bytes:
+            """
+            read returns up to ``size`` bytes of the object, or all that is
+            left when ``size`` is negative; b"" once all was read.
+            """
+            self._check_open()
+            if size is None or size < 0:
+                chunks = [self._buffer]
+                self._buffer = b""
+                while True:
+                    chunk = await self._next_chunk()
+                    if not chunk:
+                        return b"".join(chunks)
+                    chunks.append(chunk)
+            if not self._buffer:
+                self._buffer = await self._next_chunk()
+            data, self._buffer = self._buffer[:size], self._buffer[size:]
+            return data
+
+        async def read_chunk(self) -> bytes:
+            """
+            read_chunk returns the next chunk of the object; b"" once all was read.
+            """
+            self._check_open()
+            if self._buffer:
+                data, self._buffer = self._buffer, b""
+                return data
+            return await self._next_chunk()
+
+        async def close(self) -> None:
+            """
+            close stops the download of the object.
+            """
+            self._closed = True
+            await self._stop()
+
+        def _check_open(self) -> None:
+            if self._closed:
+                raise ValueError("I/O operation on closed object reader")
+
+        async def _stop(self) -> None:
+            sub, self._sub = self._sub, None
+            if sub is not None:
+                await sub.unsubscribe()
+
+        async def _next_chunk(self) -> bytes:
+            if self._error is not None:
+                raise self._error
+            if self._done:
+                return b""
+            try:
+                msg = await self._sub.messages.__anext__()
+            except StopAsyncIteration:
+                # The subscription ended before the last chunk.
+                self._error = nats.errors.BadSubscriptionError()
+                raise self._error
+
+            self._sha.update(msg.data)
+            tokens = msg._get_metadata_fields(msg.reply)
+            if tokens[8] == OBJ_NO_PENDING:
+                self._done = True
+                await self._stop()
+
+                # Make sure the digest matches.
+                try:
+                    rsha = decode_object_digest(self.info.digest)
+                except Exception as e:
+                    self._error = e
+                    raise
+                if self._sha.digest() != rsha:
+                    self._error = DigestMismatchError()
+                    raise self._error
+            return msg.data
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> bytes:
+            chunk = await self.read_chunk()
+            if not chunk:
+                raise StopAsyncIteration
+            return chunk
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc) -> None:
+            await self.close()
+
     @dataclass(frozen=True)
     class ObjectStoreStatus:
         """
@@ -248,10 +360,44 @@ class ObjectStore:
         """
         get will pull the object from the underlying stream.
         """
-        obj = name
+        reader = await self.get_reader(name, show_deleted=show_deleted)
+        result = self.ObjectResult(info=reader.info)
 
+        executor = None
+        executor_fn = None
+        if writeinto:
+            executor = asyncio.get_running_loop().run_in_executor
+            if hasattr(writeinto, "buffer"):
+                executor_fn = writeinto.buffer.write
+            else:
+                executor_fn = writeinto.write
+
+        async with reader:
+            async for chunk in reader:
+                if executor:
+                    await executor(None, executor_fn, chunk)
+                else:
+                    result.data += chunk
+
+        return result
+
+    async def get_reader(
+        self,
+        name: str,
+        show_deleted: Optional[bool] = False,
+    ) -> "ObjectStore.ObjectReader":
+        """
+        get_reader returns an ObjectReader that streams the data of the
+        object as its chunks arrive, instead of buffering all of it.
+
+        ::
+
+            async with await obs.get_reader("movie") as reader:
+                async for chunk in reader:
+                    out.write(chunk)
+        """
         # Grab meta info.
-        info = await self.get_info(obj, show_deleted)
+        info = await self.get_info(name, show_deleted)
 
         if info.nuid is None or info.nuid == "":
             raise BadObjectMetaError
@@ -264,47 +410,42 @@ class ObjectStore:
                 lobs = self
             else:
                 lobs = await self._js.object_store(info.options.link.bucket)
-            return await lobs.get(info.options.link.name, writeinto=writeinto)
-
-        result = self.ObjectResult(info=info)
+            return await lobs.get_reader(info.options.link.name)
 
         if info.size == 0:
-            return result
+            return self.ObjectReader(info)
 
         chunk_subj = OBJ_CHUNKS_PRE_TEMPLATE.format(bucket=self._name, obj=info.nuid)
         sub = await self._js.subscribe(subject=chunk_subj, ordered_consumer=True)
+        return self.ObjectReader(info, sub)
 
-        h = sha256()
+    async def get_bytes(self, name: str, show_deleted: Optional[bool] = False) -> bytes:
+        """
+        get_bytes returns the data of the object.
+        """
+        async with await self.get_reader(name, show_deleted=show_deleted) as reader:
+            return await reader.read()
 
-        executor = None
-        executor_fn = None
-        if writeinto:
-            executor = asyncio.get_running_loop().run_in_executor
-            if hasattr(writeinto, "buffer"):
-                executor_fn = writeinto.buffer.write
-            else:
-                executor_fn = writeinto.write
+    async def get_string(self, name: str, show_deleted: Optional[bool] = False) -> str:
+        """
+        get_string returns the data of the object decoded as UTF-8.
+        """
+        data = await self.get_bytes(name, show_deleted=show_deleted)
+        return data.decode()
 
-        async for msg in sub._message_iterator:
-            tokens = msg._get_metadata_fields(msg.reply)
-
-            if executor:
-                await executor(None, executor_fn, msg.data)
-            else:
-                result.data += msg.data
-            h.update(msg.data)
-
-            # Check if we are done.
-            if tokens[8] == OBJ_NO_PENDING:
-                await sub.unsubscribe()
-
-                # Make sure the digest matches.
-                sha = h.digest()
-                rsha = decode_object_digest(info.digest)
-                if not sha == rsha:
-                    raise DigestMismatchError
-
-        return result
+    async def get_file(self, name: str, file: str, show_deleted: Optional[bool] = False) -> None:
+        """
+        get_file writes the data of the object into the file at path ``file``,
+        creating or truncating it.
+        """
+        loop = asyncio.get_running_loop()
+        async with await self.get_reader(name, show_deleted=show_deleted) as reader:
+            f = await loop.run_in_executor(None, open, file, "wb")
+            try:
+                async for chunk in reader:
+                    await loop.run_in_executor(None, f.write, chunk)
+            finally:
+                await loop.run_in_executor(None, f.close)
 
     async def put(
         self,

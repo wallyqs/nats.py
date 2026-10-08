@@ -2,6 +2,8 @@ import base64
 import binascii
 import io
 import json
+import os
+import tempfile
 import unittest
 from hashlib import sha256
 
@@ -461,5 +463,92 @@ class ObjectStoreListingTest(SingleJetStreamServerTestCase):
 
         assert sorted([name async for name in js.object_store_names()]) == expected
         assert sorted([status.bucket async for status in js.object_stores()]) == expected
+
+        await nc.close()
+
+
+class ObjectReaderTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_get_reader(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        obs = await js.create_object_store("READER")
+
+        data = bytes(range(256)) * 40
+        meta = nats.js.api.ObjectMeta(name="A", options=nats.js.api.ObjectMetaOptions(max_chunk_size=1000))
+        await obs.put("A", data, meta=meta)
+
+        # Chunk by chunk.
+        async with await obs.get_reader("A") as reader:
+            assert reader.info.name == "A"
+            assert reader.info.chunks == 11
+            chunks = [chunk async for chunk in reader]
+            assert reader.error is None
+        assert [len(c) for c in chunks] == [1000] * 10 + [240]
+        assert b"".join(chunks) == data
+
+        # Sized reads across chunks, then the rest.
+        reader = await obs.get_reader("A")
+        assert await reader.read(10) == data[:10]
+        assert await reader.read(1500) == data[10:1000]
+        assert await reader.read_chunk() == data[1000:2000]
+        assert await reader.read() == data[2000:]
+        assert await reader.read() == b""
+        await reader.close()
+        with pytest.raises(ValueError):
+            await reader.read()
+
+        # Closing before the end stops the download.
+        reader = await obs.get_reader("A")
+        assert await reader.read(1) == data[:1]
+        await reader.close()
+        assert reader._sub is None
+
+        # Empty objects and links.
+        await obs.put("E", b"")
+        async with await obs.get_reader("E") as reader:
+            assert await reader.read() == b""
+        await obs.add_link("L", await obs.get_info("A"))
+        async with await obs.get_reader("L") as reader:
+            assert reader.info.name == "A"
+            assert await reader.read() == data
+
+        # A digest mismatch is raised by the last read and kept.
+        stored = await obs.get_info("A")
+        stored.digest = get_object_digest_value(sha256(b"other"))
+        await _publish_meta(js, "READER", stored)
+        reader = await obs.get_reader("A")
+        with pytest.raises(DigestMismatchError):
+            await reader.read()
+        assert isinstance(reader.error, DigestMismatchError)
+        with pytest.raises(DigestMismatchError):
+            await reader.read()
+
+        await nc.close()
+
+    @async_test
+    async def test_get_bytes_string_file(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        obs = await js.create_object_store("GETCONV")
+
+        await obs.put("A", "héllo")
+        assert await obs.get_bytes("A") == "héllo".encode()
+        assert await obs.get_string("A") == "héllo"
+
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        tmp.write(b"a longer previous content")
+        tmp.close()
+        try:
+            await obs.get_file("A", tmp.name)
+            with open(tmp.name, "rb") as f:
+                assert f.read() == "héllo".encode()
+        finally:
+            os.unlink(tmp.name)
+
+        await obs.delete("A")
+        with pytest.raises(ObjectNotFoundError):
+            await obs.get_bytes("A")
+        assert await obs.get_bytes("A", show_deleted=True) == b""
 
         await nc.close()
