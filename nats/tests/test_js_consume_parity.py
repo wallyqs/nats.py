@@ -1497,3 +1497,112 @@ class PushConsumerTest(SingleJetStreamServerTestCase):
         assert len(errors) == 1 and isinstance(errors[0], NoHeartbeatError)
         ctx.stop()
         await nc.close()
+
+
+class LeadershipChangeClusterTest(unittest.TestCase):
+    """
+    A three-node JetStream cluster: on a consumer leader change the new
+    leader answers the pull requests it took over with a 409 Leadership
+    Change (nats-server consumer.go checkPendingRequests).
+    """
+
+    def setUp(self):
+        import subprocess
+        import tempfile
+
+        self.loop = asyncio.new_event_loop()
+        self.tmp = tempfile.TemporaryDirectory()
+        routes = ", ".join(f"nats://127.0.0.1:{6230 + i}" for i in range(1, 4))
+        self.procs = []
+        for i in range(1, 4):
+            conf = f"{self.tmp.name}/n{i}.conf"
+            with open(conf, "w") as f:
+                f.write(
+                    f'server_name: n{i}\nport: {4230 + i}\njetstream {{ store_dir: "{self.tmp.name}/js{i}" }}\n'
+                    f"cluster {{ name: C, listen: 127.0.0.1:{6230 + i}, routes: [{routes}] }}\n"
+                )
+            self.procs.append(
+                subprocess.Popen(["nats-server", "-c", conf], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            )
+        self.servers = [f"nats://127.0.0.1:{4230 + i}" for i in range(1, 4)]
+
+    def tearDown(self):
+        for p in self.procs:
+            p.terminate()
+        for p in self.procs:
+            p.wait()
+        self.tmp.cleanup()
+        self.loop.close()
+
+    async def _setup(self, nc):
+        js = nc.jetstream()
+        for _ in range(60):
+            try:
+                await js.add_stream(name="LC", subjects=["lc"], num_replicas=3)
+                break
+            except Exception:
+                await asyncio.sleep(0.5)
+        await js.add_consumer("LC", durable_name="d", ack_policy="explicit", num_replicas=3)
+        return js
+
+    async def _step_down(self, nc):
+        resp = await nc.request("$JS.API.CONSUMER.LEADER.STEPDOWN.LC.d", b"", timeout=5)
+        assert json.loads(resp.data)["success"]
+
+    @async_test
+    async def test_leadership_change_status(self):
+        nc = await nats.connect(self.servers)
+        await self._setup(nc)
+
+        # A raw pending pull gets the 409, which maps to the typed error.
+        inbox = nc.new_inbox()
+        sub = await nc.subscribe(inbox)
+        await nc.publish(
+            "$JS.API.CONSUMER.MSG.NEXT.LC.d",
+            json.dumps({"batch": 1, "expires": 20_000_000_000}).encode(),
+            reply=inbox,
+        )
+        await asyncio.sleep(1)
+        await self._step_down(nc)
+        msg = await sub.next_msg(timeout=10)
+        with pytest.raises(ConsumerLeadershipChangedError) as err:
+            nats.js.errors.APIError.from_msg(msg)
+        assert err.value.code == 409
+        await nc.close()
+
+    @async_test
+    async def test_consume_continues_after_leadership_change(self):
+        nc = await nats.connect(self.servers)
+        js = await self._setup(nc)
+        consumer = await js.pull_consumer("LC", "d")
+
+        errors = []
+        received = []
+        got = asyncio.Event()
+
+        async def cb(msg):
+            received.append(msg.data)
+            await msg.ack()
+            got.set()
+
+        async def error_cb(ctx, err):
+            errors.append(err)
+
+        cc = await consumer.consume(cb, error_cb=error_cb, expires=30)
+        await asyncio.sleep(1)
+        await self._step_down(nc)
+
+        for _ in range(100):
+            if any(isinstance(e, ConsumerLeadershipChangedError) for e in errors):
+                break
+            await asyncio.sleep(0.1)
+        assert any(isinstance(e, ConsumerLeadershipChangedError) for e in errors), errors
+
+        # As in nats.go the error is reported and consuming carries on.
+        await asyncio.sleep(1)
+        await js.publish("lc", b"after")
+        await asyncio.wait_for(got.wait(), 10)
+        assert received == [b"after"]
+
+        cc.stop()
+        await nc.close()
