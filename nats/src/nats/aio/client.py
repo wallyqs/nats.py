@@ -483,6 +483,7 @@ class Client:
         no_callbacks_after_client_close: bool = False,
         ignore_auth_error_abort: bool = False,
         permission_err_on_subscribe: bool = False,
+        retry_on_failed_connect: bool = False,
     ) -> None:
         """
         Establishes a connection to NATS.
@@ -514,6 +515,10 @@ class Client:
             subscription raise the PermissionViolationError the server reported
             for its subject (and queue group), instead of waiting for messages
             that will never come. The error is still reported to error_cb.
+        :param retry_on_failed_connect: When no server of the pool can be
+            connected to, return right away and keep connecting in the
+            background, as reconnections do (publishes are buffered meanwhile).
+            connected_cb reports when the connection is established.
 
         Connecting setting all callbacks::
 
@@ -654,6 +659,7 @@ class Client:
         self.options["no_callbacks_after_client_close"] = no_callbacks_after_client_close
         self.options["ignore_auth_error_abort"] = ignore_auth_error_abort
         self.options["permission_err_on_subscribe"] = permission_err_on_subscribe
+        self.options["retry_on_failed_connect"] = retry_on_failed_connect
 
         if tls:
             self.options["tls"] = tls
@@ -686,7 +692,13 @@ class Client:
         if self.options["dont_randomize"] is False:
             shuffle(self._server_pool)
 
-        while True:
+        if retry_on_failed_connect and not await self._connect_to_pool_once():
+            # Keep connecting in the background, as nats.go's RetryOnFailedConnect.
+            self._status = Client.RECONNECTING
+            self._reconnection_task = asyncio.get_running_loop().create_task(self._attempt_reconnect(initial=True))
+            return
+
+        while not retry_on_failed_connect:
             try:
                 await self._select_next_server()
                 await self._process_connect_init()
@@ -716,6 +728,31 @@ class Client:
 
         if self._connected_cb is not None:
             await self._connected_cb()
+
+    async def _connect_to_pool_once(self) -> bool:
+        """
+        Tries each server of the pool once, as nats.go's initial connect.
+        Returns whether a connection was established.
+        """
+        for s in list(self._server_pool):
+            try:
+                await self._connect_to_server(s)
+                self._current_server = s
+                await self._process_connect_init()
+                s.reconnects = 0
+                s.did_connect = True
+                return True
+            except PermissionError:
+                raise
+            except (OSError, errors.Error, asyncio.TimeoutError) as e:
+                self._err = e
+                await self._error_cb(e)
+                await self._close(Client.DISCONNECTED, False)
+                s.last_attempt = time.monotonic()
+                s.reconnects += 1
+        if self._current_server is None and self._server_pool:
+            self._current_server = self._server_pool[0]
+        return False
 
     def _setup_nkeys_connect(self) -> None:
         if self._user_credentials is not None:
@@ -1786,7 +1823,11 @@ class Client:
             self._close_err = e
             await self._close(Client.CLOSED, True)
 
-    async def _attempt_reconnect(self) -> None:
+    async def _attempt_reconnect(self, initial: bool = False) -> None:
+        """
+        Reconnects to a server of the pool. With ``initial``, it establishes
+        the first connection instead, for retry_on_failed_connect.
+        """
         assert self._current_server, "Client.connect must be called first"
         if self._reading_task is not None and not self._reading_task.cancelled():
             self._reading_task.cancel()
@@ -1806,7 +1847,8 @@ class Client:
 
         self._err = None
         disconnect_err, self._disconnect_err = self._disconnect_err, None
-        await self._notify_disconnected(disconnect_err)
+        if not initial:
+            await self._notify_disconnected(disconnect_err)
 
         if self.is_closed:
             return
@@ -1870,7 +1912,8 @@ class Client:
 
                 # Consider a reconnect to be done once CONNECT was
                 # processed by the server successfully.
-                self.stats["reconnects"] += 1
+                if not initial:
+                    self.stats["reconnects"] += 1
 
                 # Reset reconnect attempts for this server
                 # since have successfully connected.
@@ -1912,7 +1955,10 @@ class Client:
                 await self._flush_pending()
                 self._status = Client.CONNECTED
                 await self.flush()
-                if self._reconnected_cb is not None:
+                if initial:
+                    if self._connected_cb is not None:
+                        await self._connected_cb()
+                elif self._reconnected_cb is not None:
                     await self._reconnected_cb()
                 self._reconnection_task_future = None
                 break

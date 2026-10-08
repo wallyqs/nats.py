@@ -598,6 +598,78 @@ class AuthErrorAbortTest(ConfiguredServerTestCase):
         await nc.close()
 
 
+class RetryOnFailedConnectTest(unittest.TestCase):
+    def setUp(self):
+        self.loop = asyncio.new_event_loop()
+        self.server_pool = []
+
+    def tearDown(self):
+        for natsd in self.server_pool:
+            natsd.stop()
+        self.loop.close()
+
+    @async_test
+    async def test_retry_on_failed_connect(self):
+        connected = asyncio.Event()
+        reconnected = []
+
+        async def connected_cb():
+            connected.set()
+
+        async def reconnected_cb():
+            reconnected.append(True)
+
+        async def error_cb(e):
+            pass
+
+        nc = await nats.connect(
+            "nats://127.0.0.1:4222",
+            retry_on_failed_connect=True,
+            connected_cb=connected_cb,
+            reconnected_cb=reconnected_cb,
+            error_cb=error_cb,
+            reconnect_time_wait=0.1,
+            max_reconnect_attempts=-1,
+        )
+        # connect returned without a server; the client keeps trying.
+        self.assertTrue(nc.is_reconnecting)
+        self.assertFalse(connected.is_set())
+        sub = await nc.subscribe("foo")
+        await nc.publish("foo", b"buffered")
+
+        server = NATSD(port=4222)
+        self.server_pool.append(server)
+        start_natsd(server)
+        await asyncio.wait_for(connected.wait(), 3)
+        self.assertTrue(nc.is_connected)
+        self.assertEqual(reconnected, [])
+        self.assertEqual(nc.stats["reconnects"], 0)
+        msg = await sub.next_msg(timeout=2)
+        self.assertEqual(msg.data, b"buffered")
+        await nc.close()
+
+    @async_test
+    async def test_retry_on_failed_connect_connects_right_away(self):
+        server = NATSD(port=4222)
+        self.server_pool.append(server)
+        start_natsd(server)
+        connected = []
+
+        async def connected_cb():
+            connected.append(True)
+
+        nc = await nats.connect("nats://127.0.0.1:4222", retry_on_failed_connect=True, connected_cb=connected_cb)
+        self.assertTrue(nc.is_connected)
+        self.assertEqual(connected, [True])
+        await nc.close()
+
+    @async_test
+    async def test_without_retry_connect_fails(self):
+        nc = NATS()
+        with self.assertRaises(nats.errors.NoServersError):
+            await nc.connect("nats://127.0.0.1:4222", max_reconnect_attempts=1, reconnect_time_wait=0.1)
+
+
 if __name__ == "__main__":
     import sys
 
