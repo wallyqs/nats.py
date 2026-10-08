@@ -19,7 +19,7 @@ import datetime
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import nats.errors
 import nats.js.errors
@@ -353,21 +353,46 @@ class KeyValue:
         if last and last > 0:
             hdrs[api.Header.EXPECTED_LAST_SUBJECT_SEQUENCE] = str(last)
 
-        await self._js.publish(f"{self._mutation_pre}{key}", headers=hdrs)
+        await self._publish_marker(key, hdrs)
         return True
 
-    async def purge(self, key: str, msg_ttl: Optional[float] = None) -> bool:
+    async def purge(
+        self,
+        key: str,
+        msg_ttl: Optional[float] = None,
+        last: Optional[int] = None,
+    ) -> bool:
         """
         purge will remove the key and all revisions.
 
         :param key: The key to purge
         :param msg_ttl: Optional TTL (time-to-live) in seconds for the purge marker
+        :param last: Expected last revision number (for optimistic concurrency);
+            raises KeyRevisionMismatchError when it is not the latest one
         """
         hdrs = {}
         hdrs[KV_OP] = KV_PURGE
         hdrs[api.Header.ROLLUP] = MSG_ROLLUP_SUBJECT
-        await self._js.publish(f"{self._mutation_pre}{key}", headers=hdrs, msg_ttl=msg_ttl)
+        if last and last > 0:
+            hdrs[api.Header.EXPECTED_LAST_SUBJECT_SEQUENCE] = str(last)
+        await self._publish_marker(key, hdrs, msg_ttl=msg_ttl)
         return True
+
+    async def _publish_marker(self, key: str, hdrs: Dict[str, str], msg_ttl: Optional[float] = None) -> None:
+        try:
+            await self._js.publish(f"{self._mutation_pre}{key}", headers=hdrs, msg_ttl=msg_ttl)
+        except nats.js.errors.APIError as err:
+            # A wrong last sequence on a delete or purge is a revision
+            # mismatch (nats.go wraps ErrKeyRevisionMismatch).
+            if err.err_code in (10071, 10164):
+                raise nats.js.errors.KeyRevisionMismatchError(
+                    description=err.description,
+                    code=err.code,
+                    err_code=err.err_code,
+                    stream=err.stream,
+                    seq=err.seq,
+                ) from err
+            raise
 
     async def purge_deletes(self, olderthan: int = 30 * 60) -> bool:
         """

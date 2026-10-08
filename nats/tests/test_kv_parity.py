@@ -7,6 +7,7 @@ from nats.js.errors import (
     BucketMalformedError,
     BucketRequiredError,
     InvalidBucketNameError,
+    KeyNotFoundError,
     KeyRevisionMismatchError,
     KeyValueConfigRequiredError,
     KeyWrongLastSequenceError,
@@ -60,3 +61,36 @@ class KVErrorsTest(SingleJetStreamServerTestCase):
     def test_bucket_error_identities(self):
         assert str(BucketRequiredError()) == "nats: bucket required"
         assert str(BucketMalformedError()) == "nats: bucket malformed"
+
+
+class KVPurgeLastRevisionTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_purge_and_delete_with_last_revision(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        kv = await js.create_key_value(bucket="PURGELAST", history=5)
+
+        first = await kv.put("a", b"1")
+        latest = await kv.put("a", b"2")
+
+        with pytest.raises(KeyRevisionMismatchError) as exc:
+            await kv.purge("a", last=first)
+        assert exc.value.err_code in (10071, 10164)
+        assert isinstance(exc.value, BadRequestError)
+        # Nothing was purged.
+        assert (await kv.get("a")).value == b"2"
+
+        assert await kv.purge("a", last=latest)
+        with pytest.raises(KeyNotFoundError):
+            await kv.get("a")
+        history = await kv.history("a")
+        assert len(history) == 1
+        assert history[0].operation == "PURGE"
+
+        latest = await kv.put("b", b"1")
+        with pytest.raises(KeyRevisionMismatchError) as exc:
+            await kv.delete("b", last=latest - 1)
+        assert exc.value.err_code in (10071, 10164)
+        assert await kv.delete("b", last=latest)
+
+        await nc.close()
