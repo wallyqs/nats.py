@@ -342,6 +342,155 @@ class TLSErrorTest(TLSServerTestCase):
         self.assertTrue(str(err).startswith("nats: tls error:"))
 
 
+class CallbacksTest(SingleServerTestCase):
+    @async_test
+    async def test_connected_cb_on_first_connect_only(self):
+        connected = []
+        reconnected = asyncio.Event()
+
+        async def connected_cb():
+            connected.append(True)
+
+        async def reconnected_cb():
+            reconnected.set()
+
+        nc = await nats.connect(connected_cb=connected_cb, reconnected_cb=reconnected_cb, reconnect_time_wait=0.1)
+        self.assertEqual(connected, [True])
+        await nc.force_reconnect()
+        await asyncio.wait_for(reconnected.wait(), 2)
+        self.assertEqual(connected, [True])
+        await nc.close()
+
+    @async_test
+    async def test_disconnected_err_cb(self):
+        errs = asyncio.Queue()
+        plain = []
+
+        async def disconnected_err_cb(e):
+            await errs.put(e)
+
+        async def disconnected_cb():
+            plain.append(True)
+
+        nc = await nats.connect(
+            disconnected_err_cb=disconnected_err_cb,
+            disconnected_cb=disconnected_cb,
+            reconnect_time_wait=0.1,
+            max_reconnect_attempts=-1,
+        )
+        self.server_pool[0].stop()
+        err = await asyncio.wait_for(errs.get(), 2)
+        self.assertIsInstance(err, Exception)
+        await nc.close()
+        # A close by the user reports no error.
+        err = await asyncio.wait_for(errs.get(), 2)
+        self.assertIsNone(err)
+        # disconnected_err_cb replaces disconnected_cb, as in nats.go.
+        self.assertEqual(plain, [])
+
+    @async_test
+    async def test_reconnect_error_cb(self):
+        errs = asyncio.Queue()
+
+        async def reconnect_error_cb(e):
+            await errs.put(e)
+
+        nc = await nats.connect(reconnect_error_cb=reconnect_error_cb, reconnect_time_wait=0.1)
+        self.server_pool[0].stop()
+        err = await asyncio.wait_for(errs.get(), 2)
+        self.assertIsInstance(err, OSError)
+        await nc.close()
+
+    @async_test
+    async def test_set_callbacks_after_connect(self):
+        events = []
+
+        async def disconnected_cb():
+            events.append("disconnected")
+
+        async def closed_cb():
+            events.append("closed")
+
+        async def reconnected_cb():
+            events.append("reconnected")
+
+        async def error_cb(e):
+            events.append(e)
+
+        async def discovered_server_cb():
+            pass
+
+        async def disconnected_err_cb(e):
+            pass
+
+        nc = await nats.connect(reconnect_time_wait=0.1)
+        self.assertIsNone(nc.error_cb)
+        self.assertIsNone(nc.closed_cb)
+
+        async def cb(msg):
+            raise ValueError("handler failed")
+
+        await nc.subscribe("foo", cb=cb)
+
+        nc.set_disconnected_cb(disconnected_cb)
+        nc.set_closed_cb(closed_cb)
+        nc.set_reconnected_cb(reconnected_cb)
+        nc.set_error_cb(error_cb)
+        nc.set_discovered_server_cb(discovered_server_cb)
+        self.assertIs(nc.disconnected_cb, disconnected_cb)
+        self.assertIs(nc.closed_cb, closed_cb)
+        self.assertIs(nc.reconnected_cb, reconnected_cb)
+        self.assertIs(nc.error_cb, error_cb)
+        self.assertIs(nc.discovered_server_cb, discovered_server_cb)
+        nc.set_disconnected_err_cb(disconnected_err_cb)
+        self.assertIs(nc.disconnected_err_cb, disconnected_err_cb)
+        nc.set_disconnected_err_cb(None)
+
+        with self.assertRaises(nats.errors.InvalidCallbackTypeError):
+            nc.set_closed_cb(lambda: None)
+
+        # The new error callback also covers subscriptions made before.
+        await nc.publish("foo", b"")
+        await nc.flush()
+        await asyncio.sleep(0.1)
+        self.assertIsInstance(events[0], ValueError)
+
+        await nc.force_reconnect()
+        for _ in range(20):
+            if "reconnected" in events:
+                break
+            await asyncio.sleep(0.1)
+        await nc.close()
+        self.assertEqual(events[1:], ["disconnected", "reconnected", "disconnected", "closed"])
+
+        nc.set_error_cb(None)
+        self.assertIsNone(nc.error_cb)
+
+    @async_test
+    async def test_no_callbacks_after_client_close(self):
+        events = []
+
+        async def disconnected_cb():
+            events.append("disconnected")
+
+        async def closed_cb():
+            events.append("closed")
+
+        nc = await nats.connect(
+            disconnected_cb=disconnected_cb, closed_cb=closed_cb, no_callbacks_after_client_close=True
+        )
+        await nc.close()
+        nc = await nats.connect(
+            disconnected_cb=disconnected_cb, closed_cb=closed_cb, no_callbacks_after_client_close=True
+        )
+        await nc.drain()
+        self.assertEqual(events, [])
+
+        nc = await nats.connect(disconnected_cb=disconnected_cb, closed_cb=closed_cb)
+        await nc.close()
+        self.assertEqual(events, ["disconnected", "closed"])
+
+
 if __name__ == "__main__":
     import sys
 

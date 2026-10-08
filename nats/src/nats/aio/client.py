@@ -163,6 +163,7 @@ _HEADER_VALUE_NEWLINES = str.maketrans({"\r": " ", "\n": " "})
 
 Callback = Callable[[], Awaitable[None]]
 ErrorCallback = Callable[[Exception], Awaitable[None]]
+DisconnectedErrorCallback = Callable[[Optional[Exception]], Awaitable[None]]
 JWTCallback = Callable[[], Union[bytearray, bytes]]
 SignatureCallback = Callable[[str], bytes]
 TokenCallback = Callable[[], str]
@@ -366,6 +367,12 @@ class Client:
         self._reconnected_cb: Optional[Callback] = None
         self._reconnect_to_server_handler: Optional[ReconnectToServerHandler] = None
         self._lame_duck_mode_cb: Optional[Callback] = None
+        self._connected_cb: Optional[Callback] = None
+        self._disconnected_err_cb: Optional[DisconnectedErrorCallback] = None
+        self._reconnect_error_cb: Optional[ErrorCallback] = None
+        # The errors handed to disconnected_err_cb when reconnecting or closing.
+        self._disconnect_err: Optional[Exception] = None
+        self._close_err: Optional[Exception] = None
 
         self._reconnection_task: Optional[asyncio.Task[None]] = None
         self._reconnection_task_future: Optional[asyncio.Future] = None
@@ -468,6 +475,10 @@ class Client:
         reconnect_to_server_handler: Optional[ReconnectToServerHandler] = None,
         lame_duck_mode_cb: Optional[Callback] = None,
         skip_subject_validation: bool = False,
+        connected_cb: Optional[Callback] = None,
+        disconnected_err_cb: Optional[DisconnectedErrorCallback] = None,
+        reconnect_error_cb: Optional[ErrorCallback] = None,
+        no_callbacks_after_client_close: bool = False,
     ) -> None:
         """
         Establishes a connection to NATS.
@@ -484,6 +495,14 @@ class Client:
             reply subjects and queue groups on publish, subscribe and request.
             Not recommended: the performance gain is minimal and it removes the
             protection against CRLF injection into the protocol stream.
+        :param connected_cb: Callback to report that the initial connection
+            was established (reconnections are reported to reconnected_cb).
+        :param disconnected_err_cb: Callback to report disconnection from NATS
+            with the error that caused it (None when the connection was closed
+            by the user). When set, it is called instead of disconnected_cb.
+        :param reconnect_error_cb: Callback to report each failed reconnect attempt.
+        :param no_callbacks_after_client_close: Do not call the disconnected and
+            closed callbacks when the connection is closed by close() or drain().
 
         Connecting setting all callbacks::
 
@@ -569,6 +588,9 @@ class Client:
             reconnected_cb,
             discovered_server_cb,
             lame_duck_mode_cb,
+            connected_cb,
+            disconnected_err_cb,
+            reconnect_error_cb,
         ]:
             if cb and not inspect.iscoroutinefunction(cb):
                 raise errors.InvalidCallbackTypeError
@@ -581,6 +603,9 @@ class Client:
         self._disconnected_cb = disconnected_cb
         self._reconnect_to_server_handler = reconnect_to_server_handler
         self._lame_duck_mode_cb = lame_duck_mode_cb
+        self._connected_cb = connected_cb
+        self._disconnected_err_cb = disconnected_err_cb
+        self._reconnect_error_cb = reconnect_error_cb
 
         # Custom inbox prefix
         if isinstance(inbox_prefix, str):
@@ -615,6 +640,7 @@ class Client:
         self.options["ws_connection_headers"] = ws_connection_headers
         self.options["skip_subject_validation"] = skip_subject_validation
         self._skip_subject_validation = skip_subject_validation
+        self.options["no_callbacks_after_client_close"] = no_callbacks_after_client_close
 
         if tls:
             self.options["tls"] = tls
@@ -674,6 +700,9 @@ class Client:
                 if self._current_server is not None:
                     self._current_server.last_attempt = time.monotonic()
                     self._current_server.reconnects += 1
+
+        if self._connected_cb is not None:
+            await self._connected_cb()
 
     def _setup_nkeys_connect(self) -> None:
         if self._user_credentials is not None:
@@ -822,13 +851,14 @@ class Client:
         sets the client to be in the CLOSED state.
         No further reconnections occur once reaching this point.
         """
-        await self._close(Client.CLOSED)
+        await self._close(Client.CLOSED, not self.options.get("no_callbacks_after_client_close", False))
 
     async def _close(self, status: int, do_cbs: bool = True) -> None:
         if self.is_closed:
             self._status = status
             return
         self._status = Client.CLOSED
+        close_err, self._close_err = self._close_err, None
 
         # Avoid cancelling the current task when _close is called from within
         # one of these tasks (e.g. _read_loop via _process_op_err), otherwise
@@ -897,8 +927,7 @@ class Client:
                 await self._error_cb(e)
 
         if do_cbs:
-            if self._disconnected_cb is not None:
-                await self._disconnected_cb()
+            await self._notify_disconnected(close_err)
             if self._closed_cb is not None:
                 await self._closed_cb()
 
@@ -948,7 +977,7 @@ class Client:
         finally:
             self._status = Client.DRAINING_PUBS
             await self.flush()
-            await self._close(Client.CLOSED)
+            await self._close(Client.CLOSED, not self.options.get("no_callbacks_after_client_close", False))
 
     async def publish(
         self,
@@ -1113,7 +1142,7 @@ class Client:
             pending_bytes_limit=pending_bytes_limit,
         )
 
-        sub._start(self._error_cb)
+        sub._start(self._dispatch_error)
         self._subs[sid] = sub
         await self._send_subscribe(sub)
         return sub
@@ -1639,6 +1668,8 @@ class Client:
 
                 self._err = e
                 await self._error_cb(e)
+                if self.is_reconnecting:
+                    await self._notify_reconnect_error(e)
                 continue
 
     async def _process_err(self, err_msg: str) -> None:
@@ -1677,6 +1708,7 @@ class Client:
         # FIXME: Some errors such as 'Invalid Subscription'
         # do not cause the server to close the connection.
         # For now we handle similar as other clients and close.
+        self._close_err = self._err
         asyncio.create_task(self._close(Client.CLOSED, do_cbs))
 
     async def force_reconnect(self) -> None:
@@ -1688,6 +1720,7 @@ class Client:
         if not self.options["allow_reconnect"]:
             return
         self._status = Client.RECONNECTING
+        self._disconnect_err = None
         self._ps.reset()
         if self._reconnection_task is not None and not self._reconnection_task.cancelled():
             self._reconnection_task.cancel()
@@ -1705,6 +1738,7 @@ class Client:
 
         if self.options["allow_reconnect"] and (self.is_connected or self.is_connecting):
             self._status = Client.RECONNECTING
+            self._disconnect_err = e
             self._ps.reset()
 
             if self._reconnection_task is not None and not self._reconnection_task.cancelled():
@@ -1715,6 +1749,7 @@ class Client:
         else:
             self._process_disconnect()
             self._err = e
+            self._close_err = e
             await self._close(Client.CLOSED, True)
 
     async def _attempt_reconnect(self) -> None:
@@ -1736,8 +1771,8 @@ class Client:
                 await self._error_cb(e)
 
         self._err = None
-        if self._disconnected_cb is not None:
-            await self._disconnected_cb()
+        disconnect_err, self._disconnect_err = self._disconnect_err, None
+        await self._notify_disconnected(disconnect_err)
 
         if self.is_closed:
             return
@@ -1768,6 +1803,7 @@ class Client:
                         )
                     except Exception as e:
                         await self._error_cb(e)
+                        await self._notify_reconnect_error(e)
                         continue
 
                     if selected is not None:
@@ -1779,7 +1815,9 @@ class Client:
                         if matched is not None:
                             self._current_server = matched
                         else:
-                            await self._error_cb(errors.ServerNotInPoolError())
+                            not_in_pool = errors.ServerNotInPoolError()
+                            await self._error_cb(not_in_pool)
+                            await self._notify_reconnect_error(not_in_pool)
                             selected = None
 
                     if selected is None:
@@ -1843,13 +1881,15 @@ class Client:
                 break
             except errors.NoServersError as e:
                 self._err = e
-                await self.close()
+                self._close_err = e
+                await self._close(Client.CLOSED)
                 break
             except PermissionError:
                 raise
             except (OSError, errors.Error, asyncio.TimeoutError) as e:
                 self._err = e
                 await self._error_cb(e)
+                await self._notify_reconnect_error(e)
                 self._status = Client.RECONNECTING
                 self._current_server.last_attempt = time.monotonic()
                 self._current_server.reconnects += 1
@@ -1858,6 +1898,93 @@ class Client:
 
         if self._reconnection_task_future is not None and not self._reconnection_task_future.cancelled():
             self._reconnection_task_future.set_result(True)
+
+    async def _dispatch_error(self, e: Exception) -> None:
+        """
+        Reports an asynchronous error to the error callback set at the time.
+        """
+        await self._error_cb(e)
+
+    async def _notify_disconnected(self, err: Optional[Exception]) -> None:
+        if self._disconnected_err_cb is not None:
+            await self._disconnected_err_cb(err)
+        elif self._disconnected_cb is not None:
+            await self._disconnected_cb()
+
+    async def _notify_reconnect_error(self, err: Exception) -> None:
+        if self._reconnect_error_cb is not None:
+            await self._reconnect_error_cb(err)
+
+    @staticmethod
+    def _check_callback(cb: Optional[Callable[..., Any]]) -> None:
+        if cb is not None and not inspect.iscoroutinefunction(cb):
+            raise errors.InvalidCallbackTypeError
+
+    def set_error_cb(self, cb: Optional[ErrorCallback]) -> None:
+        """
+        Replaces the callback that reports asynchronous errors,
+        as nats.go's SetErrorHandler. None restores the default logging one.
+        """
+        self._check_callback(cb)
+        self._error_cb = cb or _default_error_callback
+
+    def set_disconnected_cb(self, cb: Optional[Callback]) -> None:
+        """Replaces the disconnected callback, as nats.go's SetDisconnectHandler."""
+        self._check_callback(cb)
+        self._disconnected_cb = cb
+
+    def set_disconnected_err_cb(self, cb: Optional[DisconnectedErrorCallback]) -> None:
+        """
+        Replaces the disconnected callback that receives the error,
+        as nats.go's SetDisconnectErrHandler.
+        """
+        self._check_callback(cb)
+        self._disconnected_err_cb = cb
+
+    def set_reconnected_cb(self, cb: Optional[Callback]) -> None:
+        """Replaces the reconnected callback, as nats.go's SetReconnectHandler."""
+        self._check_callback(cb)
+        self._reconnected_cb = cb
+
+    def set_closed_cb(self, cb: Optional[Callback]) -> None:
+        """Replaces the closed callback, as nats.go's SetClosedHandler."""
+        self._check_callback(cb)
+        self._closed_cb = cb
+
+    def set_discovered_server_cb(self, cb: Optional[Callback]) -> None:
+        """
+        Replaces the callback that reports discovered servers,
+        as nats.go's SetDiscoveredServersHandler.
+        """
+        self._check_callback(cb)
+        self._discovered_server_cb = cb
+
+    @property
+    def error_cb(self) -> Optional[ErrorCallback]:
+        """The error callback, None when unset, as nats.go's ErrorHandler."""
+        if self._error_cb is _default_error_callback:
+            return None
+        return self._error_cb
+
+    @property
+    def disconnected_cb(self) -> Optional[Callback]:
+        return self._disconnected_cb
+
+    @property
+    def disconnected_err_cb(self) -> Optional[DisconnectedErrorCallback]:
+        return self._disconnected_err_cb
+
+    @property
+    def reconnected_cb(self) -> Optional[Callback]:
+        return self._reconnected_cb
+
+    @property
+    def closed_cb(self) -> Optional[Callback]:
+        return self._closed_cb
+
+    @property
+    def discovered_server_cb(self) -> Optional[Callback]:
+        return self._discovered_server_cb
 
     def _connect_command(self) -> bytes:
         """
@@ -2521,7 +2648,7 @@ class Client:
 
     async def __aexit__(self, *exc_info) -> None:
         """Close connection to NATS when used in a context manager"""
-        await self._close(Client.CLOSED, do_cbs=True)
+        await self._close(Client.CLOSED, do_cbs=not self.options.get("no_callbacks_after_client_close", False))
 
     def jetstream(self, **opts) -> nats.js.JetStreamContext:
         """
