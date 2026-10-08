@@ -36,6 +36,7 @@ import nats.js.errors
 from nats.aio.msg import Msg
 from nats.aio.subscription import Subscription
 from nats.js import api
+from nats.js.consume import PullConsumer
 from nats.js.errors import (
     BadBucketError,
     BucketNotFoundError,
@@ -1005,6 +1006,23 @@ class JetStreamContext(JetStreamManager):
             deliver=deliver,
             group=priority_group,
         )
+
+    async def pull_consumer(self, stream: str, consumer: str) -> PullConsumer:
+        """
+        pull_consumer returns a handle on an existing pull consumer, to fetch
+        and consume its messages (nats.go Stream.Consumer). Its info is
+        fetched and available from ``cached_info()``.
+
+        ::
+
+            consumer = await js.pull_consumer("mystream", "dur")
+            msg = await consumer.next()
+            await msg.ack()
+        """
+        info = await self.consumer_info(stream, consumer)
+        if info.config.deliver_subject:
+            raise nats.js.errors.NotPullConsumerError(description="consumer is not a pull consumer")
+        return PullConsumer(self, stream, info.name, info)
 
     @classmethod
     def is_status_msg(cls, msg: Optional[Msg]) -> Optional[str]:

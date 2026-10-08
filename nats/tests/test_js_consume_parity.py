@@ -465,3 +465,131 @@ class StatusErrorsTest(SingleJetStreamServerTestCase):
             await asyncio.wait_for(fetch, timeout=2)
         assert err.value.code == 409
         await nc.close()
+
+
+class PullConsumerFetchTest(SingleJetStreamServerTestCase):
+    async def _setup(self, n=5, payload=b"x", **config):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="PULL", subjects=["pull.>"])
+        for i in range(n):
+            await js.publish(f"pull.{i}", payload)
+        await js.add_consumer("PULL", durable_name="dur", ack_policy="explicit", **config)
+        consumer = await js.pull_consumer("PULL", "dur")
+        return nc, js, consumer
+
+    @async_test
+    async def test_fetch(self):
+        nc, js, consumer = await self._setup()
+        assert consumer.cached_info().name == "dur"
+        assert consumer.cached_info().num_pending == 5
+
+        batch = await consumer.fetch(3)
+        msgs = [msg async for msg in batch]
+        assert [m.subject for m in msgs] == ["pull.0", "pull.1", "pull.2"]
+        assert batch.done and batch.error is None
+        for msg in msgs:
+            await msg.ack_sync()
+
+        # Fewer messages than asked for: the batch ends when the pull expires.
+        start = time.monotonic()
+        batch = await consumer.fetch(10, max_wait=0.5)
+        msgs = [msg async for msg in batch]
+        assert len(msgs) == 2
+        assert batch.error is None
+        assert 0.4 < time.monotonic() - start < 2
+        for msg in msgs:
+            await msg.ack_sync()
+
+        # The cached info is only updated by info().
+        assert consumer.cached_info().num_pending == 5
+        info = await consumer.info()
+        assert info.num_pending == 0 and info.num_ack_pending == 0
+        assert consumer.cached_info() is info
+        await nc.close()
+
+    @async_test
+    async def test_fetch_no_wait(self):
+        nc, js, consumer = await self._setup(n=2)
+        start = time.monotonic()
+        batch = await consumer.fetch_no_wait(10)
+        msgs = [msg async for msg in batch]
+        assert len(msgs) == 2 and batch.error is None
+        batch = await consumer.fetch_no_wait(10)
+        assert [msg async for msg in batch] == []
+        assert batch.error is None
+        assert time.monotonic() - start < 0.5
+        await nc.close()
+
+    @async_test
+    async def test_fetch_bytes(self):
+        nc, js, consumer = await self._setup(n=5, payload=b"a" * 1000)
+        batch = await consumer.fetch_bytes(2500, max_wait=1)
+        msgs = [msg async for msg in batch]
+        # The third message would exceed the bytes left: the batch ends quietly.
+        assert len(msgs) == 2
+        assert batch.error is None
+        await nc.close()
+
+    @async_test
+    async def test_next(self):
+        nc, js, consumer = await self._setup(n=1)
+        msg = await consumer.next()
+        assert msg.subject == "pull.0"
+        await msg.ack()
+        with pytest.raises(nats.errors.TimeoutError):
+            await consumer.next(max_wait=0.3)
+        await nc.close()
+
+    @async_test
+    async def test_consumer_deleted(self):
+        nc, js, consumer = await self._setup(n=0)
+        batch = await consumer.fetch(1, max_wait=3)
+        await asyncio.sleep(0.3)
+        await js.delete_consumer("PULL", "dur")
+        msgs = [msg async for msg in batch]
+        assert msgs == []
+        assert isinstance(batch.error, ConsumerDeletedError)
+        with pytest.raises(ConsumerDeletedError):
+            raise batch.error
+        await nc.close()
+
+    @async_test
+    async def test_invalid_options(self):
+        nc, js, consumer = await self._setup(n=0)
+        for kwargs in ({"batch": 0}, {"batch": 1, "max_wait": 0}, {"batch": 1, "priority": 10}):
+            with pytest.raises(ValueError):
+                await consumer.fetch(**kwargs)
+        with pytest.raises(ValueError):
+            await consumer.fetch(1, max_wait=1, heartbeat=0.6)
+        with pytest.raises(ValueError):
+            await consumer.fetch_bytes(0)
+
+        await js.add_consumer("PULL", durable_name="push", deliver_subject="deliver")
+        with pytest.raises(NotPullConsumerError):
+            await js.pull_consumer("PULL", "push")
+        with pytest.raises(NotFoundError):
+            await js.pull_consumer("PULL", "missing")
+        await nc.close()
+
+    @async_test
+    async def test_fetch_pinned(self):
+        nc, js, consumer = await self._setup(
+            n=2, priority_policy=api.PriorityPolicy.PINNED, priority_groups=["A"], priority_timeout=5
+        )
+        other = await js.pull_consumer("PULL", "dur")
+
+        batch = await consumer.fetch(1, max_wait=1, group="A")
+        msgs = [m async for m in batch]
+        assert len(msgs) == 1
+        assert consumer.pin_id
+        assert msgs[0].headers[api.Header.PIN_ID] == consumer.pin_id
+
+        # Another client is not pinned and gets nothing.
+        batch = await other.fetch(1, max_wait=0.5, group="A")
+        assert [m async for m in batch] == []
+        assert other.pin_id is None
+
+        batch = await consumer.fetch(1, max_wait=1, group="A")
+        assert len([m async for m in batch]) == 1
+        await nc.close()
