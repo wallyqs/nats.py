@@ -253,7 +253,13 @@ After the fixes above, every legacy row the audit marked `missing` or `partial` 
 | Object Store | `test_object_store_parity.py` |
 | orbit `jetstreamext` | `test_jetstreamext.py` |
 
-An independent read-only re-check of all 596 legacy rows against the final code found every row closed or not applicable, once the follow-up commits closed the last partial rows.
+[`legacy-issues.tsv`](legacy-issues.tsv) maps every one of the 596 legacy rows the audit marked `missing` or `partial` to:
+- its verdict at the branch tip,
+- the commit or commits that closed it,
+- the test that exercises it,
+- `file:line` evidence.
+
+A final read-only check against the tip found all 596 rows closed, and every row cites a test that exists. The defects found outside the symbol inventory are in the commit table above.
 
 The three earlier compatibility exceptions now follow nats.go. Each changed its own commit and updated the upstream test that pinned the old behaviour:
 
@@ -272,7 +278,7 @@ Some nats.go defaults are kept as opt-ins, so existing callers keep their curren
 
 The batch error codes follow nats-server's `errors.json`, not orbit.go's 10202–10206.
 
-Verified at the branch tip: the whole `nats/tests` suite passes against nats-server v2.15.0, with 614 passed and 4 skipped.
+Verified at the branch tip: the whole `nats/tests` suite passes against nats-server v2.15.0, with 629 passed and 4 skipped.
 
 ## Notes on method
 
