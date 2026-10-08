@@ -5021,6 +5021,33 @@ class ObjectStoreTest(SingleJetStreamServerTestCase):
         await nc.close()
 
     @async_test
+    async def test_object_mtime(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        obs = await js.create_object_store("MTIME")
+        before = datetime.datetime.now(datetime.timezone.utc)
+        await obs.put("A", b"A")
+        await obs.delete("A")
+        after = datetime.datetime.now(datetime.timezone.utc)
+
+        # Deleting resets the stored mtime; it is filled from the server's
+        # timestamp of the meta message instead.
+        info = await obs.get_info("A", show_deleted=True)
+        assert info.deleted
+        mtime = datetime.datetime.fromisoformat(info.mtime)
+        assert before - datetime.timedelta(seconds=1) <= mtime <= after + datetime.timedelta(seconds=1)
+
+        watcher = await obs.watch()
+        winfo = await watcher.updates()
+        assert winfo.name == "A"
+        wmtime = datetime.datetime.fromisoformat(winfo.mtime)
+        assert abs(wmtime - mtime) < datetime.timedelta(milliseconds=1)
+        await watcher.stop()
+
+        await nc.close()
+
+    @async_test
     async def test_object_watch_stop_ends_iteration(self):
         nc = await nats.connect()
         js = nc.jetstream()

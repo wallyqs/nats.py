@@ -171,8 +171,9 @@ class ObjectStore:
         if (not show_deleted) and info.deleted:
             raise ObjectNotFoundError
 
-        # TODO: Uncomment below when time is added to RawStreamMsg.
-        # info.mtime = m.time
+        # The modification time is when the meta was last stored.
+        if msg.time is not None:
+            info.mtime = msg.time.isoformat()
 
         return info
 
@@ -494,6 +495,7 @@ class ObjectStore:
         async def watch_updates(msg):
             meta = msg.metadata
             info = api.ObjectInfo.from_response(json.loads(msg.data))
+            info.mtime = meta.timestamp.isoformat()
 
             if (not ignore_deletes) or (not info.deleted):
                 await watcher._updates.put(info)
