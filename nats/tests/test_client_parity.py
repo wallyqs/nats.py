@@ -1205,6 +1205,61 @@ class FlusherTest(unittest.IsolatedAsyncioTestCase):
         flusher.cancel()
 
 
+class MsgTest(SingleServerTestCase):
+    @async_test
+    async def test_multi_value_headers_and_size(self):
+        nc = await nats.connect()
+        sub = await nc.subscribe("foo")
+        await nc.publish("foo", b"data", reply="bar", headers={"X": ["a", "b"], "Y": "c"})
+        msg = await sub.next_msg()
+        # The dict keeps one value per header, as before.
+        self.assertEqual(msg.headers, {"X": "b", "Y": "c"})
+        self.assertEqual(msg.header_values("X"), ["a", "b"])
+        self.assertEqual(msg.header_values("Y"), ["c"])
+        self.assertEqual(msg.header_values("Z"), [])
+        raw = b"NATS/1.0\r\nX: a\r\nX: b\r\nY: c\r\n\r\n"
+        self.assertEqual(msg.size, len("foo") + len("bar") + len(raw) + len(b"data"))
+
+        await nc.publish("foo", b"plain")
+        msg = await sub.next_msg()
+        self.assertEqual(msg.size, len("foo") + len(b"plain"))
+        self.assertEqual(msg.header_values("X"), [])
+        await nc.close()
+
+    @async_test
+    async def test_add_header(self):
+        nc = await nats.connect()
+        sub = await nc.subscribe("foo")
+        msg = Msg(_client=nc, subject="foo", data=b"x")
+        msg.add_header("X", "a")
+        msg.add_header("X", "b")
+        msg.add_header("Y", "c")
+        self.assertEqual(msg.header_values("X"), ["a", "b"])
+        self.assertEqual(msg.size, len("foo") + len(b"NATS/1.0\r\nX: a\r\nX: b\r\nY: c\r\n\r\n") + 1)
+        await nc.publish(msg.subject, msg.data, headers=msg.headers)
+        received = await sub.next_msg()
+        self.assertEqual(received.header_values("X"), ["a", "b"])
+        await nc.close()
+
+    @async_test
+    async def test_respond_msg(self):
+        nc = await nats.connect()
+
+        async def handler(msg):
+            await msg.respond_msg(Msg(_client=nc, data=b"response", headers={"H": "1"}))
+
+        await nc.subscribe("service", cb=handler)
+        resp = await nc.request("service", b"", timeout=1)
+        self.assertEqual(resp.data, b"response")
+        self.assertEqual(resp.headers, {"H": "1"})
+
+        with self.assertRaises(nats.errors.InvalidMsgError):
+            await Msg(_client=nc, subject="foo", reply="bar").respond_msg(None)
+        with self.assertRaises(nats.errors.MsgNoReplyError):
+            await Msg(_client=nc, subject="foo").respond_msg(Msg(_client=nc))
+        await nc.close()
+
+
 if __name__ == "__main__":
     import sys
 

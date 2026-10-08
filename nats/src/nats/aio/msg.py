@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import datetime
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from nats.errors import (
     Error,
+    InvalidMsgError,
     MsgAlreadyAckdError,
     MsgNoReplyError,
     MsgNotBoundError,
@@ -56,6 +57,8 @@ class Msg:
     _metadata: Optional[Metadata] = None
     _ackd: bool = False
     _sid: Optional[int] = None
+    # The header block as received, for size and header_values.
+    _raw_headers: Optional[bytes] = field(default=None, repr=False, compare=False)
 
     class Ack:
         Ack = b"+ACK"
@@ -82,6 +85,59 @@ class Msg:
         header returns the headers from a message.
         """
         return self.headers
+
+    @property
+    def size(self) -> int:
+        """
+        The size of the message: subject, reply, header block and data,
+        in bytes, as nats.go's Msg.Size.
+        """
+        if self._raw_headers is not None:
+            header_size = len(self._raw_headers)
+        elif self.headers:
+            header_size = len(b"NATS/1.0\r\n\r\n")
+            for key, value in self.headers.items():
+                for item in value if isinstance(value, (list, tuple)) else [value]:
+                    header_size += len(f"{key}: {item}\r\n".encode())
+        else:
+            header_size = 0
+        return len(self.subject.encode()) + len(self.reply.encode()) + header_size + len(self.data)
+
+    def header_values(self, key: str) -> List[str]:
+        """
+        All the values of a header, as nats.go's Header.Values.
+        The ``headers`` dict keeps a single value for each header.
+        """
+        if self._raw_headers is not None:
+            values = []
+            for line in self._raw_headers.split(b"\r\n")[1:]:
+                name, sep, value = line.partition(b":")
+                if sep and name.strip().decode("ascii", "replace") == key:
+                    values.append(value.strip().decode("utf-8", "replace"))
+            return values
+        if not self.headers or key not in self.headers:
+            return []
+        value = self.headers[key]
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return [value]
+
+    def add_header(self, key: str, value: str) -> None:
+        """
+        Adds a value to a header, keeping the ones it has, as nats.go's
+        Header.Add. A header with several values holds them in a list,
+        which publish sends as one header line each.
+        """
+        if self.headers is None:
+            self.headers = {}
+        existing = self.headers.get(key)
+        if existing is None:
+            self.headers[key] = value
+        elif isinstance(existing, list):
+            existing.append(value)
+        else:
+            self.headers[key] = [existing, value]  # type: ignore[assignment]
+        self._raw_headers = None
 
     @property
     def is_acked(self) -> bool:
@@ -114,6 +170,19 @@ class Msg:
         if headers is None:
             headers = self.headers
         await self._client.publish(self.reply, data, headers=headers)
+
+    async def respond_msg(self, msg: Msg) -> None:
+        """
+        respond_msg replies to the inbox of the message with the data and
+        headers of another message, as nats.go's Msg.RespondMsg.
+        """
+        if msg is None:
+            raise InvalidMsgError
+        if not self.reply:
+            raise MsgNoReplyError
+        if not self._client:
+            raise MsgNotBoundError
+        await self._client.publish(self.reply, msg.data, headers=msg.headers)
 
     async def ack(self) -> None:
         """

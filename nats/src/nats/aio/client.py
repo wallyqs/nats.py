@@ -1246,7 +1246,8 @@ class Client:
         :param subject: Subject to which the message will be published.
         :param payload: Message data.
         :param reply: Inbox to which a responder can respond.
-        :param headers: Optional message header.
+        :param headers: Optional message header. A header with several
+            values can be given a list of them.
 
         ::
 
@@ -1336,11 +1337,13 @@ class Client:
                     continue
                 if not _HEADER_KEY_RE.fullmatch(key):
                     raise errors.BadHeaderError(key)
-                hdr.extend(key.encode())
-                hdr.extend(b": ")
-                value = v.strip().translate(_HEADER_VALUE_NEWLINES)
-                hdr.extend(value.encode())
-                hdr.extend(_CRLF_)
+                # A list holds the values of a multi-valued header.
+                for item in v if isinstance(v, (list, tuple)) else (v,):
+                    hdr.extend(key.encode())
+                    hdr.extend(b": ")
+                    value = item.strip().translate(_HEADER_VALUE_NEWLINES)
+                    hdr.extend(value.encode())
+                    hdr.extend(_CRLF_)
             hdr.extend(_CRLF_)
             pub_cmd = prot_command.hpub_cmd(subject, reply, hdr, payload)
 
@@ -2765,6 +2768,8 @@ class Client:
         msg = self._build_message(sid, subject, reply, data, hdr)
         if not msg:
             return
+        if headers:
+            msg._raw_headers = headers
 
         # Process flow control messages in case of using a JetStream context.
         ctrl_msg = None

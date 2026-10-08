@@ -408,6 +408,11 @@ class NotJSMessageError(Error):
         return "nats: not a JetStream message"
 
 
+class InvalidMsgError(Error):
+    def __str__(self) -> str:
+        return "nats: invalid message or message nil"
+
+
 class MsgAlreadyAckdError(Error):
     def __init__(self, msg=None) -> None:
         self._msg = msg
