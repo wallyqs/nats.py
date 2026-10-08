@@ -760,6 +760,16 @@ class _PullSubscription:
 
     async def _subscribe(self, cb: Callable[[Msg], Awaitable[None]]) -> None:
         self._sub = await self._nc.subscribe(self._nc.new_inbox(), cb=cb)
+        self._sub.set_closed_cb(self._sub_closed)
+
+    def _sub_closed(self, subject: str) -> None:
+        # Closing the connection closes the subscription: end at once with
+        # ErrConnectionClosed, as nats.go does on the CLOSED status.
+        if self._nc.is_closed and not self._closed:
+            self._connection_closed()
+
+    def _connection_closed(self) -> None:
+        raise NotImplementedError
 
     async def _end_subscription(self, drain: bool) -> None:
         sub = self._sub
@@ -795,6 +805,7 @@ class ConsumeContext(_PullSubscription):
         self._in_handler = False
         self._hb_task: Optional[asyncio.Future] = None
         self._end_task: Optional[asyncio.Future] = None
+        self._conn_closed = False
 
     async def _start(self) -> None:
         await self._subscribe(self._handle)
@@ -844,6 +855,16 @@ class ConsumeContext(_PullSubscription):
         except Exception as e:
             await self._nc._error_cb(e)
 
+    def _connection_closed(self) -> None:
+        if self._conn_closed:
+            return
+        self._conn_closed = True
+        asyncio.ensure_future(self._end_connection_closed())
+
+    async def _end_connection_closed(self) -> None:
+        await self._report(nats.errors.ConnectionClosedError())
+        self.stop()
+
     async def _handle(self, msg: Msg) -> None:
         self._in_handler = True
         try:
@@ -889,8 +910,7 @@ class ConsumeContext(_PullSubscription):
         hb = self._opts.heartbeat
         while not self._closed:
             if self._nc.is_closed:
-                await self._report(nats.errors.ConnectionClosedError())
-                self.stop()
+                self._connection_closed()
                 return
             wait = self._last_activity + 2 * hb - time.monotonic()
             if self._in_handler or wait > 0:
@@ -944,9 +964,11 @@ class MessagesContext(_PullSubscription):
             (``None`` waits until a message arrives).
         :raises MsgIteratorClosedError: once stopped, or drained and empty.
         :raises NoHeartbeatError: when two heartbeats were missed.
+        :raises nats.errors.ConnectionClosedError: once closed with the
+            connection, after the messages already received.
         """
         if self._closed and not self._draining:
-            raise nats.js.errors.MsgIteratorClosedError
+            raise self._closed_error()
         if self._opts.stop_after and self._delivered >= self._opts.stop_after:
             self.stop()
             raise nats.js.errors.MsgIteratorClosedError
@@ -977,7 +999,7 @@ class MessagesContext(_PullSubscription):
                 raise nats.errors.TimeoutError
             if item is _CLOSED:
                 self._queue.put_nowait(_CLOSED)
-                raise nats.js.errors.MsgIteratorClosedError
+                raise self._closed_error()
             msg: Msg = item
             if hb_deadline is not None:
                 hb_deadline = time.monotonic() + 2 * hb
@@ -992,6 +1014,20 @@ class MessagesContext(_PullSubscription):
             if term is not None:
                 self.stop()
                 raise term
+
+    def _closed_error(self) -> Exception:
+        # nats.go wraps ErrConnectionClosed in ErrMsgIteratorClosed when
+        # the connection is closed.
+        if self._nc.is_closed:
+            return nats.errors.ConnectionClosedError()
+        return nats.js.errors.MsgIteratorClosedError()
+
+    def _connection_closed(self) -> None:
+        # The messages already received are still delivered, then the
+        # error, as from nats.go's closed message channel.
+        self._closed = True
+        self._draining = True
+        self._queue.put_nowait(_CLOSED)
 
     def stop(self) -> None:
         """Stop iterating at once; buffered messages are discarded."""

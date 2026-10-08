@@ -970,6 +970,54 @@ class PullConsumeTest(SingleJetStreamServerTestCase):
         await nc.close()
 
     @async_test
+    async def test_consume_connection_closed(self):
+        # nats.go: the error handler gets ErrConnectionClosed and consuming
+        # stops once the connection is closed.
+        nc, js, consumer = await self._setup(n=0)
+        errors = []
+
+        async def cb(msg):
+            pass
+
+        ctx = await consumer.consume(cb, error_cb=lambda ctx, err: errors.append(err))
+        await asyncio.sleep(0.2)
+        await nc.close()
+        await asyncio.wait_for(ctx.closed(), 2)
+        assert len(errors) == 1
+        assert isinstance(errors[0], nats.errors.ConnectionClosedError)
+
+    @async_test
+    async def test_messages_connection_closed(self):
+        # nats.go: Next returns ErrConnectionClosed (wrapped in
+        # ErrMsgIteratorClosed) once the connection is closed.
+        nc, js, consumer = await self._setup(n=0)
+        msgs = await consumer.messages()
+        pending = asyncio.ensure_future(msgs.next())
+        await asyncio.sleep(0.2)
+        await nc.close()
+        with pytest.raises(nats.errors.ConnectionClosedError):
+            await asyncio.wait_for(pending, 2)
+        with pytest.raises(nats.errors.ConnectionClosedError):
+            await msgs.next(timeout=1)
+
+        # Iterating raises it too, rather than ending quietly.
+        nc, js, consumer = await self._setup(n=0)
+        received = []
+
+        async def iterate():
+            async for msg in await consumer.messages():
+                received.append(msg)
+
+        task = asyncio.ensure_future(iterate())
+        await asyncio.sleep(0.2)
+        await js.publish("cons.a", b"x")
+        await asyncio.sleep(0.2)
+        await nc.close()
+        with pytest.raises(nats.errors.ConnectionClosedError):
+            await asyncio.wait_for(task, 2)
+        assert len(received) == 1
+
+    @async_test
     async def test_fetch_missing_heartbeat(self):
         nc = await nats.connect()
         consumer = await self._silent_consumer(nc)
