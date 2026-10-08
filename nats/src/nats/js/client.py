@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import time
 from email.parser import BytesParser
@@ -98,6 +99,7 @@ class JetStreamContext(JetStreamManager):
     :param domain: Optional domain used by the JetStream API.
     :param timeout: Timeout for all JS API actions.
     :param publish_async_max_pending: Maximum outstanding async publishes that can be inflight at one time.
+    :param client_trace: Hooks called around each JetStream API request.
 
     ::
 
@@ -126,6 +128,7 @@ class JetStreamContext(JetStreamManager):
         domain: Optional[str] = None,
         timeout: float = 5,
         publish_async_max_pending: int = 4000,
+        client_trace: Optional[api.ClientTrace] = None,
     ) -> None:
         self._prefix = prefix
         if domain is not None:
@@ -133,6 +136,14 @@ class JetStreamContext(JetStreamManager):
         self._nc = conn
         self._timeout = timeout
         self._hdr_parser = BytesParser()
+        self._client_trace = client_trace
+        self._options = api.JetStreamOptions(
+            api_prefix=prefix,
+            domain=domain,
+            default_timeout=timeout,
+            client_trace=client_trace,
+            publish_async_max_pending=publish_async_max_pending,
+        )
 
         self._async_reply_prefix: Optional[bytearray] = None
         self._publish_async_futures: Dict[str, asyncio.Future] = {}
@@ -148,7 +159,15 @@ class JetStreamContext(JetStreamManager):
             conn=self._nc,
             prefix=self._prefix,
             timeout=self._timeout,
+            client_trace=self._client_trace,
         )
+
+    @property
+    def options(self) -> api.JetStreamOptions:
+        """
+        The options the context was created with.
+        """
+        return dataclasses.replace(self._options)
 
     async def _init_async_reply(self) -> None:
         self._publish_async_futures = {}

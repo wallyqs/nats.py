@@ -18,7 +18,7 @@ import dataclasses
 import datetime
 from dataclasses import dataclass, fields, replace
 from enum import Enum
-from typing import Any, Dict, Iterable, Iterator, List, Optional, TypeVar
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, TypeVar
 
 _NANOSECOND = 10**9
 
@@ -74,6 +74,34 @@ DEFAULT_EXPIRES = 30.0
 DEFAULT_MAX_MESSAGES = 500
 DEFAULT_PUB_RETRY_ATTEMPTS = 2
 DEFAULT_PUB_RETRY_WAIT = 0.25
+
+
+@dataclass
+class ClientTrace:
+    """
+    Hooks called around the JetStream API requests of a JetStream context
+    (nats.go ClientTrace): ``request_sent(subject, payload)`` before a
+    request is sent and ``response_received(subject, payload, headers)``
+    when its response arrives.
+    """
+
+    request_sent: Optional[Callable[[str, bytes], None]] = None
+    response_received: Optional[Callable[[str, bytes, Optional[Dict[str, str]]], None]] = None
+
+
+@dataclass
+class JetStreamOptions:
+    """
+    The options a JetStream context was created with (nats.go
+    JetStreamOptions), as returned by its ``options`` property.
+    """
+
+    api_prefix: str = DEFAULT_PREFIX
+    domain: Optional[str] = None
+    # Timeout in seconds of the API requests that are not given one.
+    default_timeout: float = 5
+    client_trace: Optional[ClientTrace] = None
+    publish_async_max_pending: Optional[int] = None
 
 
 class StatusCode(str, Enum):

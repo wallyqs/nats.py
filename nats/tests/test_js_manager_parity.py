@@ -584,3 +584,62 @@ class ConsumerManagementTest(SingleJetStreamServerTestCase):
         info = await js.stream_info("DEL")
         assert info.state.messages == 0
         await nc.close()
+
+
+class JetStreamOptionsTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_client_trace_and_options(self):
+        nc = await nats.connect()
+        sent = []
+        received = []
+        trace = api.ClientTrace(
+            request_sent=lambda subject, payload: sent.append((subject, payload)),
+            response_received=lambda subject, payload, headers: received.append((subject, payload, headers)),
+        )
+        js = nc.jetstream(timeout=3, client_trace=trace)
+        assert js.conn is nc
+        opts = js.options
+        assert opts == api.JetStreamOptions(
+            api_prefix="$JS.API",
+            domain=None,
+            default_timeout=3,
+            client_trace=trace,
+            publish_async_max_pending=4000,
+        )
+
+        await js.add_stream(name="TRACED", subjects=["traced"], allow_direct=True)
+        assert sent[0][0] == "$JS.API.STREAM.CREATE.TRACED"
+        assert json.loads(sent[0][1])["name"] == "TRACED"
+        assert received[0][0] == "$JS.API.STREAM.CREATE.TRACED"
+        assert json.loads(received[0][1])["config"]["name"] == "TRACED"
+
+        await js.publish("traced", b"hello")
+        # Publishing is not an API request.
+        assert len(sent) == 1
+
+        with pytest.raises(StreamNotFoundError):
+            await js.stream_info("MISSING")
+        assert sent[1] == ("$JS.API.STREAM.INFO.MISSING", b"")
+        assert json.loads(received[1][1])["error"]["err_code"] == 10059
+
+        msg = await js.get_msg("TRACED", 1, direct=True)
+        assert msg.data == b"hello"
+        assert sent[2][0] == "$JS.API.DIRECT.GET.TRACED"
+        assert received[2][1] == b"hello"
+        assert received[2][2]["Nats-Sequence"] == "1"
+
+        # Consumers created by subscriptions are traced as well.
+        await js.pull_subscribe("traced", durable="dur")
+        assert any(subject.startswith("$JS.API.CONSUMER.") for subject, _ in sent[3:])
+
+        jsm = nc.jsm(prefix="$JS.API", timeout=2, client_trace=trace)
+        assert jsm.conn is nc
+        assert jsm.options == api.JetStreamOptions(api_prefix="$JS.API", default_timeout=2, client_trace=trace)
+        count = len(sent)
+        await jsm.account_info()
+        assert sent[count] == ("$JS.API.INFO", b"")
+
+        domain_js = nc.jetstream(domain="hub")
+        assert domain_js.options.domain == "hub"
+        assert domain_js.options.client_trace is None
+        await nc.close()

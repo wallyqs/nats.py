@@ -42,6 +42,7 @@ from nats.js.errors import (
 
 if TYPE_CHECKING:
     from nats import NATS
+    from nats.aio.msg import Msg
 
 NATS_HDR_LINE = bytearray(b"NATS/1.0")
 NATS_HDR_LINE_SIZE = len(NATS_HDR_LINE)
@@ -131,11 +132,31 @@ class JetStreamManager:
         conn: NATS,
         prefix: str = api.DEFAULT_PREFIX,
         timeout: float = 5,
+        client_trace: Optional[api.ClientTrace] = None,
     ) -> None:
         self._prefix = prefix
         self._nc = conn
         self._timeout = timeout
         self._hdr_parser = BytesParser()
+        self._client_trace = client_trace
+
+    @property
+    def conn(self) -> NATS:
+        """
+        The NATS connection used by the context.
+        """
+        return self._nc
+
+    @property
+    def options(self) -> api.JetStreamOptions:
+        """
+        The options the context was created with.
+        """
+        return api.JetStreamOptions(
+            api_prefix=self._prefix,
+            default_timeout=self._timeout,
+            client_trace=self._client_trace,
+        )
 
     async def account_info(self) -> api.AccountInfo:
         resp = await self._api_request(f"{self._prefix}.INFO", b"", timeout=self._timeout)
@@ -754,7 +775,7 @@ class JetStreamManager:
             else:
                 req_subject = f"{self._prefix}.DIRECT.GET.{stream_name}"
 
-            resp = await self._nc.request(req_subject, data.encode(), timeout=self._timeout)
+            resp = await self._request(req_subject, data.encode(), timeout=self._timeout)
             raw_msg = JetStreamManager._lift_msg_to_raw_msg(resp)
             return raw_msg
 
@@ -866,6 +887,18 @@ class JetStreamManager:
         data = json.dumps(req)
         await self._api_request(req_subject, data.encode())
 
+    async def _request(self, req_subject: str, req: bytes, timeout: float) -> Msg:
+        """
+        Sends a JetStream API request, calling the client trace hooks.
+        """
+        trace = getattr(self, "_client_trace", None)
+        if trace is not None and trace.request_sent is not None:
+            trace.request_sent(req_subject, req)
+        msg = await self._nc.request(req_subject, req, timeout=timeout)
+        if trace is not None and trace.response_received is not None:
+            trace.response_received(req_subject, msg.data, msg.headers)
+        return msg
+
     async def _api_request(
         self,
         req_subject: str,
@@ -873,7 +906,7 @@ class JetStreamManager:
         timeout: float = 5,
     ) -> Dict[str, Any]:
         try:
-            msg = await self._nc.request(req_subject, req, timeout=timeout)
+            msg = await self._request(req_subject, req, timeout=timeout)
             resp = json.loads(msg.data)
         except NoRespondersError:
             # nats.go reports a JetStream API request without responders as
