@@ -96,14 +96,19 @@ async def _call(handler: Callable, *args: Any) -> None:
         await ret
 
 
+def _invalid_option(reason: str) -> nats.js.errors.InvalidOptionError:
+    """An invalid option error worded as nats.go's ErrInvalidOption wraps it."""
+    return nats.js.errors.InvalidOptionError(f"nats: invalid jetstream option: {reason}")
+
+
 def _check_positive(name: str, value: Optional[float]) -> None:
     if value is not None and value <= 0:
-        raise ValueError(f"nats: invalid option: {name} must be greater than 0")
+        raise _invalid_option(f"{name} must be greater than 0")
 
 
 def _check_at_least_one(name: str, value: Optional[int]) -> None:
     if value is not None and value < 1:
-        raise ValueError(f"nats: invalid option: {name} must be at least 1")
+        raise _invalid_option(f"{name} must be at least 1")
 
 
 class _PullRequest:
@@ -532,11 +537,11 @@ class PullConsumer:
         groups = self._info.config.priority_groups if self._info else None
         if groups:
             if not group:
-                raise ValueError("nats: invalid option: priority group is required for priority consumer")
+                raise _invalid_option("priority group is required for priority consumer")
             if group not in groups:
-                raise ValueError("nats: invalid option: invalid priority group")
+                raise _invalid_option("invalid priority group")
         elif group:
-            raise ValueError("nats: invalid option: priority groups not supported by consumer")
+            raise _invalid_option("priority groups not supported by consumer")
 
     @staticmethod
     def _fetch_request(
@@ -554,12 +559,12 @@ class PullConsumer:
         _check_at_least_one("min_pending", min_pending)
         _check_at_least_one("min_ack_pending", min_ack_pending)
         if priority is not None and not 0 <= priority <= 9:
-            raise ValueError("nats: invalid option: priority must be 0-9")
+            raise _invalid_option("priority must be 0-9")
         expires = DEFAULT_EXPIRES if max_wait is None else max_wait
         if heartbeat is None:
             heartbeat = 5.0 if expires >= 10 else 0
         if 2 * heartbeat > expires:
-            raise ValueError("nats: invalid option: the value of heartbeat must be less than 50% of expiry")
+            raise _invalid_option("the value of heartbeat must be less than 50% of expiry")
         return _PullRequest(
             batch,
             expires=expires,
@@ -604,20 +609,20 @@ class _PullOptions:
         _check_at_least_one("bytes_limit", bytes_limit)
         _check_positive("max_bytes", max_bytes)
         if expires is not None and expires < 1:
-            raise ValueError("nats: invalid option: expires value must be at least 1s")
+            raise _invalid_option("expires value must be at least 1s")
         _check_at_least_one("min_pending", min_pending)
         _check_at_least_one("min_ack_pending", min_ack_pending)
         if priority is not None and not 0 <= priority <= 9:
-            raise ValueError("nats: invalid option: priority must be 0-9")
+            raise _invalid_option("priority must be 0-9")
         if heartbeat is not None and not 0.5 <= heartbeat <= 30:
-            raise ValueError("nats: invalid option: idle_heartbeat value must be within 500ms-30s range")
+            raise _invalid_option("idle_heartbeat value must be within 500ms-30s range")
         _check_at_least_one("stop_after", stop_after)
 
         self.limit_size = bytes_limit is not None
         if self.limit_size and max_bytes is not None:
-            raise ValueError("nats: invalid option: only one of bytes_limit and max_bytes can be specified")
+            raise _invalid_option("only one of bytes_limit and max_bytes can be specified")
         if max_messages is not None and max_bytes is not None:
-            raise ValueError("nats: invalid option: only one of MaxMessages and MaxBytes can be specified")
+            raise _invalid_option("only one of max_messages and max_bytes can be specified")
         if max_bytes is not None:
             # Pull by bytes, with no limit on the number of messages.
             self.max_messages = _BYTES_BATCH
@@ -635,7 +640,7 @@ class _PullOptions:
             else:
                 heartbeat = min(self.expires / 2, 30.0)
         if heartbeat > self.expires / 2:
-            raise ValueError("nats: invalid option: the value of heartbeat must be less than 50% of expiry")
+            raise _invalid_option("the value of heartbeat must be less than 50% of expiry")
         self.heartbeat = heartbeat
         self.min_pending = min_pending
         self.min_ack_pending = min_ack_pending

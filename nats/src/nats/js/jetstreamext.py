@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Dict, List, Optional, Set
 
 import nats.errors
+import nats.js.errors
 from nats.aio.msg import Msg
 from nats.js import api
 from nats.js.errors import APIError, BadRequestError, Error, NoStreamResponseError, NotFoundError
@@ -246,8 +247,12 @@ class BatchAckTimeoutError(nats.errors.TimeoutError):
         return s
 
 
-class InvalidOptionError(Error):
-    """An option has an invalid value."""
+class InvalidOptionError(nats.js.errors.InvalidOptionError):
+    """
+    An option has an invalid value. It is the
+    :class:`nats.js.errors.InvalidOptionError` of the JetStream client
+    (and so also a ValueError), worded as orbit.go's jetstreamext errors.
+    """
 
     def __str__(self) -> str:
         if self.description:

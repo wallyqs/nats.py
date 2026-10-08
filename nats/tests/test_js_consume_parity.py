@@ -483,6 +483,18 @@ class StatusErrorsTest(SingleJetStreamServerTestCase):
         assert str(NoHeartbeatError()) == "nats: no heartbeat received"
         assert str(MsgIteratorClosedError()) == "nats: messages iterator closed"
 
+    def test_invalid_option_error(self):
+        import nats.js.jetstreamext as jetstreamext
+
+        # One ErrInvalidOption: jetstreamext's is the JetStream client's,
+        # keeping its own wording, and both are ValueErrors.
+        assert issubclass(InvalidOptionError, ValueError)
+        assert issubclass(jetstreamext.InvalidOptionError, InvalidOptionError)
+        assert str(InvalidOptionError()) == "nats: invalid jetstream option"
+        assert str(jetstreamext.InvalidOptionError("x")) == "nats: invalid option: x"
+        with pytest.raises(InvalidOptionError):
+            jetstreamext.new_fast_publisher(None, jetstreamext.FastPublishFlowControl(ack_timeout=-1))
+
     @async_test
     async def test_fetch_consumer_deleted_error(self):
         nc = await nats.connect()
@@ -591,11 +603,16 @@ class PullConsumerFetchTest(SingleJetStreamServerTestCase):
     async def test_invalid_options(self):
         nc, js, consumer = await self._setup(n=0)
         for kwargs in ({"batch": 0}, {"batch": 1, "max_wait": 0}, {"batch": 1, "priority": 10}):
-            with pytest.raises(ValueError):
+            with pytest.raises(InvalidOptionError):
                 await consumer.fetch(**kwargs)
-        with pytest.raises(ValueError):
+        with pytest.raises(InvalidOptionError) as err:
             await consumer.fetch(1, max_wait=1, heartbeat=0.6)
-        with pytest.raises(ValueError):
+        # Worded as nats.go wraps ErrInvalidOption, and still a ValueError.
+        assert str(err.value) == (
+            "nats: invalid jetstream option: the value of heartbeat must be less than 50% of expiry"
+        )
+        assert isinstance(err.value, ValueError)
+        with pytest.raises(InvalidOptionError):
             await consumer.fetch_bytes(0)
 
         await js.add_consumer("PULL", durable_name="push", deliver_subject="deliver")
@@ -851,9 +868,9 @@ class PullConsumeTest(SingleJetStreamServerTestCase):
             {"group": "A"},
         ):
             with self.subTest(**kwargs):
-                with pytest.raises(ValueError):
+                with pytest.raises(InvalidOptionError):
                     await consumer.consume(cb, **kwargs)
-                with pytest.raises(ValueError):
+                with pytest.raises(InvalidOptionError):
                     await consumer.messages(**kwargs)
 
         await js.add_consumer(
@@ -861,7 +878,7 @@ class PullConsumeTest(SingleJetStreamServerTestCase):
         )
         grouped = await js.pull_consumer("CONS", "grouped")
         for group in (None, "B"):
-            with pytest.raises(ValueError):
+            with pytest.raises(InvalidOptionError):
                 await grouped.messages(group=group)
         msgs = await grouped.messages(group="A")
         msgs.stop()
