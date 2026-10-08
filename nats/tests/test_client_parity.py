@@ -743,6 +743,21 @@ class IgnoreDiscoveredServersTest(ClusteringTestCase):
         await control.close()
 
 
+class FlushOrderTest(SingleServerTestCase):
+    @async_test
+    async def test_flush_follows_earlier_publishes(self):
+        nc = await nats.connect()
+        sub = await nc.subscribe("foo")
+        await nc.flush()
+        for i in range(100):
+            await nc.publish("foo", b"x")
+        await nc.flush()
+        # The PING of flush() was sent after the messages, so the server
+        # delivered them all before its PONG.
+        self.assertEqual(sub.pending_msgs, 100)
+        await nc.close()
+
+
 if __name__ == "__main__":
     import sys
 

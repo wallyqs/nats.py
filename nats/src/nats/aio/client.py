@@ -2706,8 +2706,9 @@ class Client:
         if future is None:
             future = asyncio.Future()
         self._pongs.append(future)
-        self._transport.write(PING_PROTO)
-        self._pending_data_size += len(PING_PROTO)
+        # Queue the PING behind the pending commands so that its PONG
+        # confirms they reached the server.
+        await self._send_command(PING_PROTO)
         await self._flush_pending()
 
     async def _flusher(self) -> None:
