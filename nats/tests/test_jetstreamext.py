@@ -767,3 +767,55 @@ class GetBatchTest(SingleJetStreamServerTestCase):
         with pytest.raises(APIError) as e:
             jetstreamext._direct_msg(msg({"Status": "408", "Description": "Request Timeout"}, b""))
         assert e.value.code == 408
+
+
+class InvalidBatchAckTest(SingleServerTestCase):
+    @async_test
+    async def test_malformed_commit_acks(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        commit_reply = {}
+
+        # Stands in for a stream: flow-control replies are empty, and the
+        # commit gets whatever the case under test answers.
+        async def responder(msg):
+            if not msg.reply:
+                return
+            if msg.headers and msg.headers.get(BATCH_COMMIT_HEADER):
+                batch_id = msg.headers[BATCH_ID_HEADER]
+                await msg.respond(commit_reply["fn"](batch_id), headers={})
+            else:
+                await msg.respond(b"", headers={})
+
+        await nc.subscribe("fakebatch.>", cb=responder)
+
+        cases = {
+            "not json": lambda batch_id: b"not json",
+            "not an object": lambda batch_id: b"[1, 2]",
+            "no stream": lambda batch_id: json.dumps({"seq": 2, "batch": batch_id, "count": 2}).encode(),
+            "other batch": lambda batch_id: json.dumps(
+                {"stream": "S", "seq": 2, "batch": "other", "count": 2}
+            ).encode(),
+            "wrong count": lambda batch_id: json.dumps(
+                {"stream": "S", "seq": 2, "batch": batch_id, "count": 5}
+            ).encode(),
+        }
+        for name, fn in cases.items():
+            with self.subTest(name=name):
+                commit_reply["fn"] = fn
+                batch = new_batch_publisher(js)
+                await batch.add("fakebatch.a", b"1")
+                with pytest.raises(InvalidBatchAckError):
+                    await batch.commit("fakebatch.a", b"2")
+
+        # A well-formed ack for the batch is accepted.
+        commit_reply["fn"] = lambda batch_id: json.dumps(
+            {"stream": "S", "seq": 2, "batch": batch_id, "count": 2}
+        ).encode()
+        batch = new_batch_publisher(js)
+        await batch.add("fakebatch.a", b"1")
+        ack = await batch.commit("fakebatch.a", b"2")
+        assert ack.stream == "S"
+        assert ack.batch_size == 2
+
+        await nc.close()
