@@ -65,7 +65,7 @@ from .subscription import (
     Subscription,
     _Barrier,
 )
-from .transport import TcpTransport, Transport, WebSocketTransport
+from .transport import TcpTransport, Transport, WebSocketHeadersCallback, WebSocketTransport
 
 try:
     from importlib.metadata import version
@@ -531,6 +531,9 @@ class Client:
         user_jwt_and_seed: Optional[Tuple[str, str]] = None,
         tls_cert_cb: Optional[TLSContextCallback] = None,
         tls_roots_cb: Optional[TLSContextCallback] = None,
+        ws_connection_headers_cb: Optional[WebSocketHeadersCallback] = None,
+        ws_compression: bool = False,
+        ws_proxy_path: Optional[str] = None,
     ) -> None:
         """
         Establishes a connection to NATS.
@@ -587,6 +590,13 @@ class Client:
         :param tls_roots_cb: Called with a new SSLContext before every TLS
             handshake to load the trusted CAs into it (the system ones are
             then not loaded). Implies TLS.
+        :param ws_connection_headers_cb: Function (or coroutine function)
+            returning the WebSocket handshake headers, called on every
+            connection attempt; cannot be combined with ws_connection_headers.
+        :param ws_compression: Ask for permessage-deflate compression of
+            WebSocket frames.
+        :param ws_proxy_path: Path used for every WebSocket connection, in
+            place of the server URL's path, e.g. when behind a proxy.
 
         Connecting setting all callbacks::
 
@@ -738,6 +748,14 @@ class Client:
         self.options["drain_timeout"] = drain_timeout
         self.options["tls_handshake_first"] = tls_handshake_first
         self.options["ws_connection_headers"] = ws_connection_headers
+        if ws_connection_headers_cb is not None:
+            if ws_connection_headers:
+                raise errors.WebSocketHeadersAlreadySetError
+            if not callable(ws_connection_headers_cb):
+                raise errors.Error("nats: ws_connection_headers_cb must be callable")
+        self.options["ws_connection_headers_cb"] = ws_connection_headers_cb
+        self.options["ws_compression"] = ws_compression
+        self.options["ws_proxy_path"] = ws_proxy_path
         self.options["skip_subject_validation"] = skip_subject_validation
         self._skip_subject_validation = skip_subject_validation
         self.options["no_callbacks_after_client_close"] = no_callbacks_after_client_close
@@ -2002,7 +2020,12 @@ class Client:
         s.last_attempt = time.monotonic()
         if not self._transport:
             if s.uri.scheme in ("ws", "wss"):
-                self._transport = WebSocketTransport(ws_headers=self.options["ws_connection_headers"])
+                self._transport = WebSocketTransport(
+                    ws_headers=self.options["ws_connection_headers"],
+                    ws_headers_cb=self.options.get("ws_connection_headers_cb"),
+                    compression=self.options.get("ws_compression", False),
+                    proxy_path=self.options.get("ws_proxy_path"),
+                )
             else:
                 self._transport = TcpTransport()
         if s.uri.scheme == "wss":
@@ -2846,8 +2869,9 @@ class Client:
                 connect_urls = []
                 for connect_url in info["connect_urls"]:
                     scheme = ""
-                    if self._current_server.uri.scheme == "tls":
-                        scheme = "tls"
+                    if self._current_server.uri.scheme in ("tls", "ws", "wss"):
+                        # A WebSocket client is sent WebSocket URLs.
+                        scheme = self._current_server.uri.scheme
                     else:
                         scheme = "nats"
 

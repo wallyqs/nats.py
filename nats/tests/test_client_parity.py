@@ -931,6 +931,97 @@ class TLSCallbacksTest(TLSServerTestCase):
             await nc.connect("tls://127.0.0.1:4224", tls=self.ssl_ctx, tls_roots_cb=lambda ctx: None)
 
 
+class WebSocketOptionsTest(unittest.TestCase):
+    def setUp(self):
+        self.loop = asyncio.new_event_loop()
+
+    def tearDown(self):
+        self.loop.close()
+
+    async def handshake_lines(self, url_path="", **options):
+        from tests.test_custom_headers_websocket import start_header_catcher
+
+        addr, got, close_ln = start_header_catcher()
+        try:
+            with self.assertRaises(Exception):
+                await asyncio.wait_for(
+                    nats.connect(f"ws://{addr}{url_path}", allow_reconnect=False, **options), timeout=1.0
+                )
+        finally:
+            lines = got.get(timeout=2.0)
+            close_ln()
+        return lines
+
+    @async_test
+    async def test_ws_connection_headers_cb(self):
+        from tests.test_custom_headers_websocket import has_header_value
+
+        calls = []
+
+        def headers():
+            calls.append(True)
+            return {"Authorization": ["Bearer dynamic-%d" % len(calls)]}
+
+        lines = await self.handshake_lines(ws_connection_headers_cb=headers)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(has_header_value(lines, "Authorization", "Bearer dynamic-1"))
+
+        with self.assertRaises(nats.errors.WebSocketHeadersAlreadySetError):
+            await nats.connect(
+                "ws://127.0.0.1:8080", ws_connection_headers={"A": ["b"]}, ws_connection_headers_cb=headers
+            )
+
+    @async_test
+    async def test_ws_compression(self):
+        lines = await self.handshake_lines(ws_compression=True)
+        extensions = [line for line in lines if line.lower().startswith("sec-websocket-extensions:")]
+        self.assertEqual(len(extensions), 1)
+        self.assertIn("permessage-deflate", extensions[0])
+        lines = await self.handshake_lines()
+        self.assertFalse([line for line in lines if line.lower().startswith("sec-websocket-extensions:")])
+
+    @async_test
+    async def test_ws_proxy_path(self):
+        lines = await self.handshake_lines(url_path="/ignored", ws_proxy_path="my/proxy")
+        self.assertTrue(lines[0].startswith("GET /my/proxy "), lines[0])
+        lines = await self.handshake_lines(url_path="/kept")
+        self.assertTrue(lines[0].startswith("GET /kept "), lines[0])
+
+    def test_discovered_websocket_servers_keep_scheme(self):
+        async def run():
+            nc = NATS()
+            nc._setup_server_pool("ws://127.0.0.1:8080")
+            nc._current_server = nc._server_pool[0]
+            nc.options["dont_randomize"] = True
+            await nc._process_info({"connect_urls": ["127.0.0.1:8081"]}, initial_connection=True)
+            self.assertEqual([s.uri.geturl() for s in nc._server_pool], ["ws://127.0.0.1:8080", "ws://127.0.0.1:8081"])
+
+        self.loop.run_until_complete(run())
+
+
+WS_COMPRESSION_CONF = """
+websocket {
+    port: 8080
+    no_tls: true
+    compression: true
+}
+"""
+
+
+class WebSocketCompressionTest(ConfiguredServerTestCase):
+    config = WS_COMPRESSION_CONF
+
+    @async_test
+    async def test_pub_sub_with_compression(self):
+        nc = await nats.connect("ws://127.0.0.1:8080", ws_compression=True)
+        sub = await nc.subscribe("foo")
+        payload = b"a" * 10000
+        await nc.publish("foo", payload)
+        msg = await sub.next_msg()
+        self.assertEqual(msg.data, payload)
+        await nc.close()
+
+
 class TLSIntrospectionTest(TLSServerTestCase):
     @async_test
     async def test_tls_connection_state(self):

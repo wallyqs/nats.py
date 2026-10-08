@@ -123,6 +123,11 @@ class NoEchoNotSupportedError(Error):
         return "nats: no echo option not supported by this server"
 
 
+class WebSocketHeadersAlreadySetError(Error):
+    def __str__(self) -> str:
+        return "nats: websocket connection headers already set"
+
+
 class MixingWebsocketSchemesError(Error):
     def __str__(self) -> str:
         return "nats: mixing of websocket and non websocket URLs is not allowed"

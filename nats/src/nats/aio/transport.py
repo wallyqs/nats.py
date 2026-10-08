@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import inspect
 import ssl
-from typing import Dict, List, Optional, Union
+from typing import Awaitable, Callable, Dict, List, Optional, Union
 from urllib.parse import ParseResult
 
 try:
@@ -214,8 +215,18 @@ class TcpTransport(Transport):
         return self._io_writer.get_extra_info(name, default)
 
 
+WebSocketHeaders = Dict[str, Union[str, List[str]]]
+WebSocketHeadersCallback = Callable[[], Union[WebSocketHeaders, Awaitable[WebSocketHeaders]]]
+
+
 class WebSocketTransport(Transport):
-    def __init__(self, ws_headers: Optional[Dict[str, List[str]]] = None):
+    def __init__(
+        self,
+        ws_headers: Optional[Dict[str, List[str]]] = None,
+        ws_headers_cb: Optional[WebSocketHeadersCallback] = None,
+        compression: bool = False,
+        proxy_path: Optional[str] = None,
+    ):
         if not aiohttp:
             raise ImportError("Could not import aiohttp transport, please install it with `pip install aiohttp`")
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
@@ -224,11 +235,28 @@ class WebSocketTransport(Transport):
         self._close_task = asyncio.Future()
         self._using_tls: Optional[bool] = None
         self._ws_headers = ws_headers
+        self._ws_headers_cb = ws_headers_cb
+        # permessage-deflate with the largest window, as aiohttp's compress=15.
+        self._compress = 15 if compression else 0
+        self._proxy_path = proxy_path
+
+    def _url(self, uri: ParseResult) -> str:
+        """The URL to dial; a proxy path replaces the server URL's path, as in nats.go."""
+        if self._proxy_path:
+            path = self._proxy_path if self._proxy_path.startswith("/") else "/" + self._proxy_path
+            uri = uri._replace(path=path)
+        return uri.geturl()
 
     async def connect(self, uri: ParseResult, buffer_size: int, connect_timeout: int):
-        headers = self._get_custom_headers()
+        headers = await self._headers()
         # for websocket library, the uri must contain the scheme already
-        self._ws = await self._client.ws_connect(uri.geturl(), timeout=connect_timeout, headers=headers, max_msg_size=0)
+        self._ws = await self._client.ws_connect(
+            self._url(uri),
+            timeout=connect_timeout,
+            headers=headers,
+            max_msg_size=0,
+            compress=self._compress,
+        )
         self._using_tls = False
 
     async def connect_tls(
@@ -243,13 +271,14 @@ class WebSocketTransport(Transport):
                 return
             raise ProtocolError("ws: cannot upgrade to TLS")
 
-        headers = self._get_custom_headers()
+        headers = await self._headers()
         self._ws = await self._client.ws_connect(
-            uri if isinstance(uri, str) else uri.geturl(),
+            uri if isinstance(uri, str) else self._url(uri),
             ssl=ssl_context,
             timeout=connect_timeout,
             headers=headers,
             max_msg_size=0,
+            compress=self._compress,
         )
         self._using_tls = True
 
@@ -305,11 +334,25 @@ class WebSocketTransport(Transport):
             return default
         return self._ws.get_extra_info(name, default)
 
-    def _get_custom_headers(self):
-        if self._ws_headers is None:
+    async def _headers(self):
+        """
+        The handshake headers: the static ones, or the ones the headers
+        callback returns for this connection attempt.
+        """
+        if self._ws_headers_cb is None:
+            return self._get_custom_headers()
+        headers = self._ws_headers_cb()
+        if inspect.isawaitable(headers):
+            headers = await headers
+        return self._get_custom_headers(headers)
+
+    def _get_custom_headers(self, ws_headers=None):
+        if ws_headers is None:
+            ws_headers = self._ws_headers
+        if ws_headers is None:
             return None
         md: multidict.CIMultiDict[str] = multidict.CIMultiDict()
-        for name, values in self._ws_headers.items():
+        for name, values in ws_headers.items():
             if isinstance(values, list):
                 for v in values:
                     md.add(name, v)
