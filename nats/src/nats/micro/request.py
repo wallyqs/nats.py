@@ -73,7 +73,23 @@ class Request:
         :param description: A string describing the error which can be displayed to the client.
         :param data: The error data.
         :param headers: Additional response headers.
+        :raises ValueError: If the code or the description is empty.
         """
+        if not code:
+            raise ValueError("argument required: error code")
+        if not description:
+            raise ValueError("argument required: description")
+
+        await self._send_error(code, description, data, headers)
+        self._error = f"{code}:{description}"
+
+    async def _send_error(
+        self,
+        code: str,
+        description: str,
+        data: bytes = b"",
+        headers: Optional[Dict[str, str]] = None,
+    ) -> None:
         if headers:
             headers = headers.copy()
         else:

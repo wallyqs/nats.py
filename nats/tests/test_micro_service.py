@@ -528,6 +528,53 @@ class MicroServiceTest(SingleServerTestCase):
         await nc.close()
 
     @async_test
+    async def test_request_respond_error(self):
+        handler_errors = []
+
+        async def handler(request: Request):
+            if request.data == b"empty_code":
+                try:
+                    await request.respond_error("", "description")
+                except ValueError as e:
+                    handler_errors.append(e)
+                await request.respond(b"ok")
+            elif request.data == b"empty_description":
+                try:
+                    await request.respond_error("400", "")
+                except ValueError as e:
+                    handler_errors.append(e)
+                await request.respond(b"ok")
+            else:
+                await request.respond_error("400", "bad request", b"details")
+
+        nc = await nats.connect()
+        svc = await add_service(nc, ServiceConfig(name="test_service", version="0.1.0"))
+        await svc.add_endpoint(EndpointConfig(name="default", subject="test.func", handler=handler))
+
+        response = await nc.request("test.func", b"msg", timeout=1)
+        assert response.data == b"details"
+        assert response.headers["Nats-Service-Error"] == "bad request"
+        assert response.headers["Nats-Service-Error-Code"] == "400"
+
+        stats = svc.stats()
+        assert stats.endpoints[0].num_requests == 1
+        assert stats.endpoints[0].num_errors == 1
+        assert stats.endpoints[0].last_error == "400:bad request"
+
+        for data in (b"empty_code", b"empty_description"):
+            response = await nc.request("test.func", data, timeout=1)
+            assert response.data == b"ok"
+            assert not response.headers
+        assert len(handler_errors) == 2
+
+        stats = svc.stats()
+        assert stats.endpoints[0].num_requests == 3
+        assert stats.endpoints[0].num_errors == 1
+
+        await svc.stop()
+        await nc.close()
+
+    @async_test
     async def test_request_respond(self):
         sub_tests = {
             "empty_response": {

@@ -259,9 +259,14 @@ class Endpoint:
             self._last_error = repr(error)
 
             if isinstance(error, ServiceError):
-                await request.respond_error(error.code, error.description)
+                await request._send_error(error.code, error.description)
             else:
-                await request.respond_error("500", repr(error))
+                await request._send_error("500", repr(error))
+        else:
+            # Explicit error responses count as errors, as in nats.go micro.
+            if request._error is not None:
+                self._num_errors += 1
+                self._last_error = request._error
 
         current_time = time.perf_counter_ns()
         elapsed_time = current_time - start_time
