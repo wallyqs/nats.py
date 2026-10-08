@@ -24,10 +24,11 @@ server actually sends; orbit.go's codes for the fast-ingest errors
 from __future__ import annotations
 
 import asyncio
+import datetime
 import inspect
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Dict, List, Optional, Set
 
 import nats.errors
 from nats.aio.msg import Msg
@@ -1129,3 +1130,185 @@ def new_fast_publisher(
         gaps, per-message server errors and undecodable replies.
     """
     return FastPublisher(js, flow_control, continue_on_gap, error_handler)
+
+
+def _rfc3339(when: datetime.datetime) -> str:
+    """Formats a datetime (naive ones are UTC) as an RFC 3339 UTC timestamp."""
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return when.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _direct_msg(msg: Msg) -> api.RawStreamMsg:
+    """Converts a batch direct get response to a RawStreamMsg."""
+    headers = msg.headers
+    if not msg.data and headers:
+        status = headers.get(api.Header.STATUS.value)
+        if status == api.StatusCode.NO_MESSAGES.value:
+            raise NoMessagesError(headers.get(api.Header.DESCRIPTION.value))
+        if status == "503":
+            raise nats.errors.NoRespondersError
+        if status:
+            raise APIError(code=int(status), description=headers.get(api.Header.DESCRIPTION.value))
+    if not headers:
+        raise InvalidResponseError("response should have headers")
+    if not headers.get("Nats-Num-Pending"):
+        raise BatchUnsupportedError
+    stream = headers.get("Nats-Stream")
+    if not stream:
+        raise InvalidResponseError("missing stream header")
+    seq = headers.get("Nats-Sequence")
+    if not seq:
+        raise InvalidResponseError("missing sequence header")
+    try:
+        sequence = int(seq)
+    except ValueError:
+        raise InvalidResponseError(f"invalid sequence header '{seq}'")
+    timestamp = headers.get("Nats-Time-Stamp")
+    if not timestamp:
+        raise InvalidResponseError("missing timestamp header")
+    try:
+        when = api.Base._parse_utc_iso(timestamp)
+    except ValueError:
+        raise InvalidResponseError(f"invalid timestamp header '{timestamp}'")
+    subject = headers.get("Nats-Subject")
+    if not subject:
+        raise InvalidResponseError("missing subject header")
+    return api.RawStreamMsg(
+        subject=subject,
+        seq=sequence,
+        data=msg.data,
+        headers=headers,
+        stream=stream,
+        time=when,
+    )
+
+
+def _is_eob(msg: Msg) -> bool:
+    headers = msg.headers or {}
+    return (
+        not msg.data
+        and headers.get(api.Header.STATUS.value) == "204"
+        and headers.get(api.Header.DESCRIPTION.value) == "EOB"
+    )
+
+
+async def _iter_direct(sub: Subscription, deadline: float) -> AsyncIterator[api.RawStreamMsg]:
+    loop = asyncio.get_running_loop()
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise nats.errors.TimeoutError
+            msg = await sub.next_msg(timeout=remaining)
+            if _is_eob(msg):
+                return
+            yield _direct_msg(msg)
+    finally:
+        try:
+            await sub.unsubscribe()
+        except nats.errors.Error:
+            pass
+
+
+async def _get_direct(
+    js: JetStreamContext, stream: str, req: Dict[str, Any], timeout: Optional[float]
+) -> AsyncIterator[api.RawStreamMsg]:
+    nc = js._nc
+    deadline = asyncio.get_running_loop().time() + (js._timeout if timeout is None else timeout)
+    inbox = nc.new_inbox()
+    sub = await nc.subscribe(inbox)
+    try:
+        await nc.publish(f"{js._prefix}.DIRECT.GET.{stream}", json.dumps(req).encode(), reply=inbox)
+    except Exception:
+        await sub.unsubscribe()
+        raise
+    return _iter_direct(sub, deadline)
+
+
+async def get_batch(
+    js: JetStreamContext,
+    stream: str,
+    batch: int,
+    seq: Optional[int] = None,
+    subject: Optional[str] = None,
+    max_bytes: Optional[int] = None,
+    start_time: Optional[datetime.datetime] = None,
+    timeout: Optional[float] = None,
+) -> AsyncIterator[api.RawStreamMsg]:
+    """
+    get_batch gets up to ``batch`` messages from ``stream`` with one direct
+    get request (the stream needs ``allow_direct``, nats-server v2.11.0+)
+    and returns an async iterator of RawStreamMsg. An error met while
+    iterating, e.g. NoMessagesError when nothing matches, ends it.
+
+    :param seq: Stream sequence to start from (default 1).
+    :param subject: Only get messages on this subject, which may include
+        wildcards.
+    :param max_bytes: Stop once this many bytes were sent.
+    :param start_time: Start from the first message stored at or after this
+        time (naive datetimes are UTC); excludes ``seq``.
+    :param timeout: Seconds the whole batch may take; ``None`` is the
+        JetStream context's timeout.
+
+    ::
+
+        async for msg in await get_batch(js, "ORDERS", 10, subject="orders.new"):
+            print(msg.seq, msg.data)
+    """
+    req: Dict[str, Any] = {"batch": batch}
+    if seq is not None:
+        if seq <= 0:
+            raise InvalidOptionError("sequence number has to be greater than 0")
+        if start_time is not None:
+            raise InvalidOptionError("cannot set both start time and sequence number")
+        req["seq"] = seq
+    if subject:
+        req["next_by_subj"] = subject
+    if max_bytes is not None:
+        if max_bytes <= 0:
+            raise InvalidOptionError("max bytes has to be greater than 0")
+        req["max_bytes"] = max_bytes
+    if start_time is not None:
+        req["start_time"] = _rfc3339(start_time)
+    elif seq is None:
+        req["seq"] = 1
+    return await _get_direct(js, stream, req, timeout)
+
+
+async def get_last_msgs_for(
+    js: JetStreamContext,
+    stream: str,
+    subjects: List[str],
+    batch: Optional[int] = None,
+    up_to_seq: Optional[int] = None,
+    up_to_time: Optional[datetime.datetime] = None,
+    timeout: Optional[float] = None,
+) -> AsyncIterator[api.RawStreamMsg]:
+    """
+    get_last_msgs_for gets the last message of each of ``subjects`` (which
+    may include wildcards) from ``stream`` with one direct get request and
+    returns an async iterator of RawStreamMsg, as get_batch does.
+
+    :param batch: Get at most this many messages.
+    :param up_to_seq: Only consider messages up to this stream sequence
+        (inclusive).
+    :param up_to_time: Only consider messages stored up to this time
+        (naive datetimes are UTC); excludes ``up_to_seq``.
+    :param timeout: Seconds the whole batch may take; ``None`` is the
+        JetStream context's timeout.
+    """
+    if not subjects:
+        raise SubjectRequiredError
+    req: Dict[str, Any] = {"multi_last": list(subjects)}
+    if up_to_seq is not None and up_to_time is not None:
+        raise InvalidOptionError("cannot set both up to sequence and up to time")
+    if batch is not None:
+        if batch <= 0:
+            raise InvalidOptionError("batch size has to be greater than 0")
+        req["batch"] = batch
+    if up_to_seq:
+        req["up_to_seq"] = up_to_seq
+    if up_to_time is not None:
+        req["up_to_time"] = _rfc3339(up_to_time)
+    return await _get_direct(js, stream, req, timeout)

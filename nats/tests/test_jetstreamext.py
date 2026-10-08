@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 
 import pytest
@@ -623,3 +624,145 @@ class FastPublisherTest(SingleJetStreamServerTestCase):
         assert fp._max_outstanding_acks == 2
         assert fp._ack_timeout == js._timeout
         await nc.close()
+
+
+async def _collect(it):
+    return [msg async for msg in it]
+
+
+class GetBatchTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_get_batch(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="S", subjects=["s.>"], allow_direct=True)
+        for i in range(5):
+            await js.publish(f"s.{i % 2}", str(i).encode())
+
+        msgs = await _collect(await get_batch(js, "S", 3))
+        assert [m.seq for m in msgs] == [1, 2, 3]
+        assert [m.data for m in msgs] == [b"0", b"1", b"2"]
+        assert msgs[1].subject == "s.1"
+        assert msgs[1].stream == "S"
+        assert isinstance(msgs[1].time, datetime.datetime)
+        assert msgs[1].headers["Nats-Num-Pending"] == "3"
+
+        msgs = await _collect(await get_batch(js, "S", 10, seq=4))
+        assert [m.seq for m in msgs] == [4, 5]
+
+        msgs = await _collect(await get_batch(js, "S", 10, subject="s.0"))
+        assert [m.seq for m in msgs] == [1, 3, 5]
+        msgs = await _collect(await get_batch(js, "S", 2, seq=2, subject="s.*"))
+        assert [m.seq for m in msgs] == [2, 3]
+
+        with pytest.raises(NoMessagesError):
+            await _collect(await get_batch(js, "S", 3, seq=10))
+        with pytest.raises(NotFoundError):
+            await _collect(await get_batch(js, "S", 3, subject="s.9"))
+
+        # A stream without direct gets has no responders.
+        await js.add_stream(name="NODIRECT", subjects=["nodirect.>"])
+        with pytest.raises(NoRespondersError):
+            await _collect(await get_batch(js, "NODIRECT", 3))
+        await nc.close()
+
+    @async_test
+    async def test_get_batch_max_bytes_and_start_time(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="S", subjects=["s.>"], allow_direct=True)
+        for i in range(3):
+            await js.publish("s.a", b"x" * 100)
+        await asyncio.sleep(0.05)
+        start = datetime.datetime.now(datetime.timezone.utc)
+        await asyncio.sleep(0.05)
+        for i in range(2):
+            await js.publish("s.b", b"y" * 100)
+
+        msgs = await _collect(await get_batch(js, "S", 10, max_bytes=250))
+        assert 1 <= len(msgs) < 5
+
+        msgs = await _collect(await get_batch(js, "S", 10, start_time=start))
+        assert [m.seq for m in msgs] == [4, 5]
+        # Naive datetimes are UTC.
+        naive = start.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        msgs = await _collect(await get_batch(js, "S", 1, start_time=naive))
+        assert [m.seq for m in msgs] == [4]
+        await nc.close()
+
+    @async_test
+    async def test_get_batch_invalid_options(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        with pytest.raises(InvalidOptionError):
+            await get_batch(js, "S", 1, seq=0)
+        with pytest.raises(InvalidOptionError):
+            await get_batch(js, "S", 1, seq=1, start_time=now)
+        with pytest.raises(InvalidOptionError):
+            await get_batch(js, "S", 1, max_bytes=0)
+        with pytest.raises(SubjectRequiredError):
+            await get_last_msgs_for(js, "S", [])
+        with pytest.raises(InvalidOptionError):
+            await get_last_msgs_for(js, "S", ["s.a"], up_to_seq=1, up_to_time=now)
+        with pytest.raises(InvalidOptionError):
+            await get_last_msgs_for(js, "S", ["s.a"], batch=0)
+        await nc.close()
+
+    @async_test
+    async def test_get_last_msgs_for(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="S", subjects=["s.>"], allow_direct=True)
+        for i in range(4):
+            await js.publish(f"s.{i % 2}", str(i).encode())
+        await asyncio.sleep(0.05)
+        middle = datetime.datetime.now(datetime.timezone.utc)
+        await asyncio.sleep(0.05)
+        await js.publish("s.0", b"4")
+
+        msgs = await _collect(await get_last_msgs_for(js, "S", ["s.0", "s.1"]))
+        assert [(m.subject, m.seq) for m in msgs] == [("s.1", 4), ("s.0", 5)]
+        msgs = await _collect(await get_last_msgs_for(js, "S", ["s.*"], up_to_seq=2))
+        assert [m.seq for m in msgs] == [1, 2]
+        msgs = await _collect(await get_last_msgs_for(js, "S", ["s.0", "s.1"], up_to_time=middle))
+        assert [m.seq for m in msgs] == [3, 4]
+        msgs = await _collect(await get_last_msgs_for(js, "S", ["s.>"], batch=1))
+        assert len(msgs) == 1
+        with pytest.raises(NoMessagesError):
+            await _collect(await get_last_msgs_for(js, "S", ["s.9"]))
+        await nc.close()
+
+    def test_invalid_responses(self):
+        def msg(headers, data=b"x"):
+            return nats.aio.msg.Msg(None, subject="_INBOX.x", data=data, headers=headers)
+
+        good = {
+            "Nats-Stream": "S",
+            "Nats-Subject": "s.a",
+            "Nats-Sequence": "1",
+            "Nats-Time-Stamp": "2026-10-08T05:09:50.822302496Z",
+            "Nats-Num-Pending": "0",
+        }
+        raw = jetstreamext._direct_msg(msg(dict(good)))
+        assert raw.seq == 1
+        assert raw.subject == "s.a"
+
+        no_pending = dict(good)
+        del no_pending["Nats-Num-Pending"]
+        with pytest.raises(BatchUnsupportedError):
+            jetstreamext._direct_msg(msg(no_pending))
+        with pytest.raises(InvalidResponseError):
+            jetstreamext._direct_msg(msg(None))
+        for name in ("Nats-Stream", "Nats-Sequence", "Nats-Time-Stamp", "Nats-Subject"):
+            headers = dict(good)
+            del headers[name]
+            with pytest.raises(InvalidResponseError):
+                jetstreamext._direct_msg(msg(headers))
+        with pytest.raises(InvalidResponseError):
+            jetstreamext._direct_msg(msg(dict(good, **{"Nats-Sequence": "x"})))
+        with pytest.raises(NoMessagesError):
+            jetstreamext._direct_msg(msg({"Status": "404", "Description": "No Results"}, b""))
+        with pytest.raises(APIError) as e:
+            jetstreamext._direct_msg(msg({"Status": "408", "Description": "Request Timeout"}, b""))
+        assert e.value.code == 408
