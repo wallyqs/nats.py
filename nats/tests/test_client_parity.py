@@ -21,6 +21,7 @@ from tests.utils import (
     NATSD,
     ClusteringTestCase,
     SingleServerTestCase,
+    SingleWebSocketServerTestCase,
     TLSServerTestCase,
     async_test,
     start_natsd,
@@ -755,6 +756,152 @@ class FlushOrderTest(SingleServerTestCase):
         # The PING of flush() was sent after the messages, so the server
         # delivered them all before its PONG.
         self.assertEqual(sub.pending_msgs, 100)
+        await nc.close()
+
+
+class IntrospectionTest(SingleServerTestCase):
+    @async_test
+    async def test_server_info_accessors(self):
+        nc = NATS()
+        self.assertIsNone(nc.connected_server_id)
+        await nc.connect("nats://127.0.0.1:4222")
+        info = nc._server_info
+        self.assertEqual(nc.connected_server_id, info["server_id"])
+        self.assertEqual(nc.connected_server_name, info["server_name"])
+        self.assertIsNone(nc.connected_cluster_name)
+        self.assertIsNone(nc.connected_domain)
+        self.assertFalse(nc.connected_server_jetstream)
+        self.assertFalse(nc.is_system_account)
+        self.assertFalse(nc.auth_required)
+        self.assertFalse(nc.tls_required)
+        self.assertTrue(nc.headers_supported)
+        self.assertEqual(nc.connected_addr, "127.0.0.1:4222")
+        self.assertTrue(nc.local_addr.startswith("127.0.0.1:"))
+        self.assertNotEqual(nc.local_addr, nc.connected_addr)
+        self.assertEqual(nc.connected_url_redacted, "nats://127.0.0.1:4222")
+        self.assertIsInstance(nc.get_client_id(), int)
+        self.assertEqual(nc.get_client_ip(), "127.0.0.1")
+
+        self.assertEqual(nc.num_subscriptions, 0)
+        sub = await nc.subscribe("foo")
+        await nc.subscribe("bar")
+        self.assertEqual(nc.num_subscriptions, 2)
+        await sub.unsubscribe()
+        self.assertEqual(nc.num_subscriptions, 1)
+
+        with self.assertRaises(nats.errors.ConnectionNotTLSError):
+            nc.tls_connection_state()
+        await nc.flush()
+        self.assertEqual(nc.buffered(), 0)
+
+        await nc.close()
+        self.assertIsNone(nc.connected_server_id)
+        self.assertIsNone(nc.connected_addr)
+        self.assertIsNone(nc.connected_url_redacted)
+        with self.assertRaises(nats.errors.DisconnectedError):
+            nc.tls_connection_state()
+        with self.assertRaises(nats.errors.ConnectionClosedError):
+            nc.buffered()
+        with self.assertRaises(nats.errors.ConnectionClosedError):
+            nc.get_client_id()
+
+    @async_test
+    async def test_new_resp_inbox(self):
+        nc = await nats.connect()
+        inbox = nc.new_resp_inbox()
+        prefix = inbox.rsplit(".", 1)[0]
+        self.assertTrue(inbox.startswith("_INBOX."))
+        self.assertEqual(len(inbox.split(".")), 3)
+        self.assertEqual(nc.new_resp_inbox().rsplit(".", 1)[0], prefix)
+
+        # Requests use the same response subscription.
+        async def responder(msg):
+            await msg.respond(msg.reply.encode())
+
+        await nc.subscribe("service", cb=responder)
+        resp = await nc.request("service", b"", timeout=1)
+        self.assertEqual(resp.data.decode().rsplit(".", 1)[0], prefix)
+        await nc.close()
+
+    def test_new_inbox(self):
+        inbox = nats.new_inbox()
+        self.assertTrue(inbox.startswith("_INBOX."))
+        self.assertNotEqual(inbox, nats.new_inbox())
+        self.assertTrue(nats.new_inbox("_MY").startswith("_MY."))
+
+    @async_test
+    async def test_barrier(self):
+        nc = await nats.connect()
+        events = []
+
+        async def slow(msg):
+            await asyncio.sleep(0.01)
+            events.append(msg.data)
+
+        async def fast(msg):
+            events.append(msg.data)
+
+        await nc.subscribe("slow", cb=slow)
+        await nc.subscribe("fast", cb=fast)
+        for i in range(5):
+            await nc.publish("slow", b"slow%d" % i)
+        await nc.publish("fast", b"fast")
+        await nc.flush()
+        done = asyncio.Event()
+
+        async def barrier_fn():
+            events.append(b"barrier")
+            done.set()
+
+        await nc.barrier(barrier_fn)
+        await asyncio.wait_for(done.wait(), 2)
+        self.assertEqual(events[-1], b"barrier")
+        self.assertEqual(len(events), 7)
+        await nc.close()
+
+        with self.assertRaises(nats.errors.ConnectionClosedError):
+            await nc.barrier(barrier_fn)
+
+    @async_test
+    async def test_barrier_without_subscriptions(self):
+        nc = await nats.connect()
+        called = []
+        await nc.barrier(lambda: called.append(True))
+        self.assertEqual(called, [True])
+        await nc.close()
+
+
+class RedactedUrlTest(ConfiguredServerTestCase):
+    config = 'authorization { user: "foo", password: "secret" }\n'
+
+    @async_test
+    async def test_connected_url_redacted(self):
+        nc = await nats.connect("nats://foo:secret@127.0.0.1:4222")
+        self.assertEqual(nc.connected_url_redacted, "nats://foo:xxxxx@127.0.0.1:4222")
+        self.assertTrue(nc.auth_required)
+        await nc.close()
+
+
+class WebSocketIntrospectionTest(SingleWebSocketServerTestCase):
+    @async_test
+    async def test_websocket_addresses(self):
+        nc = await nats.connect("ws://127.0.0.1:8080")
+        self.assertEqual(nc.connected_addr, "127.0.0.1:8080")
+        self.assertTrue(nc.local_addr.startswith("127.0.0.1:"))
+        with self.assertRaises(nats.errors.ConnectionNotTLSError):
+            nc.tls_connection_state()
+        await nc.close()
+
+
+class TLSIntrospectionTest(TLSServerTestCase):
+    @async_test
+    async def test_tls_connection_state(self):
+        nc = await nats.connect("nats://127.0.0.1:4224", tls=self.ssl_ctx)
+        state = nc.tls_connection_state()
+        self.assertIsInstance(state, ssl.SSLObject)
+        self.assertIsNotNone(state.version())
+        self.assertIsNotNone(state.getpeercert())
+        self.assertTrue(nc.tls_required)
         await nc.close()
 
 

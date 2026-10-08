@@ -105,6 +105,14 @@ class Transport(abc.ABC):
         """
         pass
 
+    def get_extra_info(self, name: str, default=None):
+        """
+        Returns information about the underlying connection, as
+        asyncio.BaseTransport.get_extra_info (e.g. "peername", "sockname",
+        "ssl_object"). Transports that cannot tell return the default.
+        """
+        return default
+
 
 class TcpTransport(Transport):
     def __init__(self):
@@ -200,6 +208,11 @@ class TcpTransport(Transport):
     def __bool__(self):
         return bool(self._io_writer) and bool(self._io_reader)
 
+    def get_extra_info(self, name: str, default=None):
+        if self._io_writer is None:
+            return default
+        return self._io_writer.get_extra_info(name, default)
+
 
 class WebSocketTransport(Transport):
     def __init__(self, ws_headers: Optional[Dict[str, List[str]]] = None):
@@ -286,6 +299,11 @@ class WebSocketTransport(Transport):
 
     def __bool__(self):
         return bool(self._client)
+
+    def get_extra_info(self, name: str, default=None):
+        if self._ws is None:
+            return default
+        return self._ws.get_extra_info(name, default)
 
     def _get_custom_headers(self):
         if self._ws_headers is None:

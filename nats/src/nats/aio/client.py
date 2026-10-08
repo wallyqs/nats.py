@@ -63,6 +63,7 @@ from .subscription import (
     DEFAULT_SUB_PENDING_BYTES_LIMIT,
     DEFAULT_SUB_PENDING_MSGS_LIMIT,
     Subscription,
+    _Barrier,
 )
 from .transport import TcpTransport, Transport, WebSocketTransport
 
@@ -326,6 +327,32 @@ def _server_error(description: str) -> errors.Error:
     return cls(description)
 
 
+_inbox_nuid = NUID()
+
+
+def new_inbox(prefix: str = DEFAULT_INBOX_PREFIX.decode()) -> str:
+    """
+    Returns a unique inbox subject (``_INBOX.<nuid>`` by default) that is
+    not tied to a connection, as nats.go's NewInbox.
+    """
+    inbox = bytearray(prefix.encode())
+    inbox.extend(b".")
+    inbox.extend(_inbox_nuid.next())
+    return inbox.decode()
+
+
+def _host_port(address: Any) -> Optional[str]:
+    """Formats a socket address as nats.go's net.Addr.String does."""
+    if not address:
+        return None
+    if isinstance(address, (tuple, list)) and len(address) >= 2:
+        host, port = address[0], address[1]
+        if ":" in str(host):
+            return f"[{host}]:{port}"
+        return f"{host}:{port}"
+    return str(address)
+
+
 async def _default_error_callback(ex: Exception) -> None:
     """
     Provides a default way to handle async errors if the user
@@ -409,6 +436,7 @@ class Client:
         # New style request/response
         self._resp_map: Dict[str, asyncio.Future] = {}
         self._resp_sub_prefix: Optional[bytearray] = None
+        self._resp_mux_subscribed: bool = False
         self._nuid = NUID()
         self._inbox_prefix = bytearray(DEFAULT_INBOX_PREFIX)
         self._auth_configured: bool = False
@@ -1009,6 +1037,7 @@ class Client:
         self._client_id = None
         self._client_ip = None
         self._resp_sub_prefix = None
+        self._resp_mux_subscribed = False
 
     async def drain(self) -> None:
         """
@@ -1233,13 +1262,20 @@ class Client:
         await self._send_command(sub_cmd)
         await self._flush_pending()
 
+    def _init_resp_sub_prefix(self) -> bytearray:
+        if not self._resp_sub_prefix:
+            self._resp_sub_prefix = self._inbox_prefix[:]
+            self._resp_sub_prefix.extend(b".")
+            self._resp_sub_prefix.extend(self._nuid.next())
+            self._resp_sub_prefix.extend(b".")
+        return self._resp_sub_prefix
+
     async def _init_request_sub(self) -> None:
         self._resp_map = {}
 
-        self._resp_sub_prefix = self._inbox_prefix[:]
-        self._resp_sub_prefix.extend(b".")
-        self._resp_sub_prefix.extend(self._nuid.next())
-        self._resp_sub_prefix.extend(b".")
+        self._init_resp_sub_prefix()
+        assert self._resp_sub_prefix
+        self._resp_mux_subscribed = True
         resp_mux_subject = self._resp_sub_prefix[:]
         resp_mux_subject.extend(b"*")
         await self.subscribe(resp_mux_subject.decode(), cb=self._request_sub_callback)
@@ -1292,7 +1328,7 @@ class Client:
         if self.is_draining_pubs:
             raise errors.ConnectionDrainingError
 
-        if not self._resp_sub_prefix:
+        if not self._resp_sub_prefix or not self._resp_mux_subscribed:
             await self._init_request_sub()
         assert self._resp_sub_prefix
 
@@ -1331,6 +1367,16 @@ class Client:
         next_inbox.extend(b".")
         next_inbox.extend(self._nuid.next())
         return next_inbox.decode()
+
+    def new_resp_inbox(self) -> str:
+        """
+        Returns a new inbox under the subject of the subscription that
+        receives the responses of request(), as nats.go's NewRespInbox.
+        """
+        inbox = self._init_resp_sub_prefix()[:]
+        inbox.extend(self._nuid.next())
+        inbox.extend(token_hex(2).encode())
+        return inbox.decode()
 
     async def _request_old_style(self, subject: str, payload: bytes, timeout: float = 1) -> Msg:
         """
@@ -1424,6 +1470,158 @@ class Client:
         if self._current_server and self.is_connected:
             return self._current_server.uri
         return None
+
+    @property
+    def connected_url_redacted(self) -> Optional[str]:
+        """
+        The URL of the connected server with any password replaced by
+        "xxxxx", as nats.go's ConnectedUrlRedacted.
+        """
+        uri = self.connected_url
+        if uri is None:
+            return None
+        if uri.password is not None:
+            userinfo = f"{uri.username}:xxxxx@" if uri.username is not None else ":xxxxx@"
+            uri = uri._replace(netloc=userinfo + uri.netloc.rpartition("@")[2])
+        return uri.geturl()
+
+    @property
+    def connected_addr(self) -> Optional[str]:
+        """The address of the connected server's socket, as nats.go's ConnectedAddr."""
+        if not self.is_connected or not self._transport:
+            return None
+        return _host_port(self._transport.get_extra_info("peername"))
+
+    @property
+    def local_addr(self) -> Optional[str]:
+        """The local address of the connection's socket, as nats.go's LocalAddr."""
+        if not self.is_connected or not self._transport:
+            return None
+        return _host_port(self._transport.get_extra_info("sockname"))
+
+    def _connected_info(self) -> Dict[str, Any]:
+        return self._server_info if self.is_connected else {}
+
+    @property
+    def connected_server_id(self) -> Optional[str]:
+        """The id of the connected server, as nats.go's ConnectedServerId."""
+        return self._connected_info().get("server_id")
+
+    @property
+    def connected_server_name(self) -> Optional[str]:
+        """The name of the connected server, as nats.go's ConnectedServerName."""
+        return self._connected_info().get("server_name")
+
+    @property
+    def connected_cluster_name(self) -> Optional[str]:
+        """The cluster of the connected server, as nats.go's ConnectedClusterName."""
+        return self._connected_info().get("cluster")
+
+    @property
+    def connected_domain(self) -> Optional[str]:
+        """The JetStream domain of the connected server, as nats.go's ConnectedDomain."""
+        return self._connected_info().get("domain")
+
+    @property
+    def connected_server_jetstream(self) -> bool:
+        """Whether the connected server has JetStream enabled, as nats.go's ConnectedServerJetStream."""
+        return bool(self._connected_info().get("jetstream", False))
+
+    @property
+    def connected_server_api_level(self) -> int:
+        """The JetStream API level of the connected server (second result of ConnectedServerJetStream)."""
+        return int(self._connected_info().get("api_lvl", 0))
+
+    @property
+    def is_system_account(self) -> bool:
+        """Whether the connection's account is the system account, as nats.go's IsSystemAccount."""
+        return bool(self._connected_info().get("acc_is_sys", False))
+
+    @property
+    def auth_required(self) -> bool:
+        """Whether the server requires authentication, as nats.go's AuthRequired."""
+        return bool(self._server_info.get("auth_required", False))
+
+    @property
+    def tls_required(self) -> bool:
+        """Whether the server requires TLS, as nats.go's TLSRequired."""
+        return bool(self._server_info.get("tls_required", False))
+
+    @property
+    def headers_supported(self) -> bool:
+        """Whether the server supports message headers, as nats.go's HeadersSupported."""
+        return bool(self._server_info.get("headers", False))
+
+    @property
+    def num_subscriptions(self) -> int:
+        """The number of active subscriptions, as nats.go's NumSubscriptions."""
+        return len(self._subs)
+
+    def buffered(self) -> int:
+        """
+        The number of bytes waiting to be written to the server,
+        as nats.go's Buffered.
+        """
+        if self.is_closed:
+            raise errors.ConnectionClosedError
+        return self._pending_data_size
+
+    def get_client_id(self) -> int:
+        """
+        The client id assigned by the server, as nats.go's GetClientID.
+        Unlike the client_id property, it raises when it is not known.
+        """
+        if self.is_closed:
+            raise errors.ConnectionClosedError
+        if self._client_id is None:
+            raise errors.ClientIDNotSupportedError
+        return self._client_id
+
+    def get_client_ip(self) -> str:
+        """
+        The client IP as seen by the server, as nats.go's GetClientIP.
+        Unlike the client_ip property, it raises when it is not known.
+        """
+        if self.is_closed:
+            raise errors.ConnectionClosedError
+        if not self._client_ip:
+            raise errors.ClientIPNotSupportedError
+        return self._client_ip
+
+    def tls_connection_state(self) -> ssl.SSLObject:
+        """
+        The TLS session of the connection, as nats.go's TLSConnectionState:
+        an ssl.SSLObject with version(), cipher(), getpeercert(), ...
+        """
+        if not self.is_connected or not self._transport:
+            raise errors.DisconnectedError
+        ssl_object = self._transport.get_extra_info("ssl_object")
+        if ssl_object is None:
+            raise errors.ConnectionNotTLSError
+        return ssl_object
+
+    async def barrier(self, fn: Callable[[], Any]) -> None:
+        """
+        Schedules fn (a function or coroutine function) to run once every
+        subscription with a callback has processed the messages it received
+        before this call, as nats.go's Barrier. Without such subscriptions
+        fn runs right away.
+        """
+        if self.is_closed:
+            raise errors.ConnectionClosedError
+        subs = [
+            sub
+            for sub in self._subs.values()
+            if sub._cb is not None and sub._wait_for_msgs_task is not None and not sub._wait_for_msgs_task.done()
+        ]
+        if not subs:
+            result = fn()
+            if inspect.isawaitable(result):
+                await result
+            return
+        marker = _Barrier(len(subs), fn)
+        for sub in subs:
+            await sub._pending_queue.put(marker)  # type: ignore[arg-type]
 
     @property
     def servers(self) -> List[ParseResult]:

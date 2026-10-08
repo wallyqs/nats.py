@@ -93,6 +93,21 @@ class TLSCertVerificationError(TLSError, ssl.SSLCertVerificationError):
     pass
 
 
+class ConnectionNotTLSError(Error):
+    def __str__(self) -> str:
+        return "nats: connection is not tls"
+
+
+class ClientIDNotSupportedError(Error):
+    def __str__(self) -> str:
+        return "nats: client ID not supported by this server"
+
+
+class ClientIPNotSupportedError(Error):
+    def __str__(self) -> str:
+        return "nats: client IP not supported by this server"
+
+
 class DisconnectedError(Error):
     def __str__(self) -> str:
         return "nats: server is disconnected"

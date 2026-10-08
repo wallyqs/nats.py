@@ -19,6 +19,7 @@ from typing import List, Union
 __path__ = __import__("pkgutil").extend_path(__path__, __name__)
 
 from .aio.client import Client as NATS
+from .aio.client import new_inbox as new_inbox
 
 
 async def connect(servers: Union[str, List[str]] = "nats://localhost:4222", **options) -> NATS:

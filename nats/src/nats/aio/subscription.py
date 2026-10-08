@@ -38,6 +38,24 @@ DEFAULT_SUB_PENDING_MSGS_LIMIT = 512 * 1024
 DEFAULT_SUB_PENDING_BYTES_LIMIT = 128 * 1024 * 1024
 
 
+class _Barrier:
+    """
+    Marker queued behind the pending messages of callback subscriptions by
+    Client.barrier; the last subscription to reach it runs the function.
+    """
+
+    def __init__(self, count: int, fn: Callable[[], object]) -> None:
+        self._count = count
+        self._fn = fn
+
+    async def _reached(self) -> None:
+        self._count -= 1
+        if self._count == 0:
+            result = self._fn()
+            if inspect.isawaitable(result):
+                await result
+
+
 class Subscription:
     """
     A Subscription represents interest in a particular subject.
@@ -333,6 +351,19 @@ class Subscription:
         while True:
             try:
                 msg = await self._pending_queue.get()
+                if isinstance(msg, _Barrier):
+                    try:
+                        await msg._reached()
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        if error_cb:
+                            await error_cb(e)
+                    finally:
+                        self._pending_queue.task_done()
+                    if self._max_msgs > 0 and self._received >= self._max_msgs and self._pending_queue.empty():
+                        self._stop_processing()
+                    continue
                 self._pending_size -= len(msg.data)
 
                 try:
