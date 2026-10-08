@@ -239,14 +239,40 @@ Each legacy nats-py defect above, plus the others the audit turned up, is fixed 
 | `77162a8` | `ObjectStore.list()` hides deleted objects by default. |
 | `43e13fb` | `KeyValue.get` fills `created` and `delta`, and a deleted entry carries `DEL` or `PURGE`. |
 
-These were deliberately left as they are:
+### Closing the remaining legacy gaps
 
-- **`keys(filters=)` substring matching.** The upstream test `test_keys_with_filters` relies on it.
-- **`operation is None` for KV puts.** Upstream tests assert it.
-- **`get("")` raising `ObjectNotFoundError`.** An upstream test relies on it.
-- **`respond_error` header precedence.**
+After the fixes above, every legacy row the audit marked `missing` or `partial` was closed. Each feature has its own commit and tests in the matching new test file:
 
-The remaining legacy rows in the audit are missing features, not defects.
+| Area | Test file |
+|---|---|
+| Core client | `test_client_parity.py` |
+| micro | `test_micro_parity.py` |
+| JetStream management | `test_js_manager_parity.py` |
+| JetStream publish/consume | `test_js_consume_parity.py` |
+| Key-Value | `test_kv_parity.py` |
+| Object Store | `test_object_store_parity.py` |
+| orbit `jetstreamext` | `test_jetstreamext.py` |
+
+An independent read-only re-check of all 596 legacy rows against the final code found every row closed or not applicable, once the follow-up commits closed the last partial rows.
+
+Two areas look different from nats.go to stay compatible with upstream tests:
+
+- **KV:**
+  - `keys(filters=)` keeps its substring matching. `list_keys_filtered()` adds nats.go's subject-wildcard listing.
+  - `Entry.operation` stays `None` for a value. `Entry.op` returns a `KeyValueOp`, including `PUT`.
+  - `history()` raises `KeyHistoryNotFoundError`, which is both a `KeyNotFoundError` and a `NoKeysError`.
+- **Object Store:** `get("")` raises `ObjectNameRequiredError`, which is both an `InvalidObjectNameError` and an `ObjectNotFoundError`.
+
+Some nats.go defaults are kept as opt-ins, so existing callers keep their current behaviour:
+- **Reconnect jitter:** defaults to 0.
+- **`retry_on_failed_connect`:** off unless enabled.
+- **Disconnect error:** delivered through the new `disconnected_err_cb`; `disconnected_cb` keeps its zero-argument signature.
+
+The `ErrClientCertOrRootCAsRequired` row is not applicable. Python takes `tls_cert_cb` and `tls_roots_cb` as independent keyword options, so nats.go's "neither callback given" case can't be written.
+
+The batch error codes follow nats-server's `errors.json`, not orbit.go's 10202–10206.
+
+Verified at the branch tip: the whole `nats/tests` suite passes against nats-server v2.15.0, with 613 passed and 4 skipped.
 
 ## Notes on method
 
