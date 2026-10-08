@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 
 import nats.js.api
@@ -377,4 +378,127 @@ class APITypesServerTest(SingleJetStreamServerTestCase):
         assert info.reserved_memory is not None
         assert info.reserved_storage is not None
 
+        await nc.close()
+
+
+class StreamManagementTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_create_or_update_stream(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        info = await js.create_or_update_stream(name="UPSERT", subjects=["upsert.a"])
+        assert info.config.subjects == ["upsert.a"]
+        assert info.did_create is True
+
+        info = await js.create_or_update_stream(api.StreamConfig(name="UPSERT"), subjects=["upsert.a", "upsert.b"])
+        assert info.config.subjects == ["upsert.a", "upsert.b"]
+
+        # Errors other than a missing stream are raised.
+        with pytest.raises(ServerError):
+            await js.create_or_update_stream(name="UPSERT", subjects=["upsert.a"], storage=api.StorageType.MEMORY)
+        await nc.close()
+
+    @async_test
+    async def test_stream_names_and_list_streams(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        await js.add_stream(name="LA", subjects=["la.>"])
+        await js.add_stream(name="LB", subjects=["lb.>"])
+        await js.add_stream(name="LC", subjects=["lc.x"])
+
+        names = [name async for name in js.stream_names()]
+        assert sorted(names) == ["LA", "LB", "LC"]
+        names = [name async for name in js.stream_names(subject="lb.foo")]
+        assert names == ["LB"]
+        assert [name async for name in js.stream_names(subject="nothing")] == []
+
+        infos = [info async for info in js.list_streams()]
+        assert sorted(info.config.name for info in infos) == ["LA", "LB", "LC"]
+        infos = [info async for info in js.list_streams(subject="lc.x")]
+        assert [info.config.name for info in infos] == ["LC"]
+
+        assert await js.stream_name_by_subject("la.foo") == "LA"
+        with pytest.raises(StreamNotFoundError):
+            await js.stream_name_by_subject("nothing")
+        with pytest.raises(StreamNotFoundError):
+            await js.find_stream_name_by_subject("nothing")
+        for subject in ("", ".a", "a.", "a b", "a.>.b"):
+            with pytest.raises(InvalidSubjectError):
+                await js.stream_name_by_subject(subject)
+        await nc.close()
+
+    @async_long_test
+    async def test_list_streams_pages(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        # The server lists at most 256 stream infos per page.
+        total = 300
+        for i in range(total):
+            await js.add_stream(name=f"P{i}", subjects=[f"p.{i}"], storage=api.StorageType.MEMORY)
+
+        infos = [info async for info in js.list_streams()]
+        assert len(infos) == total
+        assert len({info.config.name for info in infos}) == total
+        names = [name async for name in js.stream_names()]
+        assert len(set(names)) == total
+        # The single page API is unchanged.
+        assert len(await js.streams_info()) == 256
+        await nc.close()
+
+    @async_test
+    async def test_stream_info_deleted_details(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="DELETED", subjects=["deleted.>"])
+        for i in range(5):
+            await js.publish(f"deleted.{i}", b"x")
+        await js.delete_msg("DELETED", 2)
+        await js.delete_msg("DELETED", 4)
+
+        info = await js.stream_info("DELETED")
+        assert info.state.deleted is None
+        assert info.state.num_deleted == 2
+        info = await js.stream_info("DELETED", deleted_details=True)
+        assert info.state.deleted == [2, 4]
+        info = await js.stream_info("DELETED", subjects_filter=">", deleted_details=True)
+        assert info.state.deleted == [2, 4]
+        assert info.state.subjects == {"deleted.0": 1, "deleted.2": 1, "deleted.4": 1}
+        await nc.close()
+
+    @async_test
+    async def test_stream_info_subjects_pages(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="SUBJECTS", subjects=["subjects.>"])
+        for i in range(3):
+            await js.publish(f"subjects.{i}", b"x")
+
+        # Make the server's reply look like one page of a larger listing, as
+        # it is for more than 100k subjects.
+        requests = []
+        real_request = js._api_request
+
+        async def paged_request(subject, req=b"", timeout=5):
+            requests.append(json.loads(req) if req else None)
+            offset = requests[-1].pop("offset", 0)
+            resp = await real_request(subject, json.dumps(requests[-1]).encode(), timeout=timeout)
+            if offset:
+                requests[-1]["offset"] = offset
+            subjects = sorted(resp["state"]["subjects"].items())
+            resp["state"]["subjects"] = dict(subjects[offset : offset + 1])
+            resp["total"] = len(subjects)
+            resp["offset"] = offset
+            return resp
+
+        js._api_request = paged_request
+        info = await js.stream_info("SUBJECTS", subjects_filter=">")
+        assert info.state.subjects == {"subjects.0": 1, "subjects.1": 1, "subjects.2": 1}
+        assert requests == [
+            {"subjects_filter": ">"},
+            {"subjects_filter": ">", "offset": 1},
+            {"subjects_filter": ">", "offset": 2},
+        ]
         await nc.close()

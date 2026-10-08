@@ -17,7 +17,7 @@ from __future__ import annotations
 import base64
 import json
 from email.parser import BytesParser
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, Iterable, List, Optional
 
 from nats.errors import NoRespondersError
 from nats.js import api
@@ -30,9 +30,11 @@ from nats.js.errors import (
     ErrorCode,
     InvalidConsumerNameError,
     InvalidStreamNameError,
+    InvalidSubjectError,
     JetStreamNotEnabledError,
     NotFoundError,
     StreamNameRequiredError,
+    StreamNotFoundError,
     StreamSourceNotSupportedError,
     StreamSourceSubjectTransformNotSupportedError,
     StreamSubjectTransformNotSupportedError,
@@ -63,6 +65,20 @@ def _validate_consumer_name(name: Optional[str]) -> None:
         raise InvalidConsumerNameError("nats: consumer name is required")
     if any(c in _INVALID_NAME_CHARS for c in name):
         raise InvalidConsumerNameError(f"nats: invalid consumer name: {name!r}")
+
+
+def _validate_subject(subject: Optional[str]) -> None:
+    """
+    Validates a subject as nats.go's validateSubject does.
+    """
+    if not subject:
+        raise InvalidSubjectError("nats: invalid subject name: subject cannot be empty")
+    if subject.startswith(".") or subject.endswith(".") or " " in subject or ">" in subject[:-1]:
+        raise InvalidSubjectError(f"nats: invalid subject name: {subject}")
+
+
+def _stream_not_found() -> StreamNotFoundError:
+    return StreamNotFoundError(code=404, err_code=ErrorCode.STREAM_NOT_FOUND, description="stream not found")
 
 
 def _check_stream_support(config: api.StreamConfig, info: api.StreamInfo) -> None:
@@ -134,22 +150,60 @@ class JetStreamManager:
         req_data = json.dumps({"subject": subject})
         info = await self._api_request(req_sub, req_data.encode(), timeout=self._timeout)
         if not info["streams"]:
-            raise NotFoundError
+            raise _stream_not_found()
         return info["streams"][0]
 
-    async def stream_info(self, name: str, subjects_filter: Optional[str] = None) -> api.StreamInfo:
+    async def stream_name_by_subject(self, subject: str) -> str:
+        """
+        Returns the name of the stream that holds the subject.
+
+        :raises InvalidSubjectError: if the subject is not a valid subject.
+        :raises StreamNotFoundError: if no stream holds the subject.
+        """
+        _validate_subject(subject)
+        return await self.find_stream_name_by_subject(subject)
+
+    async def stream_info(
+        self,
+        name: str,
+        subjects_filter: Optional[str] = None,
+        deleted_details: Optional[bool] = None,
+    ) -> api.StreamInfo:
         """
         Get the latest StreamInfo by stream name.
+
+        :param name: The name of the stream.
+        :param subjects_filter: Report the message count of the subjects
+            matching this filter in ``state.subjects``. The subjects are
+            fetched page by page when the server cannot send them all at once.
+        :param deleted_details: Report the deleted sequences in
+            ``state.deleted``.
         """
         _validate_stream_name(name)
-        req_data = ""
+        req: Dict[str, Any] = {}
         if subjects_filter:
-            req_data = json.dumps({"subjects_filter": subjects_filter})
-        resp = await self._api_request(
-            f"{self._prefix}.STREAM.INFO.{name}",
-            req_data.encode(),
-            timeout=self._timeout,
-        )
+            req["subjects_filter"] = subjects_filter
+        if deleted_details:
+            req["deleted_details"] = True
+
+        subjects: Optional[Dict[str, int]] = None
+        while True:
+            resp = await self._api_request(
+                f"{self._prefix}.STREAM.INFO.{name}",
+                json.dumps(req).encode() if req else b"",
+                timeout=self._timeout,
+            )
+            total = resp.get("total") or 0
+            page = (resp.get("state") or {}).get("subjects") or {}
+            if not subjects_filter or (subjects is None and len(page) >= total):
+                break
+            # The server limits the subjects it sends in one response.
+            subjects = subjects or {}
+            subjects.update(page)
+            if not page or len(subjects) >= total:
+                resp["state"]["subjects"] = subjects
+                break
+            req["offset"] = len(subjects)
         return api.StreamInfo.from_response(resp)
 
     async def add_stream(self, config: Optional[api.StreamConfig] = None, **params) -> api.StreamInfo:
@@ -247,6 +301,71 @@ class JetStreamManager:
             stream_info = api.StreamInfo.from_response(stream)
             streams.append(stream_info)
         return streams
+
+    async def list_streams(self, subject: Optional[str] = None) -> AsyncIterator[api.StreamInfo]:
+        """
+        Iterates over the infos of all the streams, fetched page by page.
+
+        :param subject: Only list the streams that hold this subject.
+
+        ::
+
+            async for info in js.list_streams():
+                print(info.config.name)
+        """
+        req: Dict[str, Any] = {}
+        if subject:
+            req["subject"] = subject
+        offset = 0
+        while True:
+            req["offset"] = offset
+            resp = await self._api_request(
+                f"{self._prefix}.STREAM.LIST",
+                json.dumps(req).encode(),
+                timeout=self._timeout,
+            )
+            page = resp.get("streams") or []
+            for stream in page:
+                yield api.StreamInfo.from_response(stream)
+            offset += len(page)
+            if not page or offset >= resp.get("total", 0):
+                return
+
+    async def stream_names(self, subject: Optional[str] = None) -> AsyncIterator[str]:
+        """
+        Iterates over the names of all the streams, fetched page by page.
+
+        :param subject: Only list the streams that hold this subject.
+        """
+        req: Dict[str, Any] = {}
+        if subject:
+            req["subject"] = subject
+        offset = 0
+        while True:
+            req["offset"] = offset
+            resp = await self._api_request(
+                f"{self._prefix}.STREAM.NAMES",
+                json.dumps(req).encode(),
+                timeout=self._timeout,
+            )
+            page = resp.get("streams") or []
+            for name in page:
+                yield name
+            offset += len(page)
+            if not page or offset >= resp.get("total", 0):
+                return
+
+    async def create_or_update_stream(self, config: Optional[api.StreamConfig] = None, **params) -> api.StreamInfo:
+        """
+        Updates a stream, or creates it when it does not exist.
+        """
+        if config is None:
+            config = api.StreamConfig()
+        config = config.evolve(**params)
+        try:
+            return await self.update_stream(config)
+        except StreamNotFoundError:
+            return await self.add_stream(config)
 
     async def streams_info_iterator(self, offset=0) -> Iterable[api.StreamInfo]:
         """
