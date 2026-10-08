@@ -31,6 +31,7 @@ from nats.js.errors import (
     Error,
     ErrorCode,
     InvalidConsumerNameError,
+    InvalidJetStreamResponseError,
     InvalidOptionError,
     InvalidStreamNameError,
     InvalidSubjectError,
@@ -931,6 +932,8 @@ class JetStreamManager:
                 err_code=ErrorCode.JETSTREAM_NOT_ENABLED,
                 description="jetstream not enabled",
             )
+        except ValueError:
+            raise InvalidJetStreamResponseError
 
         # Check for API errors.
         if "error" in resp:

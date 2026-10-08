@@ -199,13 +199,11 @@ class JetStreamContext(JetStreamManager):
 
         # Handle response errors
         try:
-            resp = json.loads(msg.data)
-            if "error" in resp:
-                err = nats.js.errors.APIError.from_error(resp["error"])
-                future.set_exception(err)
-                return
-
-            ack = api.PubAck.from_response(resp)
+            ack = self._parse_pub_ack(msg.data)
+        except nats.js.errors.Error as err:
+            future.set_exception(err)
+            return
+        try:
             future.set_result(ack)
         except (asyncio.CancelledError, asyncio.InvalidStateError):
             pass
@@ -285,9 +283,20 @@ class JetStreamContext(JetStreamManager):
             if timeout <= 0:
                 raise nats.errors.TimeoutError
 
-        resp = json.loads(msg.data)
+        return self._parse_pub_ack(msg.data)
+
+    @staticmethod
+    def _parse_pub_ack(data: bytes) -> api.PubAck:
+        try:
+            resp = json.loads(data)
+        except ValueError:
+            raise nats.js.errors.InvalidJSAckError
+        if not isinstance(resp, dict):
+            raise nats.js.errors.InvalidJSAckError
         if "error" in resp:
             raise nats.js.errors.APIError.from_error(resp["error"])
+        if not resp.get("stream"):
+            raise nats.js.errors.InvalidJSAckError
         return api.PubAck.from_response(resp)
 
     @staticmethod

@@ -18,7 +18,13 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
-from nats.errors import Error, MsgAlreadyAckdError, NotJSMessageError
+from nats.errors import (
+    Error,
+    MsgAlreadyAckdError,
+    MsgNoReplyError,
+    MsgNotBoundError,
+    NotJSMessageError,
+)
 
 if TYPE_CHECKING:
     from nats import NATS
@@ -146,8 +152,10 @@ class Msg:
         in_progress acknowledges a message delivered by JetStream is still being worked on.
         Unlike other types of acks, an in-progress ack (+WPI) can be done multiple times.
         """
+        if not self._client:
+            raise MsgNotBoundError
         if self.reply is None or self.reply == "":
-            raise NotJSMessageError
+            raise MsgNoReplyError
         await self._client.publish(self.reply, Msg.Ack.Progress)
 
     async def term(self) -> None:
@@ -157,6 +165,20 @@ class Msg:
         self._check_reply()
 
         await self._client.publish(self.reply, Msg.Ack.Term)
+        self._ackd = True
+
+    async def term_with_reason(self, reason: str) -> None:
+        """
+        term_with_reason terminates a message delivered by JetStream and
+        disables redeliveries, giving the server a reason that is included
+        in the terminated message advisory.
+        """
+        self._check_reply()
+
+        payload = Msg.Ack.Term
+        if reason:
+            payload += b" " + reason.encode()
+        await self._client.publish(self.reply, payload)
         self._ackd = True
 
     # TODO(@orsinium): use a cached_property. Available in functools since 3.8,
@@ -178,8 +200,10 @@ class Msg:
         return Msg.Metadata._get_metadata_fields(reply)
 
     def _check_reply(self) -> None:
+        if not self._client:
+            raise MsgNotBoundError
         if self.reply is None or self.reply == "":
-            raise NotJSMessageError
+            raise MsgNoReplyError
         if self._ackd:
             raise MsgAlreadyAckdError(self)
 
@@ -218,7 +242,7 @@ class Msg:
         @classmethod
         def _get_metadata_fields(cls, reply: Optional[str]) -> List[str]:
             if not reply:
-                raise NotJSMessageError
+                raise MsgNoReplyError
             tokens = reply.split(".")
             if (
                 (len(tokens) == _V1_TOKEN_COUNT or len(tokens) >= _V2_TOKEN_COUNT - 1)

@@ -186,3 +186,21 @@ class MsgAlreadyAckdError(Error):
 
     def __str__(self) -> str:
         return f"nats: message was already acknowledged: {self._msg}"
+
+
+class MsgNoReplyError(NotJSMessageError):
+    """
+    Raised when acknowledging or reading the metadata of a message without a reply subject.
+    """
+
+    def __str__(self) -> str:
+        return "nats: message does not have a reply"
+
+
+class MsgNotBoundError(Error):
+    """
+    Raised when acknowledging a message that was not received from a connection.
+    """
+
+    def __str__(self) -> str:
+        return "nats: message is not bound to subscription/connection"

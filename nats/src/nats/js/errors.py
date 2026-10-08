@@ -633,6 +633,24 @@ class NoStreamResponseError(Error):
         return "nats: no response from stream"
 
 
+class InvalidJSAckError(Error, ValueError):
+    """
+    Raised when the response to a JetStream publish is not a valid acknowledgement.
+    """
+
+    def __str__(self) -> str:
+        return "nats: invalid jetstream publish response"
+
+
+class InvalidJetStreamResponseError(Error, ValueError):
+    """
+    Raised when the response to a JetStream API request cannot be decoded.
+    """
+
+    def __str__(self) -> str:
+        return "nats: invalid jetstream api response"
+
+
 class TooManyStalledMsgsError(Error):
     """
     Raised when too many outstanding async published messages are waiting for ack.
