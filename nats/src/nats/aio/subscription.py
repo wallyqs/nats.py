@@ -178,7 +178,10 @@ class Subscription:
             raise errors.ConnectionClosedError
 
         if self._cb:
-            raise errors.Error("nats: next_msg cannot be used in async subscriptions")
+            raise errors.SyncSubRequiredError
+
+        if self._max_msgs > 0 and self._received >= self._max_msgs and self._pending_queue.empty():
+            raise errors.MaxMessagesError
 
         task_name = str(uuid4())
         try:

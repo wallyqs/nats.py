@@ -107,9 +107,9 @@ class Msg:
         own headers.
         """
         if not self.reply:
-            raise Error("no reply subject available")
+            raise MsgNoReplyError
         if not self._client:
-            raise Error("client not set")
+            raise MsgNotBoundError
 
         if headers is None:
             headers = self.headers

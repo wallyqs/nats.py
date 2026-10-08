@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import ssl
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -74,6 +75,44 @@ class SecureConnFailedError(Error):
         return "nats: secure connection failed"
 
 
+class TLSError(Error, ssl.SSLError):
+    """
+    The TLS handshake failed, as nats.go's ErrTLS. It is still an
+    ssl.SSLError carrying the original error's errno and text.
+    """
+
+    def __str__(self) -> str:
+        return f"nats: tls error: {ssl.SSLError.__str__(self)}"
+
+
+class TLSCertVerificationError(TLSError, ssl.SSLCertVerificationError):
+    """
+    A TLSError raised for an ssl.SSLCertVerificationError.
+    """
+
+    pass
+
+
+class DisconnectedError(Error):
+    def __str__(self) -> str:
+        return "nats: server is disconnected"
+
+
+class HeadersNotSupportedError(Error):
+    def __str__(self) -> str:
+        return "nats: headers not supported by this server"
+
+
+class NoEchoNotSupportedError(Error):
+    def __str__(self) -> str:
+        return "nats: no echo option not supported by this server"
+
+
+class MixingWebsocketSchemesError(Error):
+    def __str__(self) -> str:
+        return "nats: mixing of websocket and non websocket URLs is not allowed"
+
+
 class BadSubscriptionError(Error):
     def __str__(self) -> str:
         return "nats: invalid subscription"
@@ -82,6 +121,11 @@ class BadSubscriptionError(Error):
 class BadSubjectError(Error):
     def __str__(self) -> str:
         return "nats: invalid subject"
+
+
+class BadQueueNameError(BadSubjectError):
+    def __str__(self) -> str:
+        return "nats: invalid queue name"
 
 
 class BadHeaderError(Error):
@@ -94,6 +138,16 @@ class BadHeaderError(Error):
         return "nats: invalid header"
 
 
+class BadHeaderMsgError(Error):
+    """
+    The headers of a received message could not be decoded,
+    as nats.go's ErrBadHeaderMsg. The decoding error is its __cause__.
+    """
+
+    def __str__(self) -> str:
+        return "nats: message could not decode headers"
+
+
 class SlowConsumerError(Error):
     def __init__(self, subject: str, reply: str, sid: int, sub: Subscription) -> None:
         self.subject = subject
@@ -103,6 +157,26 @@ class SlowConsumerError(Error):
 
     def __str__(self) -> str:
         return f"nats: slow consumer, messages dropped subject: {self.subject}, sid: {self.sid}, sub: {self.sub}"
+
+
+class SyncSubRequiredError(Error):
+    """
+    next_msg was called on a subscription with a callback,
+    as nats.go's ErrSyncSubRequired.
+    """
+
+    def __str__(self) -> str:
+        return "nats: next_msg cannot be used in async subscriptions"
+
+
+class MaxMessagesError(Error):
+    """
+    The subscription already delivered the messages its auto-unsubscribe
+    limit allows, as nats.go's ErrMaxMessages.
+    """
+
+    def __str__(self) -> str:
+        return "nats: maximum messages delivered"
 
 
 class BadTimeoutError(Error):

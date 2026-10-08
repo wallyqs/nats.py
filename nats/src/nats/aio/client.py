@@ -150,7 +150,7 @@ def _validate_queue(queue: str) -> None:
     wildcards and dots are valid tokens on the wire.
     """
     if queue and _SUBJECT_INVALID_RE.search(queue):
-        raise errors.BadSubjectError
+        raise errors.BadQueueNameError
 
 
 # Header keys must be printable ASCII without separators (RFC 7230 token
@@ -1020,6 +1020,8 @@ class Client:
 
         if payload_size > self._max_payload:
             raise errors.MaxPayloadError
+        if headers is not None and self._server_info and not self._server_info.get("headers", False):
+            raise errors.HeadersNotSupportedError
         await self._send_publish(subject, reply, payload, payload_size, headers)
 
     async def _send_publish(
@@ -1269,6 +1271,8 @@ class Client:
 
         if self.is_closed:
             raise errors.ConnectionClosedError
+        if self.is_reconnecting:
+            raise errors.DisconnectedError
 
         future: asyncio.Future = asyncio.Future()
         loop = asyncio.get_running_loop()
@@ -1555,7 +1559,7 @@ class Client:
                 all(server.uri.scheme in ("nats", "tls") for server in self._server_pool)
                 or all(server.uri.scheme in ("ws", "wss") for server in self._server_pool)
             ):
-                raise errors.Error("nats: mixing of websocket and non websocket URLs is not allowed")
+                raise errors.MixingWebsocketSchemesError
         else:
             raise errors.Error("nats: invalid connect url option")
 
@@ -1570,18 +1574,36 @@ class Client:
             else:
                 self._transport = TcpTransport()
         if s.uri.scheme == "wss":
-            await self._transport.connect_tls(
-                s.uri,
-                ssl_context=self.ssl_context,
-                buffer_size=DEFAULT_BUFFER_SIZE,
-                connect_timeout=self.options["connect_timeout"],
-            )
+            await self._connect_tls(s.uri)
         else:
             await self._transport.connect(
                 s.uri,
                 buffer_size=DEFAULT_BUFFER_SIZE,
                 connect_timeout=self.options["connect_timeout"],
             )
+
+    async def _connect_tls(self, uri: Union[str, ParseResult]) -> None:
+        """
+        Runs the TLS handshake, raising a failure as errors.TLSError,
+        as nats.go wraps it in ErrTLS.
+        """
+        assert self._transport
+        try:
+            await self._transport.connect_tls(
+                uri,
+                self.ssl_context,
+                DEFAULT_BUFFER_SIZE,
+                self.options["connect_timeout"],
+            )
+        except errors.TLSError:
+            raise
+        except ssl.SSLError as e:
+            cls = errors.TLSCertVerificationError if isinstance(e, ssl.SSLCertVerificationError) else errors.TLSError
+            err = cls(*e.args)
+            for attr in ("library", "reason", "verify_code", "verify_message"):
+                if hasattr(e, attr):
+                    setattr(err, attr, getattr(e, attr))
+            raise err from e
 
     async def _select_next_server(self) -> None:
         """
@@ -2051,7 +2073,9 @@ class Client:
                     del hdr[k]
 
         except Exception as e:
-            await self._error_cb(e)
+            err = errors.BadHeaderMsgError()
+            err.__cause__ = e
+            await self._error_cb(err)
             return hdr
 
         return hdr or None
@@ -2282,12 +2306,7 @@ class Client:
 
         handshake_first = self.options["tls_handshake_first"]
         if handshake_first:
-            await self._transport.connect_tls(
-                hostname,
-                self.ssl_context,
-                DEFAULT_BUFFER_SIZE,
-                self.options["connect_timeout"],
-            )
+            await self._connect_tls(hostname)
 
         connection_completed = self._transport.readline()
         info_line = await asyncio.wait_for(connection_completed, self.options["connect_timeout"])
@@ -2321,6 +2340,9 @@ class Client:
         if "client_ip" in self._server_info:
             self._client_ip = self._server_info["client_ip"]
 
+        if self.options["no_echo"] and self._server_info.get("proto", 0) < 1:
+            raise errors.NoEchoNotSupportedError
+
         scheme = self._current_server.uri.scheme
         tls_required = bool(self._server_info.get("tls_required", False))
         # A tls:// URL or an explicit TLS context asks for a secure connection
@@ -2334,12 +2356,7 @@ class Client:
                 await self._transport.drain()  # just in case something is left
 
                 # connect to transport via tls
-                await self._transport.connect_tls(
-                    hostname,
-                    self.ssl_context,
-                    DEFAULT_BUFFER_SIZE,
-                    self.options["connect_timeout"],
-                )
+                await self._connect_tls(hostname)
 
         # Refresh state of parser upon reconnect.
         if self.is_reconnecting:
