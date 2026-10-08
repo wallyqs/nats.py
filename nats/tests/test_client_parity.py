@@ -1121,6 +1121,35 @@ class AuthOptionErrorsTest(unittest.IsolatedAsyncioTestCase):
         await self.check(nats.errors.TokenAlreadySetError, servers="nats://token@127.0.0.1:4999", token=lambda: "other")
 
 
+class CustomDialerTest(SingleServerTestCase):
+    @async_test
+    async def test_custom_dialer(self):
+        dialed = []
+
+        async def dialer(host, port):
+            dialed.append((host, port))
+            # E.g. a tunnel: the client asks for an unreachable address.
+            return await asyncio.open_connection("127.0.0.1", 4222)
+
+        reconnected = asyncio.Event()
+
+        async def reconnected_cb():
+            reconnected.set()
+
+        nc = await nats.connect(
+            "nats://nats.invalid:4999", custom_dialer=dialer, reconnected_cb=reconnected_cb, reconnect_time_wait=0.1
+        )
+        self.assertEqual(dialed, [("nats.invalid", 4999)])
+        sub = await nc.subscribe("foo")
+        await nc.publish("foo", b"via dialer")
+        msg = await sub.next_msg()
+        self.assertEqual(msg.data, b"via dialer")
+        await nc.force_reconnect()
+        await asyncio.wait_for(reconnected.wait(), 2)
+        self.assertEqual(len(dialed), 2)
+        await nc.close()
+
+
 if __name__ == "__main__":
     import sys
 

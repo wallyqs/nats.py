@@ -65,7 +65,13 @@ from .subscription import (
     Subscription,
     _Barrier,
 )
-from .transport import TcpTransport, Transport, WebSocketHeadersCallback, WebSocketTransport
+from .transport import (
+    CustomDialer,
+    TcpTransport,
+    Transport,
+    WebSocketHeadersCallback,
+    WebSocketTransport,
+)
 
 try:
     from importlib.metadata import version
@@ -534,6 +540,7 @@ class Client:
         ws_connection_headers_cb: Optional[WebSocketHeadersCallback] = None,
         ws_compression: bool = False,
         ws_proxy_path: Optional[str] = None,
+        custom_dialer: Optional[CustomDialer] = None,
     ) -> None:
         """
         Establishes a connection to NATS.
@@ -597,6 +604,9 @@ class Client:
             WebSocket frames.
         :param ws_proxy_path: Path used for every WebSocket connection, in
             place of the server URL's path, e.g. when behind a proxy.
+        :param custom_dialer: Coroutine function called with (host, port) that
+            opens the TCP connection and returns its (StreamReader,
+            StreamWriter), e.g. to go through a proxy or tunnel.
 
         Connecting setting all callbacks::
 
@@ -756,6 +766,9 @@ class Client:
         self.options["ws_connection_headers_cb"] = ws_connection_headers_cb
         self.options["ws_compression"] = ws_compression
         self.options["ws_proxy_path"] = ws_proxy_path
+        if custom_dialer is not None and not callable(custom_dialer):
+            raise errors.Error("nats: custom_dialer must be callable")
+        self.options["custom_dialer"] = custom_dialer
         self.options["skip_subject_validation"] = skip_subject_validation
         self._skip_subject_validation = skip_subject_validation
         self.options["no_callbacks_after_client_close"] = no_callbacks_after_client_close
@@ -2027,7 +2040,7 @@ class Client:
                     proxy_path=self.options.get("ws_proxy_path"),
                 )
             else:
-                self._transport = TcpTransport()
+                self._transport = TcpTransport(dialer=self.options.get("custom_dialer"))
         if s.uri.scheme == "wss":
             await self._connect_tls(s.uri)
         else:

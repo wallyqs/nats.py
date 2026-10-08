@@ -4,7 +4,7 @@ import abc
 import asyncio
 import inspect
 import ssl
-from typing import Awaitable, Callable, Dict, List, Optional, Union
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import ParseResult
 
 try:
@@ -115,22 +115,28 @@ class Transport(abc.ABC):
         return default
 
 
+# Opens the connection to (host, port), returning its stream reader and writer.
+CustomDialer = Callable[[str, int], Awaitable[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]]
+
+
 class TcpTransport(Transport):
-    def __init__(self):
+    def __init__(self, dialer: Optional[CustomDialer] = None):
         self._bare_io_reader: Optional[asyncio.StreamReader] = None
         self._io_reader: Optional[asyncio.StreamReader] = None
         self._bare_io_writer: Optional[asyncio.StreamWriter] = None
         self._io_writer: Optional[asyncio.StreamWriter] = None
+        self._dialer = dialer
 
     async def connect(self, uri: ParseResult, buffer_size: int, connect_timeout: int):
-        r, w = await asyncio.wait_for(
-            asyncio.open_connection(
+        if self._dialer is not None:
+            dial = self._dialer(uri.hostname, uri.port)
+        else:
+            dial = asyncio.open_connection(
                 host=uri.hostname,
                 port=uri.port,
                 limit=buffer_size,
-            ),
-            connect_timeout,
-        )
+            )
+        r, w = await asyncio.wait_for(dial, connect_timeout)
         # We keep a reference to the initial transport we used when
         # establishing the connection in case we later upgrade to TLS
         # after getting the first INFO message. This is in order to
