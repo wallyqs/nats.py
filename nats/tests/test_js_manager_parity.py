@@ -643,3 +643,94 @@ class JetStreamOptionsTest(SingleJetStreamServerTestCase):
         assert domain_js.options.domain == "hub"
         assert domain_js.options.client_trace is None
         await nc.close()
+
+
+class StreamHandleTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_stream_handle(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        with pytest.raises(StreamNotFoundError):
+            await js.stream("MISSING")
+
+        await js.add_stream(name="HANDLE", subjects=["handle.>"])
+        stream = await js.stream("HANDLE")
+        assert stream.name == "HANDLE"
+        assert stream.cached_info().state.messages == 0
+
+        for subject in ("handle.a", "handle.b", "handle.a", "handle.b"):
+            await js.publish(subject, b"x")
+        assert stream.cached_info().state.messages == 0
+        info = await stream.info(subjects_filter=">")
+        assert info.state.subjects == {"handle.a": 2, "handle.b": 2}
+        assert stream.cached_info().state.messages == 4
+        assert stream.cached_info().state.subjects is None
+
+        msg = await stream.get_msg(1)
+        assert msg.subject == "handle.a"
+        msg = await stream.get_msg(2, subject="handle.a")
+        assert msg.seq == 3
+        msg = await stream.get_last_msg_for_subject("handle.b")
+        assert msg.seq == 4
+
+        assert await stream.delete_msg(2)
+        assert await stream.secure_delete_msg(3)
+        info = await stream.info(deleted_details=True)
+        assert info.state.deleted == [2, 3]
+
+        with pytest.raises(InvalidOptionError):
+            await stream.purge(seq=4, keep=1)
+        assert await stream.purge(subject="handle.a")
+        assert (await stream.info()).state.messages == 1
+
+        # Consumers.
+        info = await stream.create_consumer(durable_name="pull")
+        assert info.name == "pull"
+        info = await stream.update_consumer(durable_name="pull", description="updated")
+        assert info.config.description == "updated"
+        info = await stream.create_or_update_consumer(durable_name="other")
+        assert (await stream.consumer_info("other")).name == "other"
+        with pytest.raises(NotPushConsumerError):
+            await stream.create_push_consumer(durable_name="push")
+        info = await stream.create_push_consumer(durable_name="push", deliver_subject="deliver.one")
+        assert info.config.deliver_subject == "deliver.one"
+        info = await stream.update_push_consumer(
+            durable_name="push", deliver_subject="deliver.one", description="updated"
+        )
+        assert info.config.description == "updated"
+        info = await stream.create_or_update_push_consumer(durable_name="push2", deliver_subject="deliver.two")
+        assert info.name == "push2"
+
+        assert sorted([name async for name in stream.consumer_names()]) == ["other", "pull", "push", "push2"]
+        infos = [info async for info in stream.list_consumers()]
+        assert sorted(info.name for info in infos) == ["other", "pull", "push", "push2"]
+        assert await stream.delete_consumer("other")
+
+        # The remaining message, handle.b at sequence 4.
+        psub = await stream.consumer("pull")
+        msgs = await psub.fetch(1, timeout=1)
+        assert msgs[0].subject == "handle.b"
+        with pytest.raises(NotPullConsumerError):
+            await stream.consumer("push")
+
+        received = asyncio.Queue()
+
+        async def cb(msg):
+            await received.put(msg)
+
+        await stream.push_consumer("push", cb=cb)
+        msg = await asyncio.wait_for(received.get(), 1)
+        assert msg.subject == "handle.b"
+        with pytest.raises(NotPushConsumerError):
+            await stream.push_consumer("pull")
+
+        osub = await stream.ordered_consumer()
+        msg = await osub.next_msg(timeout=1)
+        assert msg.subject == "handle.b"
+
+        jsm = nc.jsm()
+        handle = await jsm.stream("HANDLE")
+        with pytest.raises(Error):
+            await handle.consumer("pull")
+        await nc.close()

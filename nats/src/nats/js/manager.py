@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import json
 from email.parser import BytesParser
 from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, Iterable, List, Optional
@@ -27,12 +28,16 @@ from nats.js.errors import (
     ConsumerInvalidResetError,
     ConsumerMultipleFilterSubjectsNotSupportedError,
     ConsumerResetResponseEmptyError,
+    Error,
     ErrorCode,
     InvalidConsumerNameError,
+    InvalidOptionError,
     InvalidStreamNameError,
     InvalidSubjectError,
     JetStreamNotEnabledError,
     NotFoundError,
+    NotPullConsumerError,
+    NotPushConsumerError,
     StreamNameRequiredError,
     StreamNotFoundError,
     StreamSourceNotSupportedError,
@@ -183,6 +188,16 @@ class JetStreamManager:
         """
         _validate_subject(subject)
         return await self.find_stream_name_by_subject(subject)
+
+    async def stream(self, name: str) -> Stream:
+        """
+        Returns a handle on a stream, with its info cached
+        (nats.go StreamManager.Stream).
+
+        :raises StreamNotFoundError: if the stream does not exist.
+        """
+        info = await self.stream_info(name)
+        return Stream(self, name, info)
 
     async def stream_info(
         self,
@@ -922,3 +937,223 @@ class JetStreamManager:
             raise APIError.from_error(resp["error"])
 
         return resp
+
+
+class Stream:
+    """
+    A handle on one stream (nats.go ``jetstream.Stream``), returned by
+    ``JetStreamManager.stream()``. It manages the stream's messages and
+    consumers, and caches the stream's info.
+
+    ::
+
+        stream = await js.stream("ORDERS")
+        print(stream.cached_info().state.messages)
+        await stream.create_consumer(durable_name="processor")
+        psub = await stream.consumer("processor")
+        msgs = await psub.fetch(10)
+    """
+
+    def __init__(self, jsm: JetStreamManager, name: str, info: Optional[api.StreamInfo] = None) -> None:
+        self._jsm = jsm
+        self._name = name
+        self._info = info
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def cached_info(self) -> Optional[api.StreamInfo]:
+        """
+        The stream's info as last fetched, without a request.
+        """
+        return self._info
+
+    async def info(
+        self,
+        subjects_filter: Optional[str] = None,
+        deleted_details: Optional[bool] = None,
+    ) -> api.StreamInfo:
+        """
+        Fetches the stream's info and caches it (without the subjects of
+        ``subjects_filter``).
+        """
+        info = await self._jsm.stream_info(
+            self._name,
+            subjects_filter=subjects_filter,
+            deleted_details=deleted_details,
+        )
+        cached = copy.copy(info)
+        cached.state = copy.copy(info.state)
+        cached.state.subjects = None
+        self._info = cached
+        return info
+
+    async def purge(
+        self,
+        subject: Optional[str] = None,
+        seq: Optional[int] = None,
+        keep: Optional[int] = None,
+    ) -> bool:
+        """
+        Purges the stream's messages: those of the subject, those before
+        the sequence, or all but the last ``keep``. ``seq`` and ``keep``
+        cannot be combined.
+        """
+        if seq and keep:
+            raise InvalidOptionError(
+                "nats: invalid jetstream option: both 'keep' and 'sequence' cannot be provided in purge request"
+            )
+        return await self._jsm.purge_stream(self._name, seq=seq, subject=subject, keep=keep)
+
+    def _direct(self) -> bool:
+        return bool(self._info is not None and self._info.config.allow_direct)
+
+    async def get_msg(self, seq: int, subject: Optional[str] = None) -> api.RawStreamMsg:
+        """
+        Gets the message stored at the sequence or, with a subject, the
+        first message on that subject at or after it. Uses direct get when
+        the cached info allows it.
+        """
+        if subject:
+            return await self._jsm.get_msg(self._name, seq=seq, subject=subject, next=True, direct=self._direct())
+        return await self._jsm.get_msg(self._name, seq=seq, direct=self._direct())
+
+    async def get_last_msg_for_subject(self, subject: str) -> api.RawStreamMsg:
+        """
+        Gets the last message stored on the subject.
+        """
+        return await self._jsm.get_last_msg(self._name, subject, direct=self._direct())
+
+    async def delete_msg(self, seq: int) -> bool:
+        """
+        Marks the message at the sequence as deleted, without erasing it.
+        """
+        return await self._jsm.delete_msg(self._name, seq, no_erase=True)
+
+    async def secure_delete_msg(self, seq: int) -> bool:
+        """
+        Deletes the message at the sequence, overwriting its data.
+        """
+        return await self._jsm.delete_msg(self._name, seq)
+
+    async def create_consumer(self, config: Optional[api.ConsumerConfig] = None, **params) -> api.ConsumerInfo:
+        """
+        Creates a consumer of the stream; see JetStreamManager.create_consumer.
+        """
+        return await self._jsm.create_consumer(self._name, config, **params)
+
+    async def update_consumer(self, config: Optional[api.ConsumerConfig] = None, **params) -> api.ConsumerInfo:
+        """
+        Updates a consumer of the stream; see JetStreamManager.update_consumer.
+        """
+        return await self._jsm.update_consumer(self._name, config, **params)
+
+    async def create_or_update_consumer(
+        self, config: Optional[api.ConsumerConfig] = None, **params
+    ) -> api.ConsumerInfo:
+        """
+        Creates a consumer of the stream, or updates it.
+        """
+        return await self._jsm.create_or_update_consumer(self._name, config, **params)
+
+    @staticmethod
+    def _push_config(config: Optional[api.ConsumerConfig], params: Dict[str, Any]) -> api.ConsumerConfig:
+        config = (config or api.ConsumerConfig()).evolve(**params)
+        if not config.deliver_subject:
+            raise NotPushConsumerError(description="consumer is not a push consumer")
+        return config
+
+    async def create_push_consumer(self, config: Optional[api.ConsumerConfig] = None, **params) -> api.ConsumerInfo:
+        """
+        Creates a push consumer of the stream; the config needs a
+        deliver_subject (NotPushConsumerError otherwise).
+        """
+        return await self._jsm.create_consumer(self._name, self._push_config(config, params))
+
+    async def update_push_consumer(self, config: Optional[api.ConsumerConfig] = None, **params) -> api.ConsumerInfo:
+        """
+        Updates a push consumer of the stream.
+        """
+        return await self._jsm.update_consumer(self._name, self._push_config(config, params))
+
+    async def create_or_update_push_consumer(
+        self, config: Optional[api.ConsumerConfig] = None, **params
+    ) -> api.ConsumerInfo:
+        """
+        Creates a push consumer of the stream, or updates it.
+        """
+        return await self._jsm.create_or_update_consumer(self._name, self._push_config(config, params))
+
+    async def consumer_info(self, name: str) -> api.ConsumerInfo:
+        return await self._jsm.consumer_info(self._name, name)
+
+    async def delete_consumer(self, name: str) -> bool:
+        return await self._jsm.delete_consumer(self._name, name)
+
+    async def pause_consumer(self, name: str, pause_until: str) -> api.ConsumerPause:
+        return await self._jsm.pause_consumer(self._name, name, pause_until)
+
+    async def resume_consumer(self, name: str) -> api.ConsumerPause:
+        return await self._jsm.resume_consumer(self._name, name)
+
+    async def reset_consumer(self, name: str, seq: Optional[int] = None) -> api.ConsumerReset:
+        return await self._jsm.reset_consumer(self._name, name, seq)
+
+    async def unpin_consumer(self, name: str, group: str) -> None:
+        await self._jsm.unpin_consumer(self._name, name, group)
+
+    def list_consumers(self) -> AsyncIterator[api.ConsumerInfo]:
+        """
+        Iterates over the infos of the stream's consumers.
+        """
+        return self._jsm.list_consumers(self._name)
+
+    def consumer_names(self) -> AsyncIterator[str]:
+        """
+        Iterates over the names of the stream's consumers.
+        """
+        return self._jsm.consumer_names(self._name)
+
+    def _context(self) -> Any:
+        if not hasattr(self._jsm, "pull_subscribe_bind"):
+            raise Error("consuming requires a JetStreamContext (nc.jetstream())")
+        return self._jsm
+
+    async def consumer(self, name: str, **params) -> Any:
+        """
+        Returns a pull subscription bound to the stream's pull consumer
+        (nats.go Stream.Consumer). ``params`` are passed to
+        JetStreamContext.pull_subscribe_bind.
+
+        :raises NotPullConsumerError: if the consumer is a push consumer.
+        """
+        js = self._context()
+        info = await self._jsm.consumer_info(self._name, name)
+        if info.config.deliver_subject:
+            raise NotPullConsumerError(description="consumer is not a pull consumer")
+        return await js.pull_subscribe_bind(consumer=name, stream=self._name, **params)
+
+    async def push_consumer(self, name: str, cb: Optional[Any] = None, **params) -> Any:
+        """
+        Returns a push subscription bound to the stream's push consumer
+        (nats.go Stream.PushConsumer), delivering to ``cb`` if given.
+        ``params`` are passed to JetStreamContext.subscribe_bind.
+
+        :raises NotPushConsumerError: if the consumer is a pull consumer.
+        """
+        js = self._context()
+        info = await self._jsm.consumer_info(self._name, name)
+        if not info.config.deliver_subject:
+            raise NotPushConsumerError(description="consumer is not a push consumer")
+        return await js.subscribe_bind(stream=self._name, config=info.config, consumer=name, cb=cb, **params)
+
+    async def ordered_consumer(self, subject: str = ">", cb: Optional[Any] = None, **params) -> Any:
+        """
+        Returns an ordered consumer of the stream's messages on the subject
+        (nats.go Stream.OrderedConsumer): a push subscription whose
+        ephemeral consumer is recreated in order whenever a delivery is
+        missed. ``params`` are passed to JetStreamContext.subscribe.
+        """
+        js = self._context()
+        return await js.subscribe(subject, cb=cb, stream=self._name, ordered_consumer=True, **params)
