@@ -162,10 +162,19 @@ class PublishOptionsTest(SingleJetStreamServerTestCase):
         nc = await nats.connect()
         js = nc.jetstream()
 
-        # Default: no retries.
+        # Default: nats.go's DefaultPubRetryAttempts retries, each after
+        # DefaultPubRetryWait.
+        assert api.DEFAULT_PUB_RETRY_ATTEMPTS == 2
+        assert api.DEFAULT_PUB_RETRY_WAIT == 0.25
         start = time.monotonic()
         with pytest.raises(NoStreamResponseError):
             await js.publish("retry.a", b"x")
+        assert time.monotonic() - start >= 0.5
+
+        # retry_attempts=0 disables the retries.
+        start = time.monotonic()
+        with pytest.raises(NoStreamResponseError):
+            await js.publish("retry.a", b"x", retry_attempts=0)
         assert time.monotonic() - start < 0.2
 
         start = time.monotonic()
@@ -411,9 +420,32 @@ class PublishAsyncTest(SingleJetStreamServerTestCase):
         nc = await nats.connect()
         js = nc.jetstream()
 
+        # Resent DEFAULT_PUB_RETRY_ATTEMPTS times by default, as nats.go does.
+        start = time.monotonic()
         future = await js.publish_async("aretry.a", b"x")
         with pytest.raises(NoStreamResponseError):
+            await asyncio.wait_for(future, 2)
+        assert future._retries == api.DEFAULT_PUB_RETRY_ATTEMPTS
+        assert time.monotonic() - start >= 0.5
+
+        # retry_attempts=0 fails on the first no responders.
+        start = time.monotonic()
+        future = await js.publish_async("aretry.a", b"x", retry_attempts=0)
+        with pytest.raises(NoStreamResponseError):
             await asyncio.wait_for(future, 1)
+        assert future._retries == 0
+        assert time.monotonic() - start < 0.2
+
+        # The stream appears while the default retries are pending.
+        async def add_stream_soon():
+            await asyncio.sleep(0.1)
+            await js.add_stream(name="DRETRY", subjects=["dretry.>"])
+
+        task = asyncio.create_task(add_stream_soon())
+        future = await js.publish_async("dretry.a", b"x")
+        ack = await asyncio.wait_for(future, 2)
+        assert ack.stream == "DRETRY"
+        await task
 
         async def add_stream():
             await asyncio.sleep(0.3)

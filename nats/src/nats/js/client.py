@@ -324,7 +324,7 @@ class JetStreamContext(JetStreamManager):
         expected_last_subject_sequence: Optional[int] = None,
         expected_last_subject_sequence_subject: Optional[str] = None,
         schedule: Optional[api.MsgSchedule] = None,
-        retry_attempts: int = 0,
+        retry_attempts: int = api.DEFAULT_PUB_RETRY_ATTEMPTS,
         retry_wait: float = api.DEFAULT_PUB_RETRY_WAIT,
     ) -> api.PubAck:
         """
@@ -345,8 +345,10 @@ class JetStreamContext(JetStreamManager):
             that ``expected_last_subject_sequence`` refers to.
         :param schedule: Publish the message as a message schedule.
         :param retry_attempts: Times to retry when no stream responded (negative
-            retries until the timeout).
-        :param retry_wait: Seconds to wait before each retry.
+            retries until the timeout, 0 disables retries). Defaults to
+            nats.go's DefaultPubRetryAttempts (2).
+        :param retry_wait: Seconds to wait before each retry. Defaults to
+            nats.go's DefaultPubRetryWait (0.25).
         """
         hdr = self._publish_headers(
             headers,
@@ -456,7 +458,7 @@ class JetStreamContext(JetStreamManager):
         expected_last_subject_sequence: Optional[int] = None,
         expected_last_subject_sequence_subject: Optional[str] = None,
         schedule: Optional[api.MsgSchedule] = None,
-        retry_attempts: int = 0,
+        retry_attempts: int = api.DEFAULT_PUB_RETRY_ATTEMPTS,
         retry_wait: float = api.DEFAULT_PUB_RETRY_WAIT,
     ) -> PubAckFuture:
         """
@@ -468,8 +470,11 @@ class JetStreamContext(JetStreamManager):
         :param stream: Expected stream name.
         :param headers: Message headers.
         :param msg_ttl: Per-message TTL in seconds (requires NATS Server 2.11+).
-        :param retry_attempts: Times to resend the message when no stream responded.
-        :param retry_wait: Seconds to wait before each resend.
+        :param retry_attempts: Times to resend the message when no stream
+            responded (0 disables resends). Defaults to nats.go's
+            DefaultPubRetryAttempts (2).
+        :param retry_wait: Seconds to wait before each resend. Defaults to
+            nats.go's DefaultPubRetryWait (0.25).
 
         The other keyword arguments set the same headers as in :meth:`publish`.
 
