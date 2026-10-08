@@ -4330,11 +4330,22 @@ class KVTest(SingleJetStreamServerTestCase):
         # Add keys to the bucket
         await kv.put("hello", b"world")
         await kv.put("greeting", b"hi")
+        await kv.put("greet.a", b"a")
+        await kv.put("greet.b.c", b"c")
 
-        # Test with filters (fetch keys with "hello" or "greet")
-        filtered_keys = await kv.keys(filters=["hello", "greet"])
-        assert "hello" in filtered_keys
-        assert "greeting" in filtered_keys
+        # Filters are subject patterns, as in nats.go's ListKeysFiltered.
+        filtered_keys = await kv.keys(filters=["hello", "greet.*"])
+        assert sorted(filtered_keys) == ["greet.a", "hello"]
+
+        filtered_keys = await kv.keys(filters=["greet.>"])
+        assert sorted(filtered_keys) == ["greet.a", "greet.b.c"]
+
+        # A plain key matches only itself, not keys that contain it.
+        with pytest.raises(nats.js.errors.NoKeysError):
+            await kv.keys(filters=["greet"])
+
+        with pytest.raises(nats.js.errors.InvalidKeyError):
+            await kv.keys(filters=["bad key"])
 
         # Clean up
         await nc.close()

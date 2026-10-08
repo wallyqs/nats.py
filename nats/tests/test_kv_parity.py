@@ -521,8 +521,8 @@ class KVListKeysTest(SingleJetStreamServerTestCase):
         assert [key async for key in lister] == []
         await lister.stop()
 
-        # keys() keeps its substring filters.
-        assert sorted(await kv.keys(filters=["ders"])) == ["orders.1", "orders.2"]
+        # keys() filters with the same subject patterns.
+        assert sorted(await kv.keys(filters=["orders.*"])) == ["orders.1", "orders.2"]
 
         await nc.close()
 

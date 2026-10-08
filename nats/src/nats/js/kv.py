@@ -668,8 +668,7 @@ class KeyValue:
         """
         list_keys_filtered returns a KeyLister of the keys that have a
         value and match any of the subject patterns in filters, e.g.
-        ``["orders.*", "users.>"]`` (nats.go ListKeysFiltered). Unlike the
-        substring filters of keys(), these are NATS subject wildcards.
+        ``["orders.*", "users.>"]`` (nats.go ListKeysFiltered).
         """
         watcher = await self.watch_filtered(filters, ignore_deletes=True, meta_only=True)
         return KeyValue.KeyLister(watcher)
@@ -683,36 +682,23 @@ class KeyValue:
     async def keys(self, filters: List[str] = None, **kwargs) -> List[str]:
         """
         Returns a list of the keys from a KeyValue store.
-        Optionally filters the keys based on the provided filter list.
-        """
-        watcher = await self.watchall(
-            ignore_deletes=True,
-            meta_only=True,
-        )
-        keys = []
 
-        # Check consumer info and make sure filters are applied correctly
-        try:
-            consumer_info = await watcher._sub.consumer_info()
-            if consumer_info and filters:
-                # If NATS server < 2.10, filters might be ignored.
-                if consumer_info.config.filter_subject != ">":
-                    logger.warning("Server may ignore filters if version is < 2.10.")
-        except Exception as e:
-            raise e
+        filters optionally limits the keys to those matching any of the
+        given subject patterns, e.g. ``["orders.*", "users.>"]``, as
+        nats.go's ListKeysFiltered does. Several filters need nats-server
+        2.10 or later.
+        """
+        if filters:
+            watcher = await self.watch_filtered(filters, ignore_deletes=True, meta_only=True)
+        else:
+            watcher = await self.watchall(ignore_deletes=True, meta_only=True)
+        keys = []
 
         async for key in watcher:
             # None entry is used to signal that there is no more info.
             if not key:
                 break
-
-            # Apply filters if any were provided
-            if filters:
-                if any(f in key.key for f in filters):
-                    keys.append(key.key)
-            else:
-                # No filters provided, append all keys
-                keys.append(key.key)
+            keys.append(key.key)
 
         await watcher.stop()
 
