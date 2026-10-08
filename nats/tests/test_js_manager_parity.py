@@ -869,3 +869,115 @@ class StreamSourceInfoTest(SingleJetStreamServerTestCase):
         info = await synced("SOURCED", 4)
         assert info.sources[0].seq == 4
         await nc.close()
+
+
+class NotSupportedErrorsTest(SingleJetStreamServerTestCase):
+    """
+    Servers before v2.10 drop the stream and consumer settings they do not
+    know from the config they answer with; nats.go then fails the create or
+    update with an Err...NotSupported. A fake JetStream API stands in for
+    such a server, answering with the requested config minus what drop()
+    removes.
+    """
+
+    async def _old_server(self, nc):
+        drop = {"fn": lambda config: None}
+
+        async def respond(msg):
+            req = json.loads(msg.data)
+            created = "2022-01-01T00:00:00Z"
+            if ".STREAM." in msg.subject:
+                config = dict(req)
+                drop["fn"](config)
+                resp = {
+                    "type": "io.nats.jetstream.api.v1.stream_create_response",
+                    "config": config,
+                    "created": created,
+                    "state": {"messages": 0, "bytes": 0, "first_seq": 0, "last_seq": 0, "consumer_count": 0},
+                }
+            else:
+                config = dict(req["config"])
+                drop["fn"](config)
+                resp = {
+                    "type": "io.nats.jetstream.api.v1.consumer_create_response",
+                    "stream_name": req["stream_name"],
+                    "name": msg.subject.split(".")[4],
+                    "config": config,
+                    "created": created,
+                }
+            await msg.respond(json.dumps(resp).encode())
+
+        await nc.subscribe("old.api.>", cb=respond)
+        return nc.jetstream(prefix="old.api"), drop
+
+    @async_test
+    async def test_stream_not_supported(self):
+        nc = await nats.connect()
+        js, drop = await self._old_server(nc)
+        transform = api.SubjectTransform(src="in.>", dest="out.>")
+        source = api.StreamSource(
+            name="ORIGIN", subject_transforms=[api.SubjectTransform(src="origin.>", dest="copy.>")]
+        )
+
+        # A server that keeps everything.
+        info = await js.add_stream(name="S", subjects=["in.>"], subject_transform=transform, sources=[source])
+        assert info.config.subject_transform == transform
+        info = await js.update_stream(name="S", subjects=["in.>"], subject_transform=transform)
+        assert info.config.subject_transform == transform
+
+        # nats.go ErrStreamSubjectTransformNotSupported.
+        drop["fn"] = lambda config: config.pop("subject_transform", None)
+        for call in (js.add_stream, js.update_stream):
+            with pytest.raises(StreamSubjectTransformNotSupportedError) as err:
+                await call(name="S", subjects=["in.>"], subject_transform=transform)
+            assert type(err.value) is StreamSubjectTransformNotSupportedError
+            assert str(err.value) == "nats: stream subject transformation not supported by nats-server"
+
+        # nats.go ErrStreamSourceNotSupported.
+        drop["fn"] = lambda config: config.pop("sources", None)
+        for call in (js.add_stream, js.update_stream):
+            with pytest.raises(StreamSourceNotSupportedError) as err:
+                await call(name="S", sources=[source])
+            assert str(err.value) == "nats: stream sourcing is not supported by nats-server"
+
+        # nats.go ErrStreamSourceSubjectTransformNotSupported.
+        def drop_source_transforms(config):
+            for src in config.get("sources") or []:
+                src.pop("subject_transforms", None)
+
+        drop["fn"] = drop_source_transforms
+        for call in (js.add_stream, js.update_stream):
+            with pytest.raises(StreamSourceSubjectTransformNotSupportedError) as err:
+                await call(name="S", sources=[source])
+            assert isinstance(err.value, StreamSubjectTransformNotSupportedError)
+            assert str(err.value) == "nats: stream subject transformation not supported by nats-server"
+        # Sources without transforms are fine.
+        await js.add_stream(name="S", sources=[api.StreamSource(name="ORIGIN")])
+        await nc.close()
+
+    @async_test
+    async def test_consumer_multiple_filter_subjects_not_supported(self):
+        nc = await nats.connect()
+        js, drop = await self._old_server(nc)
+        filters = ["a.>", "b.>"]
+
+        info = await js.add_consumer("S", durable_name="dur", filter_subjects=filters)
+        assert info.config.filter_subjects == filters
+
+        # nats.go ErrConsumerMultipleFilterSubjectsNotSupported.
+        drop["fn"] = lambda config: config.pop("filter_subjects", None)
+        calls = (
+            lambda: js.add_consumer("S", durable_name="dur", filter_subjects=filters),
+            lambda: js.add_consumer("S", name="eph", filter_subjects=filters),
+            lambda: js.create_consumer("S", durable_name="dur", filter_subjects=filters),
+            lambda: js.update_consumer("S", durable_name="dur", filter_subjects=filters),
+            lambda: js.create_or_update_consumer("S", durable_name="dur", filter_subjects=filters),
+        )
+        for call in calls:
+            with pytest.raises(ConsumerMultipleFilterSubjectsNotSupportedError) as err:
+                await call()
+            assert str(err.value) == "nats: multiple consumer filter subjects not supported by nats-server"
+        # A single filter subject is fine.
+        info = await js.add_consumer("S", durable_name="dur", filter_subject="a.>")
+        assert info.config.filter_subject == "a.>"
+        await nc.close()
