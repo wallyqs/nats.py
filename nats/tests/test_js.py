@@ -5101,6 +5101,19 @@ class ObjectStoreTest(SingleJetStreamServerTestCase):
         assert entries[2].name == "C"
         assert entries[3].name == "D"
 
+        # Deleted objects are only listed on request.
+        await obs.delete("B")
+        entries = await obs.list()
+        assert [e.name for e in entries] == ["A", "C", "D"]
+
+        entries = await obs.list(ignore_deletes=False)
+        assert [(e.name, bool(e.deleted)) for e in entries] == [
+            ("A", False),
+            ("C", False),
+            ("D", False),
+            ("B", True),
+        ]
+
         await nc.close()
 
     @async_test

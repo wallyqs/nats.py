@@ -569,10 +569,12 @@ class ObjectStore:
 
     async def list(
         self,
-        ignore_deletes=False,
+        ignore_deletes=True,
     ) -> List[api.ObjectInfo]:
         """
         list will list all the objects in this store.
+
+        Deleted objects are left out unless ``ignore_deletes`` is False.
         """
         watcher = await self.watch(ignore_deletes=ignore_deletes)
         entries = []
