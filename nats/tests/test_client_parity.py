@@ -882,6 +882,55 @@ class WebSocketIntrospectionTest(SingleWebSocketServerTestCase):
         await nc.close()
 
 
+class TLSCallbacksTest(TLSServerTestCase):
+    @async_test
+    async def test_tls_callbacks_run_on_every_handshake(self):
+        calls = []
+
+        def roots(ctx):
+            calls.append("roots")
+            ctx.load_verify_locations(get_config_file("certs/ca.pem"))
+
+        def cert(ctx):
+            calls.append("cert")
+            ctx.load_cert_chain(
+                certfile=get_config_file("certs/client-cert.pem"),
+                keyfile=get_config_file("certs/client-key.pem"),
+            )
+
+        reconnected = asyncio.Event()
+
+        async def reconnected_cb():
+            reconnected.set()
+
+        nc = await nats.connect(
+            "nats://127.0.0.1:4224",
+            tls_cert_cb=cert,
+            tls_roots_cb=roots,
+            reconnected_cb=reconnected_cb,
+            reconnect_time_wait=0.1,
+        )
+        self.assertEqual(calls, ["roots", "cert"])
+        self.assertIsInstance(nc.tls_connection_state(), ssl.SSLObject)
+        await nc.force_reconnect()
+        await asyncio.wait_for(reconnected.wait(), 2)
+        self.assertEqual(calls, ["roots", "cert", "roots", "cert"])
+        await nc.close()
+
+    @async_test
+    async def test_tls_roots_cb_replaces_system_roots(self):
+        nc = NATS()
+        # Without the CA the server certificate cannot be verified.
+        with self.assertRaises(nats.errors.TLSError):
+            await nc.connect("tls://127.0.0.1:4224", tls_roots_cb=lambda ctx: None, allow_reconnect=False)
+
+    @async_test
+    async def test_tls_with_callbacks_rejected(self):
+        nc = NATS()
+        with self.assertRaises(nats.errors.Error):
+            await nc.connect("tls://127.0.0.1:4224", tls=self.ssl_ctx, tls_roots_cb=lambda ctx: None)
+
+
 class TLSIntrospectionTest(TLSServerTestCase):
     @async_test
     async def test_tls_connection_state(self):

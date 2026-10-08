@@ -176,6 +176,9 @@ TokenCallback = Callable[[], str]
 CredentialCallback = Callable[[], str]
 # Returns the (user, password) pair; same constraints as CredentialCallback.
 UserInfoCallback = Callable[[], Tuple[str, str]]
+# Loads a client certificate or trusted CAs into the SSLContext built for a
+# TLS handshake (e.g. with load_cert_chain or load_verify_locations).
+TLSContextCallback = Callable[[ssl.SSLContext], None]
 
 
 class RawCredentials(UserString):
@@ -526,6 +529,8 @@ class Client:
         nkey: Optional[str] = None,
         user_info_cb: Optional[UserInfoCallback] = None,
         user_jwt_and_seed: Optional[Tuple[str, str]] = None,
+        tls_cert_cb: Optional[TLSContextCallback] = None,
+        tls_roots_cb: Optional[TLSContextCallback] = None,
     ) -> None:
         """
         Establishes a connection to NATS.
@@ -576,6 +581,12 @@ class Client:
             called on each connection attempt.
         :param user_jwt_and_seed: The user JWT and nkey seed as strings,
             instead of a credentials file.
+        :param tls_cert_cb: Called with a new SSLContext before every TLS
+            handshake to load the client certificate into it, so a rotated
+            certificate is picked up on reconnect. Implies TLS.
+        :param tls_roots_cb: Called with a new SSLContext before every TLS
+            handshake to load the trusted CAs into it (the system ones are
+            then not loaded). Implies TLS.
 
         Connecting setting all callbacks::
 
@@ -742,6 +753,13 @@ class Client:
 
         if tls:
             self.options["tls"] = tls
+        for tls_cb in (tls_cert_cb, tls_roots_cb):
+            if tls_cb is not None and not callable(tls_cb):
+                raise errors.Error("nats: tls_cert_cb and tls_roots_cb must be callable")
+        if tls and (tls_cert_cb is not None or tls_roots_cb is not None):
+            raise errors.Error("nats: tls cannot be combined with tls_cert_cb or tls_roots_cb")
+        self.options["tls_cert_cb"] = tls_cert_cb
+        self.options["tls_roots_cb"] = tls_roots_cb
         if tls_hostname:
             self.options["tls_hostname"] = tls_hostname
 
@@ -1862,8 +1880,29 @@ class Client:
             raise errors.Error("nats: no ssl context provided")
         return ssl_context
 
+    def _handshake_ssl_context(self) -> ssl.SSLContext:
+        """
+        The SSLContext for a TLS handshake. With tls_cert_cb or tls_roots_cb
+        it is built anew each time, as nats.go's ClientTLSConfig callbacks
+        run on every handshake.
+        """
+        cert_cb = self.options.get("tls_cert_cb")
+        roots_cb = self.options.get("tls_roots_cb")
+        if cert_cb is None and roots_cb is None:
+            return self.ssl_context
+        if roots_cb is None:
+            ssl_context = ssl.create_default_context()
+        else:
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            roots_cb(ssl_context)
+        if cert_cb is not None:
+            cert_cb(ssl_context)
+        return ssl_context
+
     def _secure_wanted(self) -> bool:
         if self.options.get("tls") is not None:
+            return True
+        if self.options.get("tls_cert_cb") is not None or self.options.get("tls_roots_cb") is not None:
             return True
         return any(srv.uri.scheme == "tls" for srv in self._server_pool)
 
@@ -1984,7 +2023,7 @@ class Client:
         try:
             await self._transport.connect_tls(
                 uri,
-                self.ssl_context,
+                self._handshake_ssl_context(),
                 DEFAULT_BUFFER_SIZE,
                 self.options["connect_timeout"],
             )
