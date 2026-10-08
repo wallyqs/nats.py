@@ -705,6 +705,157 @@ class PullConsumeTest(SingleJetStreamServerTestCase):
                 await js.delete_stream("CONS")
                 await nc.close()
 
+    async def _capture_pulls(self):
+        # The pull requests, as a second connection sees them.
+        obs = await nats.connect()
+        pulls = []
+
+        async def cb(msg):
+            pulls.append(json.loads(msg.data))
+
+        await obs.subscribe("$JS.API.CONSUMER.MSG.NEXT.>", cb=cb)
+        await obs.flush()
+        return obs, pulls
+
+    async def _wait_for(self, cond, timeout=2):
+        for _ in range(int(timeout / 0.02)):
+            if cond():
+                return
+            await asyncio.sleep(0.02)
+        raise AssertionError("condition not met")
+
+    @async_test
+    async def test_overflow_min_pending_and_min_ack_pending(self):
+        # nats.go PullMinPending and PullMinAckPending, for consumers with
+        # the overflow priority policy.
+        nc, js, consumer = await self._setup(n=2, priority_policy=api.PriorityPolicy.OVERFLOW, priority_groups=["A"])
+        obs, pulls = await self._capture_pulls()
+        received = asyncio.Queue()
+
+        async def cb(msg):
+            await received.put(msg)
+
+        ctx = await consumer.consume(cb, max_messages=10, min_pending=3, group="A")
+        await self._wait_for(lambda: len(pulls) == 1)
+        assert pulls[0]["min_pending"] == 3
+        assert pulls[0]["group"] == "A"
+        assert pulls[0]["batch"] == 10
+        assert "min_ack_pending" not in pulls[0]
+        # Two messages pending, fewer than min_pending: nothing delivered
+        # until a third arrives.
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(received.get(), 0.5)
+        await js.publish("cons.2", b"x")
+        msg = await asyncio.wait_for(received.get(), 2)
+        assert msg.subject == "cons.0"
+        ctx.stop()
+        await ctx.closed()
+
+        pulls.clear()
+        msgs = await consumer.messages(max_messages=10, min_ack_pending=2, group="A")
+        # One message is unacknowledged, fewer than min_ack_pending: the
+        # pull is not served.
+        with pytest.raises(nats.errors.TimeoutError):
+            await msgs.next(timeout=0.5)
+        await self._wait_for(lambda: len(pulls) == 1)
+        assert pulls[0]["min_ack_pending"] == 2
+        assert pulls[0]["group"] == "A"
+        assert "min_pending" not in pulls[0]
+        assert (await consumer.info()).num_ack_pending == 1
+        # Once another client leaves a second one unacknowledged, it is.
+        batch = await consumer.fetch(1, max_wait=1, group="A")
+        assert [m.subject async for m in batch] == ["cons.1"]
+        msg = await msgs.next(timeout=2)
+        assert msg.subject == "cons.2"
+        msgs.stop()
+        await obs.close()
+        await nc.close()
+
+    @async_test
+    async def test_prioritized(self):
+        # nats.go PullPrioritized: the waiting pull of the lowest priority
+        # value gets the messages, whatever the order of the pulls.
+        nc, js, consumer = await self._setup(n=0, priority_policy=api.PriorityPolicy.PRIORITIZED, priority_groups=["A"])
+        obs, pulls = await self._capture_pulls()
+
+        low = await consumer.messages(priority=5, group="A")
+        with pytest.raises(nats.errors.TimeoutError):
+            await low.next(timeout=0.3)
+        await self._wait_for(lambda: len(pulls) == 1)
+        assert pulls[0]["priority"] == 5
+        assert pulls[0]["group"] == "A"
+
+        received = asyncio.Queue()
+
+        async def cb(msg):
+            await received.put(msg)
+
+        ctx = await consumer.consume(cb, priority=1, group="A")
+        await self._wait_for(lambda: len(pulls) == 2)
+        assert pulls[1]["priority"] == 1
+        assert pulls[1]["group"] == "A"
+
+        for i in range(3):
+            await js.publish(f"cons.{i}", b"x")
+        got = [(await asyncio.wait_for(received.get(), 2)).subject for _ in range(3)]
+        assert got == ["cons.0", "cons.1", "cons.2"]
+        with pytest.raises(nats.errors.TimeoutError):
+            await low.next(timeout=0.3)
+
+        # Priority 0, the highest, is the server default and left out.
+        ctx.stop()
+        await ctx.closed()
+        pulls.clear()
+        ctx = await consumer.consume(cb, priority=0, group="A")
+        await self._wait_for(lambda: len(pulls) == 1)
+        assert "priority" not in pulls[0]
+        ctx.stop()
+        low.stop()
+        await obs.close()
+        await nc.close()
+
+    @async_test
+    async def test_threshold_bytes(self):
+        # nats.go PullThresholdBytes: pull again once fewer bytes than the
+        # threshold are pending, instead of half of max_bytes.
+        for threshold, refills, refill_after in ((None, 1, 3), (4500, 3, 1)):
+            with self.subTest(threshold=threshold):
+                nc, js, consumer = await self._setup(n=10, payload=b"a" * 1000)
+                obs, pulls = await self._capture_pulls()
+                handled = 0
+                blocked = asyncio.Event()
+                release = asyncio.Event()
+
+                async def cb(msg):
+                    nonlocal handled
+                    handled += 1
+                    if handled == 4:
+                        blocked.set()
+                        await release.wait()
+
+                kwargs = {"max_bytes": 5000}
+                if threshold:
+                    kwargs["threshold_bytes"] = threshold
+                ctx = await consumer.consume(cb, **kwargs)
+                await asyncio.wait_for(blocked.wait(), 2)
+                await obs.flush()
+                await asyncio.sleep(0.1)
+                # While the fourth message is handled, the pulls made by
+                # the first three: a refill comes once the pending bytes
+                # fall below the threshold, for the bytes handled since the
+                # last pull. By default (2500 bytes) after the third message,
+                # with a 4500 bytes threshold after each.
+                assert pulls[0]["max_bytes"] == 5000
+                assert len(pulls) == 1 + refills
+                size = len("cons.0") + len(ctx._sub.subject) + 1000
+                for pull in pulls[1:]:
+                    assert refill_after * size <= pull["max_bytes"] <= refill_after * (size + 100)
+                release.set()
+                ctx.stop()
+                await ctx.closed()
+                await obs.close()
+                await nc.close()
+
     @async_test
     async def test_consume_stop_after(self):
         nc, js, consumer = await self._setup()
