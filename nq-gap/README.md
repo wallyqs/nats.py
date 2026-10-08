@@ -255,24 +255,24 @@ After the fixes above, every legacy row the audit marked `missing` or `partial` 
 
 An independent read-only re-check of all 596 legacy rows against the final code found every row closed or not applicable, once the follow-up commits closed the last partial rows.
 
-Two areas look different from nats.go to stay compatible with upstream tests:
+The three earlier compatibility exceptions now follow nats.go. Each changed its own commit and updated the upstream test that pinned the old behaviour:
 
-- **KV:**
-  - `keys(filters=)` keeps its substring matching. `list_keys_filtered()` adds nats.go's subject-wildcard listing.
-  - `Entry.operation` stays `None` for a value. `Entry.op` returns a `KeyValueOp`, including `PUT`.
-  - `history()` raises `KeyHistoryNotFoundError`, which is both a `KeyNotFoundError` and a `NoKeysError`.
-- **Object Store:** `get("")` raises `ObjectNameRequiredError`, which is both an `InvalidObjectNameError` and an `ObjectNotFoundError`.
+- **`keys(filters=)`** takes subject patterns (`*`, `>`) and lets the server filter them. It no longer matches substrings.
+- **`Entry.operation`** is a `KeyValueOp` for every entry, `PUT` included. It is never `None`.
+- **An empty object name** raises `ObjectNameRequiredError`, which is no longer an `ObjectNotFoundError`.
+
+`history()` raises `KeyHistoryNotFoundError`, which is both a `KeyNotFoundError` and a `NoKeysError`.
 
 Some nats.go defaults are kept as opt-ins, so existing callers keep their current behaviour:
 - **Reconnect jitter:** defaults to 0.
 - **`retry_on_failed_connect`:** off unless enabled.
 - **Disconnect error:** delivered through the new `disconnected_err_cb`; `disconnected_cb` keeps its zero-argument signature.
 
-The `ErrClientCertOrRootCAsRequired` row is not applicable. Python takes `tls_cert_cb` and `tls_roots_cb` as independent keyword options, so nats.go's "neither callback given" case can't be written.
+`ErrClientCertOrRootCAsRequired` is covered by `connect(client_tls_config=ClientTLSConfig(cert_cb, roots_cb))`. Like nats.go's `ClientTLSConfig`, it raises that error when it has neither callback.
 
 The batch error codes follow nats-server's `errors.json`, not orbit.go's 10202–10206.
 
-Verified at the branch tip: the whole `nats/tests` suite passes against nats-server v2.15.0, with 613 passed and 4 skipped.
+Verified at the branch tip: the whole `nats/tests` suite passes against nats-server v2.15.0, with 614 passed and 4 skipped.
 
 ## Notes on method
 
