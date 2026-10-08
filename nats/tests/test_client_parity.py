@@ -19,6 +19,7 @@ from nats.aio.msg import Msg
 
 from tests.utils import (
     NATSD,
+    ClusteringTestCase,
     SingleServerTestCase,
     TLSServerTestCase,
     async_test,
@@ -717,6 +718,29 @@ class ReconnectDelayTest(SingleServerTestCase):
         nc = NATS()
         nc.options.update(reconnect_time_wait=1)
         self.assertEqual(nc._reconnect_delay(), 1)
+
+
+class IgnoreDiscoveredServersTest(ClusteringTestCase):
+    @async_test
+    async def test_ignore_discovered_servers(self):
+        discovered = []
+
+        async def discovered_server_cb():
+            discovered.append(True)
+
+        nc = await nats.connect(
+            "nats://127.0.0.1:4223", ignore_discovered_servers=True, discovered_server_cb=discovered_server_cb
+        )
+        control = await nats.connect("nats://127.0.0.1:4223")
+        await asyncio.get_running_loop().run_in_executor(None, start_natsd, self.server_pool[1])
+        while len(control.discovered_servers) == 0:
+            await asyncio.sleep(0.05)
+        await nc.flush()
+        self.assertEqual(len(nc.servers), 1)
+        self.assertEqual(nc.discovered_servers, [])
+        self.assertEqual(discovered, [])
+        await nc.close()
+        await control.close()
 
 
 if __name__ == "__main__":

@@ -492,6 +492,7 @@ class Client:
         custom_reconnect_delay_cb: Optional[ReconnectDelayHandler] = None,
         reconnect_jitter: float = 0,
         reconnect_jitter_tls: float = 0,
+        ignore_discovered_servers: bool = False,
     ) -> None:
         """
         Establishes a connection to NATS.
@@ -534,6 +535,8 @@ class Client:
             added to reconnect_time_wait, so that clients do not all reconnect
             at once.
         :param reconnect_jitter_tls: Like reconnect_jitter, for TLS connections.
+        :param ignore_discovered_servers: Do not add the servers the cluster
+            announces to the server pool; only the given servers are used.
 
         Connecting setting all callbacks::
 
@@ -680,6 +683,7 @@ class Client:
         self.options["custom_reconnect_delay_cb"] = custom_reconnect_delay_cb
         self.options["reconnect_jitter"] = reconnect_jitter
         self.options["reconnect_jitter_tls"] = reconnect_jitter_tls
+        self.options["ignore_discovered_servers"] = ignore_discovered_servers
 
         if tls:
             self.options["tls"] = tls
@@ -2506,7 +2510,7 @@ class Client:
         with latest updates from cluster to enable server discovery.
         """
         assert self._current_server, "Client.connect must be called first"
-        if "connect_urls" in info:
+        if "connect_urls" in info and not self.options.get("ignore_discovered_servers", False):
             if info["connect_urls"]:
                 connect_urls = []
                 for connect_url in info["connect_urls"]:
