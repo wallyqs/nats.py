@@ -1031,7 +1031,7 @@ class OrderedConsumerConfig:
     - ``inactive_threshold``: seconds before an unused consumer is removed
       by the server (5 minutes by default).
     - ``max_reset_attempts``: attempts to recreate the consumer before giving
-      up; ``None`` or 0 retries without limit.
+      up with OrderedConsumerResetError; ``None`` or 0 retries without limit.
     - ``name_prefix``: prefix of the consumer names, ``<prefix>_<n>``; a NUID
       by default.
     """
@@ -1187,9 +1187,12 @@ class OrderedConsumer:
                     info = await self._js.add_consumer(self._stream, config=config)
                     self._current = PullConsumer(self._js, self._stream, info.name, info)
                     return
-                except Exception:
+                except Exception as e:
                     if 0 < attempts <= attempt + 1:
-                        raise
+                        reason = str(e)
+                        if reason.startswith("nats: "):
+                            reason = reason[len("nats: ") :]
+                        raise nats.js.errors.OrderedConsumerResetError(reason) from e
                 attempt += 1
                 await asyncio.sleep(interval)
                 interval = min(2 * interval, _ORDERED_BACKOFF_MAX)

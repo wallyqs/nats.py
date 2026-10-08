@@ -1012,12 +1012,43 @@ class OrderedConsumerTest(SingleJetStreamServerTestCase):
         oc = await js.ordered_consumer("ORD", nats.js.consume.OrderedConsumerConfig(max_reset_attempts=1))
         assert (await oc.info()).name == oc.cached_info().name
         await js.delete_stream("ORD")
-        with pytest.raises(NotFoundError):
+        # nats.go ErrOrderedConsumerReset, chained from the last attempt's error.
+        with pytest.raises(OrderedConsumerResetError) as err:
             await oc.fetch(1)
+        assert isinstance(err.value.__cause__, StreamNotFoundError)
+        assert err.value.api_error is err.value.__cause__
+        assert err.value.api_error.err_code == 10059
+        assert str(err.value).startswith("nats: recreating ordered consumer: StreamNotFoundError")
         assert oc.cached_info() is None
         with pytest.raises(OrderedConsumerNotCreatedError):
             await oc.info()
         assert str(OrderedConsumerResetError()) == "nats: recreating ordered consumer"
+        await nc.close()
+
+    @async_test
+    async def test_consume_recreate_fails(self):
+        nc, js = await self._setup()
+        oc = await js.ordered_consumer("ORD", nats.js.consume.OrderedConsumerConfig(max_reset_attempts=2))
+        received = []
+        errors = []
+
+        async def cb(msg):
+            received.append(msg)
+
+        async def error_cb(ctx, err):
+            errors.append(err)
+
+        cc = await oc.consume(cb, error_cb=error_cb, expires=2)
+        for _ in range(50):
+            if len(received) == 10:
+                break
+            await asyncio.sleep(0.1)
+        await js.delete_stream("ORD")
+        # One failed attempt and a 1s backoff before the last one.
+        await asyncio.wait_for(cc.closed(), 10)
+        resets = [e for e in errors if isinstance(e, OrderedConsumerResetError)]
+        assert len(resets) == 1
+        assert isinstance(resets[0].__cause__, StreamNotFoundError)
         await nc.close()
 
 

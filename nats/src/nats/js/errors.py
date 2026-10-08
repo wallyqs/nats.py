@@ -737,11 +737,22 @@ class OrderedConsumerNotCreatedError(Error):
 
 class OrderedConsumerResetError(Error):
     """
-    Signals that an ordered consumer is being recreated (nats.go ErrOrderedConsumerReset).
+    Raised when an ordered consumer could not be recreated within its
+    ``max_reset_attempts`` (nats.go ErrOrderedConsumerReset). The error of
+    the last attempt is its ``__cause__`` and its description.
     """
 
     def __str__(self) -> str:
+        if self.description:
+            return f"nats: recreating ordered consumer: {self.description}"
         return "nats: recreating ordered consumer"
+
+    @property
+    def api_error(self) -> Optional[APIError]:
+        cause = self.__cause__
+        if isinstance(cause, Error):
+            return cause.api_error
+        return None
 
 
 class NoStreamResponseError(Error):
