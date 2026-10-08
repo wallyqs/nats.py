@@ -73,6 +73,14 @@ class EndpointConfig:
     """Subscribe without a queue group, so that every service instance receives each request.
     When not set, it is inherited from the parent group or service unless a queue group is set."""
 
+    pending_msgs_limit: Optional[int] = None
+    """The maximum number of messages the endpoint's subscription buffers.
+    A negative value means no limit; when not set, the client's default is used."""
+
+    pending_bytes_limit: Optional[int] = None
+    """The maximum number of bytes the endpoint's subscription buffers.
+    A negative value means no limit; when not set, the client's default is used."""
+
     def __post_init__(self) -> None:
         if not self.name:
             raise ConfigValidationError("Name cannot be empty.")
@@ -91,6 +99,19 @@ class EndpointConfig:
         if self.queue_group:
             if not SUBJECT_REGEX.match(self.queue_group):
                 raise ConfigValidationError("Invalid queue group. Queue group must not contain spaces.")
+
+        if self.pending_msgs_limit == 0 and self.pending_bytes_limit == 0:
+            raise ConfigValidationError("at least one pending limit must be non-zero")
+
+        if self.pending_msgs_limit == 0 or self.pending_bytes_limit == 0:
+            raise ConfigValidationError("pending limits must be non-zero, use a negative value for no limit")
+
+    def with_metadata_key(self, key: str, value: str) -> EndpointConfig:
+        """Returns a copy of the configuration with one metadata entry set,
+        keeping the other entries (nats.go's WithEndpointMetadataKey)."""
+        metadata = dict(self.metadata or {})
+        metadata[key] = value
+        return replace(self, metadata=metadata)
 
 
 @dataclass
@@ -246,6 +267,8 @@ class Endpoint:
             self._queue_group = config.queue_group or DEFAULT_QUEUE_GROUP
         self._handler = config.handler
         self._metadata = config.metadata
+        self._pending_msgs_limit = config.pending_msgs_limit
+        self._pending_bytes_limit = config.pending_bytes_limit
 
         self._num_requests = 0
         self._num_errors = 0
@@ -258,10 +281,18 @@ class Endpoint:
     async def _start(self) -> None:
         assert not self._subscription
 
+        limits: Dict[str, int] = {}
+        # Negative limits mean no limit, which the client spells as zero.
+        if self._pending_msgs_limit is not None:
+            limits["pending_msgs_limit"] = max(self._pending_msgs_limit, 0)
+        if self._pending_bytes_limit is not None:
+            limits["pending_bytes_limit"] = max(self._pending_bytes_limit, 0)
+
         self._subscription = await self._service._client.subscribe(
             subject=self._subject,
             queue=self._queue_group,
             cb=self._handle_request,
+            **limits,
         )
 
     async def _stop(self) -> None:
@@ -339,6 +370,8 @@ class EndpointManager(Protocol):
         subject: Optional[str] = None,
         metadata: Optional[Dict[str, str]] = None,
         queue_group_disabled: bool = False,
+        pending_msgs_limit: Optional[int] = None,
+        pending_bytes_limit: Optional[int] = None,
     ) -> None: ...
 
     async def add_endpoint(self, config: Optional[EndpointConfig] = None, **kwargs) -> None: ...
@@ -380,6 +413,8 @@ class Group(GroupManager, EndpointManager):
         subject: Optional[str] = None,
         metadata: Optional[Dict[str, str]] = None,
         queue_group_disabled: bool = False,
+        pending_msgs_limit: Optional[int] = None,
+        pending_bytes_limit: Optional[int] = None,
     ) -> None: ...
 
     async def add_endpoint(self, config: Optional[EndpointConfig] = None, **kwargs) -> None:
@@ -732,6 +767,8 @@ class Service(AsyncContextManager):
         subject: Optional[str] = None,
         metadata: Optional[Dict[str, str]] = None,
         queue_group_disabled: bool = False,
+        pending_msgs_limit: Optional[int] = None,
+        pending_bytes_limit: Optional[int] = None,
     ) -> None: ...
 
     async def add_endpoint(self, config: Optional[EndpointConfig] = None, **kwargs) -> None:

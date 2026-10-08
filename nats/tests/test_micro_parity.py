@@ -291,3 +291,69 @@ class MicroQueueGroupTest(SingleServerTestCase):
         for svc in services:
             await svc.stop()
         await nc.close()
+
+
+class MicroEndpointOptionsTest(SingleServerTestCase):
+    def test_pending_limits_validation(self):
+        with self.assertRaises(ConfigValidationError) as ctx:
+            EndpointConfig(name="e", handler=noop_handler, pending_msgs_limit=0, pending_bytes_limit=0)
+        self.assertEqual(str(ctx.exception), "at least one pending limit must be non-zero")
+        with self.assertRaises(ConfigValidationError):
+            EndpointConfig(name="e", handler=noop_handler, pending_msgs_limit=0, pending_bytes_limit=10)
+        EndpointConfig(name="e", handler=noop_handler, pending_msgs_limit=-1, pending_bytes_limit=10)
+        EndpointConfig(name="e", handler=noop_handler, pending_msgs_limit=5)
+
+    @async_test
+    async def test_pending_limits(self):
+        slow = []
+
+        async def error_cb(e):
+            if isinstance(e, nats.errors.SlowConsumerError):
+                slow.append(e)
+
+        release = asyncio.Event()
+
+        async def handler(request: Request):
+            await release.wait()
+            await request.respond(b"ok")
+
+        nc = await nats.connect(error_cb=error_cb)
+        svc = await add_service(nc, name="svc", version="0.1.0")
+        await svc.add_endpoint(name="limited", handler=handler, pending_msgs_limit=1, pending_bytes_limit=-1)
+        await svc.add_endpoint(name="unlimited", handler=handler, pending_msgs_limit=-1, pending_bytes_limit=-1)
+
+        subs = {e._subject: e._subscription for e in svc._endpoints}
+        self.assertEqual(subs["limited"]._pending_msgs_limit, 1)
+        self.assertEqual(subs["limited"]._pending_bytes_limit, 0)
+        self.assertEqual(subs["unlimited"]._pending_msgs_limit, 0)
+
+        for _ in range(5):
+            await nc.publish("limited", b"x")
+            await nc.publish("unlimited", b"x")
+        await nc.flush()
+        await asyncio.sleep(0.2)
+        self.assertTrue(slow)
+        self.assertTrue(all(e.subject == "limited" for e in slow))
+
+        release.set()
+        await svc.stop()
+        await nc.close()
+
+    @async_test
+    async def test_metadata_key(self):
+        config = EndpointConfig(name="e", handler=noop_handler, metadata={"a": "1"})
+        updated = config.with_metadata_key("b", "2").with_metadata_key("a", "3")
+        self.assertEqual(config.metadata, {"a": "1"})
+        self.assertEqual(updated.metadata, {"a": "3", "b": "2"})
+        self.assertEqual(
+            EndpointConfig(name="e", handler=noop_handler).with_metadata_key("k", "v").metadata,
+            {"k": "v"},
+        )
+
+        nc = await nats.connect()
+        svc = await add_service(nc, name="svc", version="0.1.0")
+        await svc.add_endpoint(updated)
+        info = await nc.request(control_subject(ServiceVerb.INFO, "svc"), b"", timeout=1)
+        self.assertEqual(json.loads(info.data)["endpoints"][0]["metadata"], {"a": "3", "b": "2"})
+        await svc.stop()
+        await nc.close()
