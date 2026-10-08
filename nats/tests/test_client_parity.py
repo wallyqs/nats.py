@@ -412,6 +412,35 @@ class FakeServerErrorsTest(unittest.IsolatedAsyncioTestCase):
             await nc.close()
 
 
+class FakeServerInfoTest(unittest.IsolatedAsyncioTestCase):
+    async def test_client_id_and_ip_not_supported(self):
+        # A server whose INFO has neither client_id nor client_ip.
+        async with FakeServer({}) as server:
+            nc = await nats.connect(server.url, allow_reconnect=False)
+            with self.assertRaises(nats.errors.ClientIDNotSupportedError):
+                nc.get_client_id()
+            with self.assertRaises(nats.errors.ClientIPNotSupportedError):
+                nc.get_client_ip()
+            await nc.close()
+
+        async with FakeServer({"client_id": 7, "client_ip": "10.0.0.1"}) as server:
+            nc = await nats.connect(server.url, allow_reconnect=False)
+            self.assertEqual(nc.get_client_id(), 7)
+            self.assertEqual(nc.get_client_ip(), "10.0.0.1")
+            await nc.close()
+            with self.assertRaises(nats.errors.ConnectionClosedError):
+                nc.get_client_id()
+
+    async def test_cluster_domain_and_system_account(self):
+        info = {"cluster": "C1", "domain": "hub", "acc_is_sys": True}
+        async with FakeServer(info) as server:
+            nc = await nats.connect(server.url, allow_reconnect=False)
+            self.assertEqual(nc.connected_cluster_name, "C1")
+            self.assertEqual(nc.connected_domain, "hub")
+            self.assertTrue(nc.is_system_account)
+            await nc.close()
+
+
 class TLSErrorTest(TLSServerTestCase):
     @async_test
     async def test_tls_error(self):
