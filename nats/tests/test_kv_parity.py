@@ -1,7 +1,9 @@
 import asyncio
 
 import nats
+import nats.errors
 import nats.js.api
+import nats.js.kv
 import pytest
 from nats.js.errors import (
     APIError,
@@ -11,6 +13,7 @@ from nats.js.errors import (
     BucketNotFoundError,
     BucketRequiredError,
     InvalidBucketNameError,
+    InvalidKeyError,
     KeyNotFoundError,
     KeyRevisionMismatchError,
     KeyValueConfigRequiredError,
@@ -370,5 +373,107 @@ class KVListTest(SingleJetStreamServerTestCase):
             assert isinstance(status, nats.js.kv.KeyValue.BucketStatus)
             assert status.values == 1
             assert status.backing_store == "JetStream"
+
+        await nc.close()
+
+
+async def _initial(watcher):
+    """The entries a watcher delivers before its None marker."""
+    entries = []
+    while True:
+        entry = await watcher.updates(timeout=2)
+        if entry is None:
+            return entries
+        entries.append(entry)
+
+
+class KVWatchOptionsTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_watch_updates_only(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        kv = await js.create_key_value(bucket="UPDATES")
+        await kv.put("a", b"1")
+        await kv.put("b", b"2")
+
+        watcher = await kv.watchall(updates_only=True)
+        # No initial values and no None marker.
+        with pytest.raises(nats.errors.TimeoutError):
+            await watcher.updates(timeout=0.3)
+
+        await kv.put("c", b"3")
+        entry = await watcher.updates(timeout=2)
+        assert entry.key == "c"
+        assert entry.value == b"3"
+        await watcher.stop()
+
+        # Also when the bucket is empty.
+        empty = await js.create_key_value(bucket="UPDATES_EMPTY")
+        watcher = await empty.watch("x", updates_only=True)
+        with pytest.raises(nats.errors.TimeoutError):
+            await watcher.updates(timeout=0.3)
+        await empty.put("x", b"1")
+        assert (await watcher.updates(timeout=2)).key == "x"
+        await watcher.stop()
+
+        await nc.close()
+
+    @async_test
+    async def test_watch_resume_from_revision(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        kv = await js.create_key_value(bucket="RESUME", history=5)
+        await kv.put("a", b"1")
+        await kv.put("b", b"2")
+        await kv.put("a", b"3")
+        await kv.put("c", b"4")
+
+        watcher = await kv.watchall(resume_from_revision=2, include_history=True)
+        entries = await _initial(watcher)
+        assert [(e.key, e.revision) for e in entries] == [("b", 2), ("a", 3), ("c", 4)]
+        await kv.put("d", b"5")
+        assert (await watcher.updates(timeout=2)).revision == 5
+        await watcher.stop()
+
+        await nc.close()
+
+    @async_test
+    async def test_watch_filtered(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        kv = await js.create_key_value(bucket="FILTERED")
+        await kv.put("orders.1", b"o1")
+        await kv.put("users.1", b"u1")
+        await kv.put("users.2.name", b"n")
+        await kv.put("other", b"x")
+
+        watcher = await kv.watch_filtered(["orders.*", "users.>"])
+        entries = await _initial(watcher)
+        assert sorted(e.key for e in entries) == ["orders.1", "users.1", "users.2.name"]
+
+        await kv.put("other", b"y")
+        await kv.put("orders.2", b"o2")
+        entry = await watcher.updates(timeout=2)
+        assert entry.key == "orders.2"
+        await watcher.stop()
+
+        # An empty list watches every key.
+        watcher = await kv.watch_filtered([])
+        entries = await _initial(watcher)
+        assert sorted(e.key for e in entries) == ["orders.1", "orders.2", "other", "users.1", "users.2.name"]
+        await watcher.stop()
+
+        # A single pattern works like watch().
+        watcher = await kv.watch_filtered(["users.*"], updates_only=True)
+        await kv.put("users.3", b"u3")
+        assert (await watcher.updates(timeout=2)).key == "users.3"
+        await watcher.stop()
+
+        with pytest.raises(InvalidKeyError):
+            await kv.watch_filtered(["bad key"])
+        with pytest.raises(InvalidKeyError):
+            await kv.watch_filtered(["orders."])
+
+        assert nats.js.kv.ALL_KEYS == ">"
 
         await nc.close()

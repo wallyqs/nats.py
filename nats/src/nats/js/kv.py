@@ -38,12 +38,22 @@ KV_MARKER_REASON = "Nats-Marker-Reason"
 logger = logging.getLogger(__name__)
 
 VALID_KEY_RE = re.compile(r"^[-/_=\.a-zA-Z0-9]+$")
+VALID_SEARCH_KEY_RE = re.compile(r"^[-/_=\.a-zA-Z0-9*]*[>]?$")
+
+# ALL_KEYS is the key pattern that matches all the keys of a bucket.
+ALL_KEYS = ">"
 
 
 def _is_key_valid(key: str) -> bool:
     if len(key) == 0 or key[0] == "." or key[-1] == ".":
         return False
     return bool(VALID_KEY_RE.match(key))
+
+
+def _is_search_key_valid(key: str) -> bool:
+    if len(key) == 0 or key[0] == "." or key[-1] == ".":
+        return False
+    return bool(VALID_SEARCH_KEY_RE.match(key))
 
 
 class StopIterSentinel:
@@ -534,7 +544,7 @@ class KeyValue:
         """
         watchall returns a KeyValue watcher that matches all the keys.
         """
-        return await self.watch(">", **kwargs)
+        return await self.watch(ALL_KEYS, **kwargs)
 
     async def keys(self, filters: List[str] = None, **kwargs) -> List[str]:
         """
@@ -606,15 +616,75 @@ class KeyValue:
         ignore_deletes=False,
         meta_only=False,
         inactive_threshold=None,
+        updates_only=False,
+        resume_from_revision: Optional[int] = None,
     ) -> KeyWatcher:
         """
         watch will fire a callback when a key that matches the keys
         pattern is updated.
         The first update after starting the watch is None in case
         there are no pending updates.
+
+        :param updates_only: Only deliver updates made after the watch
+            starts; no initial values and no None marker are delivered.
+        :param resume_from_revision: Deliver the updates starting at this
+            revision of the bucket.
         """
-        subject = f"{self._pre}{keys}"
+        return await self._watch(
+            [f"{self._pre}{keys}"],
+            include_history=include_history,
+            ignore_deletes=ignore_deletes,
+            meta_only=meta_only,
+            inactive_threshold=inactive_threshold,
+            updates_only=updates_only,
+            resume_from_revision=resume_from_revision,
+        )
+
+    async def watch_filtered(
+        self,
+        keys: List[str],
+        include_history: bool = False,
+        ignore_deletes: bool = False,
+        meta_only: bool = False,
+        inactive_threshold: Optional[float] = None,
+        updates_only: bool = False,
+        resume_from_revision: Optional[int] = None,
+    ) -> KeyWatcher:
+        """
+        watch_filtered watches the keys matching any of the given subject
+        patterns (e.g. ``["orders.*", "users.>"]``); an empty list watches
+        all the keys. The options are those of watch().
+        """
+        for key in keys:
+            if not _is_search_key_valid(key):
+                raise nats.js.errors.InvalidKeyError(key)
+        if not keys:
+            keys = [ALL_KEYS]
+        return await self._watch(
+            [f"{self._pre}{key}" for key in keys],
+            include_history=include_history,
+            ignore_deletes=ignore_deletes,
+            meta_only=meta_only,
+            inactive_threshold=inactive_threshold,
+            updates_only=updates_only,
+            resume_from_revision=resume_from_revision,
+        )
+
+    async def _watch(
+        self,
+        subjects: List[str],
+        include_history=False,
+        ignore_deletes=False,
+        meta_only=False,
+        inactive_threshold=None,
+        updates_only=False,
+        resume_from_revision: Optional[int] = None,
+    ) -> KeyWatcher:
         watcher = KeyValue.KeyWatcher(self)
+        # With updates only there are no initial values to signal the end of
+        # (nats.go marks the initialization as done).
+        if updates_only:
+            watcher._init_done = True
         init_setup: asyncio.Future[bool] = asyncio.Future()
 
         async def watch_updates(msg):
@@ -666,18 +736,30 @@ class KeyValue:
                 await watcher._updates.put(None)
                 watcher._init_done = True
 
+        # As nats.go, the last of these deliver policies applies.
+        config = None
         deliver_policy = None
         if not include_history:
             deliver_policy = api.DeliverPolicy.LAST_PER_SUBJECT
+        if updates_only:
+            deliver_policy = api.DeliverPolicy.NEW
+        if resume_from_revision is not None and resume_from_revision > 0:
+            deliver_policy = api.DeliverPolicy.BY_START_SEQUENCE
+            config = api.ConsumerConfig(opt_start_seq=resume_from_revision)
+        if len(subjects) > 1:
+            if config is None:
+                config = api.ConsumerConfig()
+            config.filter_subjects = subjects
 
         # Cleanup watchers after 5 minutes of inactivity by default.
         if not inactive_threshold:
             inactive_threshold = 5 * 60
 
         watcher._sub = await self._js.subscribe(
-            subject,
+            subjects[0],
             stream=self._stream,
             cb=watch_updates,
+            config=config,
             ordered_consumer=True,
             deliver_policy=deliver_policy,
             headers_only=meta_only,
@@ -697,7 +779,7 @@ class KeyValue:
             # so need to check those that have already made it.
             received = watcher._sub.delivered
             init_setup.set_result(True)
-            if cinfo.num_pending == 0 and received == 0:
+            if cinfo.num_pending == 0 and received == 0 and not watcher._init_done:
                 await watcher._updates.put(None)
                 watcher._init_done = True
         except Exception as err:
