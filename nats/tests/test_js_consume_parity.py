@@ -6,6 +6,7 @@ import unittest
 
 import nats
 import nats.js.api
+import nats.js.consume
 import pytest
 from nats.aio.msg import Msg
 from nats.js import api
@@ -592,4 +593,231 @@ class PullConsumerFetchTest(SingleJetStreamServerTestCase):
 
         batch = await consumer.fetch(1, max_wait=1, group="A")
         assert len([m async for m in batch]) == 1
+        await nc.close()
+
+
+class PullConsumeTest(SingleJetStreamServerTestCase):
+    async def _setup(self, n=10, payload=b"x", **config):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="CONS", subjects=["cons.>"])
+        for i in range(n):
+            await js.publish(f"cons.{i}", payload)
+        await js.add_consumer("CONS", durable_name="dur", ack_policy="explicit", **config)
+        consumer = await js.pull_consumer("CONS", "dur")
+        return nc, js, consumer
+
+    async def _silent_consumer(self, nc):
+        # A consumer handle whose pulls reach a subscriber that never
+        # answers: no messages, no heartbeats.
+        await nc.subscribe("silent.api.>")
+        js = nc.jetstream(prefix="silent.api")
+        return nats.js.consume.PullConsumer(js, "S", "C")
+
+    @async_test
+    async def test_consume(self):
+        nc, js, consumer = await self._setup()
+        received = []
+        done = asyncio.Event()
+
+        async def cb(msg):
+            received.append(msg.subject)
+            await msg.ack()
+            if len(received) == 10:
+                done.set()
+
+        ctx = await consumer.consume(cb, max_messages=3)
+        await asyncio.wait_for(done.wait(), 3)
+        assert received == [f"cons.{i}" for i in range(10)]
+        assert not ctx.is_closed
+        ctx.stop()
+        await asyncio.wait_for(ctx.closed(), 1)
+        assert ctx.is_closed
+        await nc.close()
+
+    @async_test
+    async def test_consume_by_bytes(self):
+        for kwargs in ({"max_bytes": 3000}, {"max_messages": 4, "bytes_limit": 2500}):
+            with self.subTest(**kwargs):
+                nc, js, consumer = await self._setup(payload=b"a" * 1000)
+                received = []
+                done = asyncio.Event()
+
+                async def cb(msg):
+                    received.append(msg)
+                    await msg.ack()
+                    if len(received) == 10:
+                        done.set()
+
+                ctx = await consumer.consume(cb, **kwargs)
+                await asyncio.wait_for(done.wait(), 4)
+                ctx.stop()
+                await ctx.closed()
+                await js.delete_stream("CONS")
+                await nc.close()
+
+    @async_test
+    async def test_consume_stop_after(self):
+        nc, js, consumer = await self._setup()
+        received = []
+
+        async def cb(msg):
+            received.append(msg)
+            await msg.ack()
+
+        ctx = await consumer.consume(cb, max_messages=3, stop_after=4)
+        await asyncio.wait_for(ctx.closed(), 3)
+        assert len(received) == 4
+        info = await consumer.info()
+        assert info.num_pending == 6
+        await nc.close()
+
+    @async_test
+    async def test_consume_drain(self):
+        nc, js, consumer = await self._setup()
+        received = []
+
+        async def cb(msg):
+            received.append(msg)
+            if len(received) == 1:
+                ctx.drain()
+            await asyncio.sleep(0.01)
+
+        ctx = await consumer.consume(cb, max_messages=5)
+        await asyncio.wait_for(ctx.closed(), 3)
+        # The messages of the first pull were all handled, and no more pulled.
+        assert len(received) == 5
+        await nc.close()
+
+    @async_test
+    async def test_consume_errors(self):
+        nc, js, consumer = await self._setup(n=0)
+        errors = []
+
+        def error_cb(ctx, err):
+            errors.append((ctx, err))
+
+        async def cb(msg):
+            pass
+
+        ctx = await consumer.consume(cb, error_cb=error_cb)
+        await asyncio.sleep(0.2)
+        await js.delete_consumer("CONS", "dur")
+        await asyncio.wait_for(ctx.closed(), 3)
+        assert len(errors) == 1
+        assert errors[0][0] is ctx
+        assert isinstance(errors[0][1], ConsumerDeletedError)
+        await nc.close()
+
+    @async_test
+    async def test_consume_missing_heartbeat(self):
+        nc = await nats.connect()
+        consumer = await self._silent_consumer(nc)
+        errors = []
+
+        async def error_cb(ctx, err):
+            errors.append(err)
+
+        async def cb(msg):
+            pass
+
+        ctx = await consumer.consume(cb, expires=1, heartbeat=0.5, error_cb=error_cb)
+        await asyncio.sleep(1.4)
+        assert len(errors) == 1
+        assert isinstance(errors[0], NoHeartbeatError)
+        # Consuming goes on with a new pull.
+        assert not ctx.is_closed
+        ctx.stop()
+        await ctx.closed()
+        await nc.close()
+
+    @async_test
+    async def test_messages(self):
+        nc, js, consumer = await self._setup()
+        msgs = await consumer.messages(max_messages=4)
+        received = []
+        async for msg in msgs:
+            received.append(msg.subject)
+            await msg.ack()
+            if len(received) == 10:
+                msgs.stop()
+        assert received == [f"cons.{i}" for i in range(10)]
+        with pytest.raises(MsgIteratorClosedError):
+            await msgs.next()
+
+        msgs = await consumer.messages()
+        with pytest.raises(nats.errors.TimeoutError):
+            await msgs.next(timeout=0.3)
+        msgs.stop()
+        await nc.close()
+
+    @async_test
+    async def test_messages_stop_after_and_drain(self):
+        nc, js, consumer = await self._setup()
+        msgs = await consumer.messages(max_messages=4, stop_after=3)
+        received = [msg async for msg in msgs]
+        assert len(received) == 3
+        for msg in received:
+            await msg.ack()
+
+        msgs = await consumer.messages(max_messages=4)
+        first = await msgs.next(timeout=1)
+        await asyncio.sleep(0.2)
+        msgs.drain()
+        # The rest of the first pull is still delivered after draining.
+        rest = [msg async for msg in msgs]
+        assert [m.metadata.sequence.stream for m in [first] + rest] == [4, 5, 6, 7]
+        await nc.close()
+
+    @async_test
+    async def test_messages_missing_heartbeat(self):
+        nc = await nats.connect()
+        consumer = await self._silent_consumer(nc)
+        msgs = await consumer.messages(expires=1, heartbeat=0.5)
+        start = time.monotonic()
+        with pytest.raises(NoHeartbeatError):
+            await msgs.next()
+        assert 0.9 < time.monotonic() - start < 1.5
+        msgs.stop()
+
+        msgs = await consumer.messages(expires=1, heartbeat=0.5, err_on_missing_heartbeat=False)
+        with pytest.raises(nats.errors.TimeoutError):
+            await msgs.next(timeout=1.5)
+        msgs.stop()
+        await nc.close()
+
+    @async_test
+    async def test_invalid_options(self):
+        nc, js, consumer = await self._setup(n=0)
+
+        async def cb(msg):
+            pass
+
+        with pytest.raises(HandlerRequiredError):
+            await consumer.consume(None)
+        for kwargs in (
+            {"max_messages": 10, "max_bytes": 100},
+            {"max_bytes": 100, "bytes_limit": 100},
+            {"max_messages": 0},
+            {"expires": 0.5},
+            {"heartbeat": 0.1},
+            {"expires": 2, "heartbeat": 1.5},
+            {"stop_after": 0},
+            {"group": "A"},
+        ):
+            with self.subTest(**kwargs):
+                with pytest.raises(ValueError):
+                    await consumer.consume(cb, **kwargs)
+                with pytest.raises(ValueError):
+                    await consumer.messages(**kwargs)
+
+        await js.add_consumer(
+            "CONS", durable_name="grouped", priority_policy=api.PriorityPolicy.OVERFLOW, priority_groups=["A"]
+        )
+        grouped = await js.pull_consumer("CONS", "grouped")
+        for group in (None, "B"):
+            with pytest.raises(ValueError):
+                await grouped.messages(group=group)
+        msgs = await grouped.messages(group="A")
+        msgs.stop()
         await nc.close()
