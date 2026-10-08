@@ -540,8 +540,10 @@ class KVHandleTest(SingleJetStreamServerTestCase):
         entry = await kv.get("greeting")
         assert entry.value == "héllo".encode()
         assert entry.revision == rev
-        # A value keeps operation None, as before; op names it.
-        assert entry.operation is None
+        # A value's operation is PUT, as nats.go's KeyValuePut.
+        assert entry.operation is KeyValueOp.PUT
+        assert entry.operation == "PUT"
+        assert str(entry.operation) == "KeyValuePutOp"
         assert entry.op is KeyValueOp.PUT
 
         await kv.delete("greeting")

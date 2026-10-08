@@ -3940,7 +3940,7 @@ class KVTest(SingleJetStreamServerTestCase):
         assert e.key == "t.name"
         assert e.value == b"b"
         assert e.revision == 10
-        assert e.operation == None
+        assert e.operation == "PUT"
 
         e = await w.updates()
         assert e.bucket == "WATCH"
@@ -3948,7 +3948,7 @@ class KVTest(SingleJetStreamServerTestCase):
         assert e.key == "t.age"
         assert e.value == b"d"
         assert e.revision == 12
-        assert e.operation == None
+        assert e.operation == "PUT"
 
         e = await w.updates()
         assert e.bucket == "WATCH"
@@ -3956,7 +3956,7 @@ class KVTest(SingleJetStreamServerTestCase):
         assert e.key == "t.a"
         assert e.value == b"a"
         assert e.revision == 13
-        assert e.operation == None
+        assert e.operation == "PUT"
 
         # Consume next pending update.
         e = await w.updates()
@@ -3965,7 +3965,7 @@ class KVTest(SingleJetStreamServerTestCase):
         assert e.key == "t.b"
         assert e.value == b"b"
         assert e.revision == 14
-        assert e.operation == None
+        assert e.operation == "PUT"
 
         # There are no more updates so client will be sent a marker to signal
         # that there are no more updates.
@@ -4561,7 +4561,7 @@ class KVLimitMarkerTTLTest(SingleJetStreamServerTestCase):
         assert entry is not None
         assert entry.key == "age"
         assert entry.value == b"30"
-        assert entry.operation is None
+        assert entry.operation == "PUT"
 
         # None marker: initial state is delivered
         none_entry = await watcher.updates(timeout=3.0)

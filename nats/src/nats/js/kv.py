@@ -43,8 +43,9 @@ class KeyValueOp(str, Enum):
     """
     KeyValueOp is the operation of a KeyValue entry (nats.go KeyValueOp).
 
-    The values are the KV-Operation header tokens, so they compare equal
-    to Entry.operation; str() gives nats.go's names.
+    Entry.operation holds one of these. The values are the KV-Operation
+    header tokens, so they compare equal to "PUT", "DEL" and "PURGE";
+    str() gives nats.go's names.
     """
 
     PUT = "PUT"
@@ -146,8 +147,7 @@ class KeyValue:
         @property
         def op(self) -> KeyValueOp:
             """
-            op returns the entry's operation as a KeyValueOp; unlike
-            operation, which is None for a value, it is PUT then.
+            op returns the entry's operation as a KeyValueOp.
             """
             if self.operation == KV_DEL:
                 return KeyValueOp.DELETE
@@ -327,14 +327,14 @@ class KeyValue:
             revision=msg.seq,
             delta=0,
             created=msg.time,
-            operation=None,
+            operation=KeyValueOp.PUT,
         )
 
         # Check headers to see if deleted or purged.
         if msg.headers:
             op = msg.headers.get(KV_OP, None)
             if op == KV_DEL or op == KV_PURGE:
-                entry.operation = op
+                entry.operation = KeyValueOp(op)
                 raise nats.js.errors.KeyDeletedError(entry, op)
 
         return entry
@@ -871,7 +871,7 @@ class KeyValue:
                 revision=meta.sequence.stream,
                 delta=meta.num_pending,
                 created=meta.timestamp,
-                operation=op,
+                operation=KeyValueOp(op) if op else KeyValueOp.PUT,
             )
             await watcher._updates.put(entry)
 
