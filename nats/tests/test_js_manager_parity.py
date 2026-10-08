@@ -827,3 +827,45 @@ class StreamHandleTest(SingleJetStreamServerTestCase):
         with pytest.raises(Error):
             await handle.consumer("pull")
         await nc.close()
+
+
+class StreamSourceInfoTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_source_and_mirror_seq(self):
+        # nats.go StreamSourceInfo.Seq: the last sequence of the origin
+        # stream that was sourced.
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="ORIGIN", subjects=["origin.>"])
+        for i in range(3):
+            await js.publish(f"origin.{i}", b"x")
+        await js.add_stream(name="SOURCED", sources=[api.StreamSource(name="ORIGIN", filter_subject="origin.>")])
+        await js.add_stream(name="MIRRORED", mirror=api.StreamSource(name="ORIGIN"))
+
+        async def synced(name, n):
+            for _ in range(50):
+                info = await js.stream_info(name)
+                if info.state.messages == n:
+                    return info
+                await asyncio.sleep(0.05)
+            raise AssertionError(f"{name} did not reach {n} messages")
+
+        info = await synced("SOURCED", 3)
+        assert len(info.sources) == 1
+        source = info.sources[0]
+        assert isinstance(source, api.StreamSourceInfo)
+        assert source.name == "ORIGIN"
+        assert source.seq == 3
+        assert source.lag == 0
+        assert source.filter_subject == "origin.>"
+        info = await synced("MIRRORED", 3)
+        assert info.mirror.name == "ORIGIN"
+        # nats-server only reports it for sources (stream.go sourcesInfo),
+        # so a mirror's is left unset, as nats.go's omitempty zero.
+        assert info.mirror.seq is None
+
+        # The sequence follows what is sourced next.
+        await js.publish("origin.3", b"x")
+        info = await synced("SOURCED", 4)
+        assert info.sources[0].seq == 4
+        await nc.close()
