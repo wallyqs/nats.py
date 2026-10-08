@@ -1655,7 +1655,7 @@ class JetStreamContext(JetStreamManager):
 
     async def object_store(self, bucket: str) -> ObjectStore:
         if VALID_BUCKET_RE.match(bucket) is None:
-            raise InvalidBucketNameError
+            raise nats.js.errors.InvalidStoreNameError
 
         stream = OBJ_STREAM_TEMPLATE.format(bucket=bucket)
         try:
@@ -1685,7 +1685,7 @@ class JetStreamContext(JetStreamManager):
         config = config.evolve(**params)
 
         if VALID_BUCKET_RE.match(config.bucket) is None:
-            raise InvalidBucketNameError
+            raise nats.js.errors.InvalidStoreNameError
 
         name = config.bucket
         chunks = OBJ_ALL_CHUNKS_PRE_TEMPLATE.format(bucket=name)
@@ -1723,7 +1723,7 @@ class JetStreamContext(JetStreamManager):
         delete_object_store will delete the underlying stream for the named object.
         """
         if VALID_BUCKET_RE.match(bucket) is None:
-            raise InvalidBucketNameError
+            raise nats.js.errors.InvalidStoreNameError
 
         stream = OBJ_STREAM_TEMPLATE.format(bucket=bucket)
         return await self.delete_stream(stream)

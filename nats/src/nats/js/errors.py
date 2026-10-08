@@ -357,6 +357,54 @@ class InvalidDigestFormatError(Error):
         return "nats: object digest hash has invalid format"
 
 
+class InvalidStoreNameError(InvalidBucketNameError):
+    """
+    Raised when an Object Store bucket name is not valid.
+    """
+
+    def __str__(self) -> str:
+        return "nats: invalid object-store name"
+
+
+class ObjectNameRequiredError(InvalidObjectNameError, ObjectNotFoundError):
+    """
+    Raised when an Object Store operation is given an empty object name.
+
+    It is an ObjectNotFoundError too, which is what looking up an empty
+    name used to raise.
+    """
+
+    def __str__(self) -> str:
+        return "nats: name is required"
+
+
+class NoObjectsFoundError(NotFoundError):
+    """
+    Raised when listing an Object Store that has no objects.
+    """
+
+    def __str__(self) -> str:
+        return "nats: no objects found"
+
+
+class UpdateMetaDeletedError(ObjectDeletedError):
+    """
+    Raised when updating the meta of an object that is missing or deleted.
+    """
+
+    def __str__(self) -> str:
+        return "nats: cannot update meta for a deleted object"
+
+
+class LinkNotAllowedError(Error):
+    """
+    Raised when putting an object whose meta options carry a link.
+    """
+
+    def __str__(self) -> str:
+        return "nats: link cannot be set when putting the object in bucket"
+
+
 class KeyValueLimitMarkerTTLNotSupportedError(Error):
     """
     Raised when limit_marker_ttl is used but the connected server does not support it (pre-2.11).

@@ -31,10 +31,13 @@ from nats.js.errors import (
     InvalidDigestFormatError,
     InvalidObjectNameError,
     LinkIsABucketError,
+    LinkNotAllowedError,
+    NoObjectsFoundError,
     NotFoundError,
     ObjectAlreadyExists,
-    ObjectDeletedError,
+    ObjectNameRequiredError,
     ObjectNotFoundError,
+    UpdateMetaDeletedError,
 )
 from nats.js.kv import MSG_ROLLUP_SUBJECT, StopIterSentinel
 
@@ -175,6 +178,8 @@ class ObjectStore:
         """
         get_info will retrieve the current information for the object.
         """
+        if not name:
+            raise ObjectNameRequiredError
         obj = name
 
         meta = OBJ_META_PRE_TEMPLATE.format(
@@ -291,6 +296,8 @@ class ObjectStore:
             )
 
         _check_object_name(meta.name)
+        if meta.options.link is not None:
+            raise LinkNotAllowedError
         obj = meta.name
         einfo = None
 
@@ -415,8 +422,10 @@ class ObjectStore:
         info = None
         try:
             info = await self.get_info(name)
+        except ObjectNameRequiredError:
+            raise
         except ObjectNotFoundError:
-            raise ObjectDeletedError
+            raise UpdateMetaDeletedError
 
         # A rename may only take a name that is unused or deleted.
         if name != meta.name:
@@ -616,6 +625,6 @@ class ObjectStore:
         await watcher.stop()
 
         if not entries:
-            raise NotFoundError
+            raise NoObjectsFoundError
 
         return entries
