@@ -707,7 +707,13 @@ class KeyValue:
 
         return keys
 
-    async def history(self, key: str, ignore_deletes: bool = False, meta_only: bool = False) -> List[Entry]:
+    async def history(
+        self,
+        key: str,
+        ignore_deletes: bool = False,
+        meta_only: bool = False,
+        resume_from_revision: Optional[int] = None,
+    ) -> List[Entry]:
         """
         history retrieves a list of the entries so far.
 
@@ -716,12 +722,14 @@ class KeyValue:
 
         :param ignore_deletes: Leave out delete and purge markers.
         :param meta_only: Retrieve the entries without their values.
+        :param resume_from_revision: Start the history at this revision.
         """
         watcher = await self.watch(
             key,
             include_history=True,
             ignore_deletes=ignore_deletes,
             meta_only=meta_only,
+            resume_from_revision=resume_from_revision,
         )
 
         entries = []

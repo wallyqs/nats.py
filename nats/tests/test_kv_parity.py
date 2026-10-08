@@ -599,6 +599,10 @@ class KVHistoryTest(SingleJetStreamServerTestCase):
         assert len(history) == 3
         assert all(not e.value for e in history)
 
+        # As nats.go's History with ResumeFromRevision.
+        history = await kv.history("a", resume_from_revision=2)
+        assert [(e.revision, e.op) for e in history] == [(2, KeyValueOp.PUT), (3, KeyValueOp.DELETE)]
+
         await nc.close()
 
 
