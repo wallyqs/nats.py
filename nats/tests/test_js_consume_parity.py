@@ -770,6 +770,19 @@ class PullConsumeTest(SingleJetStreamServerTestCase):
         await nc.close()
 
     @async_test
+    async def test_fetch_missing_heartbeat(self):
+        nc = await nats.connect()
+        consumer = await self._silent_consumer(nc)
+        start = time.monotonic()
+        batch = await consumer.fetch(1, max_wait=3, heartbeat=0.5)
+        assert [m async for m in batch] == []
+        assert isinstance(batch.error, NoHeartbeatError)
+        assert 0.9 < time.monotonic() - start < 1.5
+        with pytest.raises(NoHeartbeatError):
+            await consumer.next(max_wait=3, heartbeat=0.5)
+        await nc.close()
+
+    @async_test
     async def test_messages_missing_heartbeat(self):
         nc = await nats.connect()
         consumer = await self._silent_consumer(nc)
