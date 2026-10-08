@@ -612,3 +612,28 @@ class ObjectStoreBucketExistsTest(SingleJetStreamServerTestCase):
         assert err.bucket == "OBJEXISTS"
 
         await nc.close()
+
+
+class KVPurgeKeyValidationTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_purge_rejects_invalid_keys(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        kv = await js.create_key_value(bucket="PURGEKEYS", history=5)
+        await kv.put("a.b", b"1")
+
+        for key in ("", ".a", "a.", "a b", "bad*key", "a.>.b"):
+            with self.subTest(key=key):
+                with pytest.raises(InvalidKeyError):
+                    await kv.purge(key)
+
+        # Nothing was published for the rejected keys.
+        status = await kv.status()
+        assert status.values == 1
+
+        # Whole-token wildcards keep working, as before.
+        await kv.purge("a.*")
+        with pytest.raises(KeyNotFoundError):
+            await kv.get("a.b")
+
+        await nc.close()

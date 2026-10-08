@@ -78,6 +78,22 @@ def _is_search_key_valid(key: str) -> bool:
     return bool(VALID_SEARCH_KEY_RE.match(key))
 
 
+def _is_purge_key_valid(key: str) -> bool:
+    # A purge accepts a key, or a pattern whose wildcards are whole tokens
+    # (purging "hello.*" is supported); anything else is rejected as nats.go does.
+    if _is_key_valid(key):
+        return True
+    if not _is_search_key_valid(key):
+        return False
+    tokens = key.split(".")
+    for i, token in enumerate(tokens):
+        if token == "*" or (token == ">" and i == len(tokens) - 1):
+            continue
+        if not token or not VALID_KEY_RE.match(token):
+            return False
+    return True
+
+
 class StopIterSentinel:
     """A sentinel class used to indicate that iteration should stop."""
 
@@ -477,6 +493,7 @@ class KeyValue:
         key: str,
         msg_ttl: Optional[float] = None,
         last: Optional[int] = None,
+        validate_keys: bool = True,
     ) -> bool:
         """
         purge will remove the key and all revisions.
@@ -485,7 +502,11 @@ class KeyValue:
         :param msg_ttl: Optional TTL (time-to-live) in seconds for the purge marker
         :param last: Expected last revision number (for optimistic concurrency);
             raises KeyRevisionMismatchError when it is not the latest one
+        :param validate_keys: Whether to validate the key format
         """
+        if validate_keys and not _is_purge_key_valid(key):
+            raise nats.js.errors.InvalidKeyError
+
         hdrs = {}
         hdrs[KV_OP] = KV_PURGE
         hdrs[api.Header.ROLLUP] = MSG_ROLLUP_SUBJECT
