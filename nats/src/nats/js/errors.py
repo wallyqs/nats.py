@@ -660,6 +660,33 @@ class TooManyStalledMsgsError(Error):
         return "nats: stalled with too many outstanding async published messages"
 
 
+class AsyncPublishTimeoutError(Error):
+    """
+    Raised by an async publish future when its acknowledgement did not arrive in time.
+    """
+
+    def __str__(self) -> str:
+        return "nats: timeout waiting for ack"
+
+
+class JetStreamPublisherClosedError(Error):
+    """
+    Raised by the pending async publish futures when the publisher is cleaned up.
+    """
+
+    def __str__(self) -> str:
+        return "nats: jetstream context closed"
+
+
+class AsyncPublishReplySubjectSetError(Error):
+    """
+    Raised when an async published message has a reply subject.
+    """
+
+    def __str__(self) -> str:
+        return "nats: reply subject should be empty"
+
+
 class FetchTimeoutError(nats.errors.TimeoutError):
     """
     Raised if the consumer timed out waiting for messages.

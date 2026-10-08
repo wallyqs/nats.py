@@ -284,3 +284,143 @@ class InvalidResponseTest(SingleJetStreamServerTestCase):
             await jsm.stream_info("FOO")
         assert str(err.value) == "nats: invalid jetstream api response"
         await nc.close()
+
+
+class PublishAsyncTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_pub_ack_future(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="PAF", subjects=["paf"])
+
+        future = await js.publish_async("paf", b"hello", headers={"X": "1"}, msg_id="id-1")
+        assert isinstance(future, asyncio.Future)
+        assert isinstance(future, nats.js.client.PubAckFuture)
+        assert future.msg.subject == "paf"
+        assert future.msg.data == b"hello"
+        assert future.msg.headers == {"X": "1", api.Header.MSG_ID: "id-1"}
+        ack = await future.ok()
+        assert ack.seq == 1
+        assert await future.err() is None
+        assert future.result() is ack
+
+        future = await js.publish_async("paf", b"x", stream="OTHER")
+        err = await future.err()
+        assert isinstance(err, APIError)
+        with pytest.raises(APIError):
+            await future.ok()
+        await nc.close()
+
+    @async_test
+    async def test_ack_and_err_handlers(self):
+        nc = await nats.connect()
+        acks = []
+        errs = []
+
+        async def ack_handler(js, msg, ack):
+            acks.append((js, msg, ack))
+
+        def err_handler(js, msg, err):
+            errs.append((js, msg, err))
+
+        js = nc.jetstream(publish_async_ack_handler=ack_handler, publish_async_err_handler=err_handler)
+        await js.add_stream(name="HANDLERS", subjects=["handlers"])
+        ok = await js.publish_async("handlers", b"1")
+        bad = await js.publish_async("handlers", b"2", stream="OTHER")
+        await js.publish_async_complete(timeout=1)
+        await asyncio.sleep(0.05)
+
+        assert len(acks) == 1 and len(errs) == 1
+        assert acks[0][0] is js
+        assert acks[0][1] is ok.msg
+        assert acks[0][2].seq == 1
+        assert errs[0][1] is bad.msg
+        assert isinstance(errs[0][2], APIError)
+        await nc.close()
+
+    @async_test
+    async def test_timeout(self):
+        nc = await nats.connect()
+        errs = []
+
+        async def err_handler(js, msg, err):
+            errs.append(err)
+
+        # A responder that never answers.
+        await nc.subscribe("silent")
+        js = nc.jetstream(publish_async_timeout=0.3, publish_async_err_handler=err_handler)
+        assert js.options.publish_async_timeout == 0.3
+        future = await js.publish_async("silent", b"x")
+        assert js.publish_async_pending() == 1
+        with pytest.raises(nats.errors.TimeoutError):
+            await js.publish_async_complete(timeout=0.1)
+        with pytest.raises(AsyncPublishTimeoutError) as err:
+            await asyncio.wait_for(future, 1)
+        assert str(err.value) == "nats: timeout waiting for ack"
+        assert js.publish_async_pending() == 0
+        await js.publish_async_complete(timeout=0.1)
+        await asyncio.sleep(0.05)
+        assert len(errs) == 1 and isinstance(errs[0], AsyncPublishTimeoutError)
+
+        with pytest.raises(ValueError):
+            nc.jetstream(publish_async_max_pending=0)
+        await nc.close()
+
+    @async_test
+    async def test_cleanup_publisher(self):
+        nc = await nats.connect()
+        js = nc.jetstream(publish_async_max_pending=3)
+        await js.add_stream(name="CLEANUP", subjects=["cleanup"])
+        await nc.subscribe("silent")
+
+        futures = [await js.publish_async("silent", b"x") for _ in range(3)]
+        assert js.publish_async_pending() == 3
+        with pytest.raises(TooManyStalledMsgsError):
+            await js.publish_async("silent", b"x", wait_stall=0.1)
+
+        await js.cleanup_publisher()
+        assert js.publish_async_pending() == 0
+        for future in futures:
+            with pytest.raises(JetStreamPublisherClosedError):
+                await future
+        await js.publish_async_complete(timeout=0.1)
+
+        # The publisher is set up again on the next publish, with capacity freed.
+        future = await js.publish_async("cleanup", b"y")
+        assert (await asyncio.wait_for(future, 1)).seq == 1
+        await nc.close()
+
+    @async_test
+    async def test_publish_msg_async(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="PMA", subjects=["pma"])
+
+        with pytest.raises(AsyncPublishReplySubjectSetError):
+            await js.publish_msg_async(Msg(_client=nc, subject="pma", reply="inbox", data=b"x"))
+        future = await js.publish_msg_async(Msg(_client=nc, subject="pma", data=b"x", headers={"A": "b"}), msg_id="1")
+        ack = await asyncio.wait_for(future, 1)
+        assert ack.seq == 1
+        msg = await js.get_msg("PMA", 1)
+        assert msg.headers["A"] == "b"
+        await nc.close()
+
+    @async_test
+    async def test_retry_on_no_responders(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        future = await js.publish_async("aretry.a", b"x")
+        with pytest.raises(NoStreamResponseError):
+            await asyncio.wait_for(future, 1)
+
+        async def add_stream():
+            await asyncio.sleep(0.3)
+            await js.add_stream(name="ARETRY", subjects=["aretry.>"])
+
+        task = asyncio.create_task(add_stream())
+        future = await js.publish_async("aretry.a", b"x", retry_attempts=20, retry_wait=0.1)
+        ack = await asyncio.wait_for(future, 3)
+        assert ack.stream == "ARETRY"
+        await task
+        await nc.close()

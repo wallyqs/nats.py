@@ -116,6 +116,8 @@ class JetStreamOptions:
     default_timeout: float = 5
     client_trace: Optional[ClientTrace] = None
     publish_async_max_pending: Optional[int] = None
+    # Seconds an async publish waits for its acknowledgement (None: forever).
+    publish_async_timeout: Optional[float] = None
 
 
 class StatusCode(str, Enum):
