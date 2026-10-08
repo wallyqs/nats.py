@@ -1018,6 +1018,30 @@ class PullConsumeTest(SingleJetStreamServerTestCase):
         assert len(received) == 1
 
     @async_test
+    async def test_ordered_connection_closed(self):
+        nc, js, consumer = await self._setup(n=0)
+        errors = []
+
+        async def cb(msg):
+            pass
+
+        oc = await js.ordered_consumer("CONS")
+        ctx = await oc.consume(cb, error_cb=lambda ctx, err: errors.append(err))
+        await asyncio.sleep(0.2)
+        await nc.close()
+        await asyncio.wait_for(ctx.closed(), 2)
+        assert [type(e) for e in errors] == [nats.errors.ConnectionClosedError]
+
+        nc, js, consumer = await self._setup(n=0)
+        oc = await js.ordered_consumer("CONS")
+        msgs = await oc.messages()
+        pending = asyncio.ensure_future(msgs.next())
+        await asyncio.sleep(0.2)
+        await nc.close()
+        with pytest.raises(nats.errors.ConnectionClosedError):
+            await asyncio.wait_for(pending, 2)
+
+    @async_test
     async def test_fetch_missing_heartbeat(self):
         nc = await nats.connect()
         consumer = await self._silent_consumer(nc)
