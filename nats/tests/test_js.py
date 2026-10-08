@@ -4199,6 +4199,20 @@ class KVTest(SingleJetStreamServerTestCase):
         await nc.close()
 
     @async_test
+    async def test_kv_placement(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        placement = nats.js.api.Placement(cluster="C1", tags=["a", "b"])
+        kv = await js.create_key_value(bucket="PLACED", placement=placement)
+        await kv.put("hello", b"world")
+
+        si = await js.stream_info("KV_PLACED")
+        assert si.config.placement == placement
+
+        await nc.close()
+
+    @async_test
     async def test_kv_republish(self):
         errors = []
 

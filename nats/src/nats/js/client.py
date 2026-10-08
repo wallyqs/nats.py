@@ -1603,6 +1603,7 @@ class JetStreamContext(JetStreamManager):
             num_replicas=config.replicas,
             storage=config.storage,
             republish=config.republish,
+            placement=config.placement,
             subject_delete_marker_ttl=subject_delete_marker_ttl,
         )
         si = await self.add_stream(stream)
