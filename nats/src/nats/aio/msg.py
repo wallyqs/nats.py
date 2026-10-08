@@ -93,16 +93,21 @@ class Msg:
             raise Error("sid not set")
         return self._sid
 
-    async def respond(self, data: bytes) -> None:
+    async def respond(self, data: bytes, headers: Optional[Dict[str, str]] = None) -> None:
         """
         respond replies to the inbox of the message if there is one.
+
+        The reply carries ``headers`` when given, otherwise the message's
+        own headers.
         """
         if not self.reply:
             raise Error("no reply subject available")
         if not self._client:
             raise Error("client not set")
 
-        await self._client.publish(self.reply, data, headers=self.headers)
+        if headers is None:
+            headers = self.headers
+        await self._client.publish(self.reply, data, headers=headers)
 
     async def ack(self) -> None:
         """

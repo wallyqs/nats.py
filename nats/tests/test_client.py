@@ -1503,6 +1503,41 @@ class ClientTest(SingleServerTestCase):
         await nc.close()
 
     @async_test
+    async def test_msg_respond_with_headers(self):
+        nc = NATS()
+
+        async def echo(msg):
+            await msg.respond(b"echo")
+
+        async def custom(msg):
+            await msg.respond(b"custom", headers={"Reply-Header": "yes"})
+
+        async def empty(msg):
+            await msg.respond(b"empty", headers={})
+
+        await nc.connect()
+        await nc.subscribe("respond.echo", cb=echo)
+        await nc.subscribe("respond.custom", cb=custom)
+        await nc.subscribe("respond.empty", cb=empty)
+
+        request_headers = {"Request-Header": "1"}
+
+        # Without headers, the reply keeps carrying the request headers.
+        resp = await nc.request("respond.echo", b"", headers=request_headers, timeout=1)
+        self.assertEqual(resp.data, b"echo")
+        self.assertEqual(resp.headers, request_headers)
+
+        resp = await nc.request("respond.custom", b"", headers=request_headers, timeout=1)
+        self.assertEqual(resp.data, b"custom")
+        self.assertEqual(resp.headers, {"Reply-Header": "yes"})
+
+        resp = await nc.request("respond.empty", b"", headers=request_headers, timeout=1)
+        self.assertEqual(resp.data, b"empty")
+        self.assertFalse(resp.headers)
+
+        await nc.close()
+
+    @async_test
     async def test_authentication_expired_uses_reconnect_path(self):
         nc = NATS()
         processed_errors: List[Exception] = []
