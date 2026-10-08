@@ -218,6 +218,36 @@ All of these were confirmed by reading the source at `db5f8da`.
 - **Legacy micro `reset()`.** `Service.reset()` only resets `started` (`nats/src/nats/micro/service.py:749`). Endpoint request and error counts and processing times are never cleared.
 - **Legacy pause fields.** `ConsumerInfo.pause_remaining` is typed `str`, but the server sends an integer number of nanoseconds. Reported by the audit; not re-checked.
 
+## Legacy fixes on this branch
+
+Each legacy nats-py defect above, plus the others the audit turned up, is fixed in its own commit. Every commit adds a regression test, and each test was confirmed to fail without its fix.
+
+| Commit | Fix |
+|---|---|
+| `0f988bc` | A `tls://` URL or a `tls=` context now forces TLS, and raises `SecureConnWantedError` when the server offers none. |
+| `7820a23` | `ObjectStore.update_meta` renames work: it checks the new name, publishes under it, and purges the old name. |
+| `5cb65fe` | micro `Service.reset()` clears every endpoint's statistics. |
+| `4d4d83e` | micro `respond_error` rejects an empty code or description, and counts explicit error responses. |
+| `dacef6a` | micro `control_subject` rejects an ID without a name, and treats empty strings as absent. |
+| `ae0ddcb` | `pause_remaining` on `ConsumerInfo` and `ConsumerPause` is converted from nanoseconds to seconds. |
+| `d6ce4c5` | `KeyValueConfig.placement` reaches the bucket's stream. |
+| `0a18fb5` | `ObjectWatcher.stop()` ends an `async for` loop that is already waiting. |
+| `c9d2ba0` | `put` and `update_meta` raise `InvalidObjectNameError` for an empty name, so no chunks are orphaned. |
+| `34079c2` | `Msg.respond(data, headers=...)`; without `headers` it still echoes the request's headers. |
+| `9488d8b` | A pull fetch reports terminal 409s instead of timing out. These are Consumer Deleted, push based, and MaxRequestBatch, MaxRequestExpires and MaxRequestMaxBytes exceeded. |
+| `bf613ad` | Object `mtime` is filled from the server's timestamp in `get_info` and in watch updates. |
+| `77162a8` | `ObjectStore.list()` hides deleted objects by default. |
+| `43e13fb` | `KeyValue.get` fills `created` and `delta`, and a deleted entry carries `DEL` or `PURGE`. |
+
+These were deliberately left as they are:
+
+- **`keys(filters=)` substring matching.** The upstream test `test_keys_with_filters` relies on it.
+- **`operation is None` for KV puts.** Upstream tests assert it.
+- **`get("")` raising `ObjectNotFoundError`.** An upstream test relies on it.
+- **`respond_error` header precedence.**
+
+The remaining legacy rows in the audit are missing features, not defects.
+
 ## Notes on method
 
 - Some calls were judgement calls:
