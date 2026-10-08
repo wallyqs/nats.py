@@ -810,9 +810,17 @@ class StreamHandleTest(SingleJetStreamServerTestCase):
         with pytest.raises(NotPushConsumerError):
             await stream.push_consumer("pull")
 
-        osub = await stream.ordered_consumer()
-        msg = await osub.next_msg(timeout=1)
+        # The pull-based ordered consumer (nats.go Stream.OrderedConsumer).
+        oc = await stream.ordered_consumer()
+        assert isinstance(oc, nats.js.consume.OrderedConsumer)
+        msg = await oc.next(max_wait=1)
         assert msg.subject == "handle.b"
+        oc = await stream.ordered_consumer(
+            nats.js.consume.OrderedConsumerConfig(filter_subjects=["handle.a"], name_prefix="ord")
+        )
+        assert oc.cached_info().name == "ord_1"
+        assert oc.cached_info().config.filter_subject == "handle.a"
+        assert [m async for m in await oc.fetch(1, max_wait=0.5)] == []
 
         jsm = nc.jsm()
         handle = await jsm.stream("HANDLE")

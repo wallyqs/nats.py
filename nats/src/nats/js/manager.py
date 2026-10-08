@@ -49,7 +49,7 @@ from nats.js.errors import (
 if TYPE_CHECKING:
     from nats import NATS
     from nats.aio.msg import Msg
-    from nats.js.consume import PullConsumer, PushConsumer
+    from nats.js.consume import OrderedConsumer, OrderedConsumerConfig, PullConsumer, PushConsumer
 
 NATS_HDR_LINE = bytearray(b"NATS/1.0")
 NATS_HDR_LINE_SIZE = len(NATS_HDR_LINE)
@@ -1166,12 +1166,11 @@ class Stream:
         """
         return await self._context().push_consumer(self._name, name)
 
-    async def ordered_consumer(self, subject: str = ">", cb: Optional[Any] = None, **params) -> Any:
+    async def ordered_consumer(self, config: Optional[OrderedConsumerConfig] = None) -> OrderedConsumer:
         """
-        Returns an ordered consumer of the stream's messages on the subject
-        (nats.go Stream.OrderedConsumer): a push subscription whose
-        ephemeral consumer is recreated in order whenever a delivery is
-        missed. ``params`` are passed to JetStreamContext.subscribe.
+        Returns a pull-based ordered consumer of the stream (nats.go
+        Stream.OrderedConsumer): messages are delivered in order and
+        without acks, its ephemeral consumer being recreated whenever a
+        delivery is missed; see JetStreamContext.ordered_consumer.
         """
-        js = self._context()
-        return await js.subscribe(subject, cb=cb, stream=self._name, ordered_consumer=True, **params)
+        return await self._context().ordered_consumer(self._name, config)
