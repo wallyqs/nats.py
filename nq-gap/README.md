@@ -259,7 +259,12 @@ After the fixes above, every legacy row the audit marked `missing` or `partial` 
 - the test that exercises it,
 - `file:line` evidence.
 
-A final read-only check against the tip found all 596 rows closed, and every row cites a test that exists. The defects found outside the symbol inventory are in the commit table above.
+A final read-only check against the tip found all 596 rows closed. A mechanical re-check then confirmed, for every row:
+- each cited commit is on this branch,
+- each cited commit changes the row's evidence file or test file,
+- every `file:line` exists.
+
+All 238 distinct cited tests pass against nats-server v2.15.0, including a three-node cluster test for the Leadership Change status. The defects found outside the symbol inventory are in the commit table above.
 
 The three earlier compatibility exceptions now follow nats.go. Each changed its own commit and updated the upstream test that pinned the old behaviour:
 
