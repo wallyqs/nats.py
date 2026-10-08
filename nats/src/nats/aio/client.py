@@ -1432,6 +1432,11 @@ class Client:
             raise errors.Error("nats: no ssl context provided")
         return ssl_context
 
+    def _secure_wanted(self) -> bool:
+        if self.options.get("tls") is not None:
+            return True
+        return any(srv.uri.scheme == "tls" for srv in self._server_pool)
+
     async def _send_command(self, cmd: bytes) -> None:
         self._pending.append(cmd)
         self._pending_data_size += len(cmd)
@@ -2279,11 +2284,15 @@ class Client:
         if "client_ip" in self._server_info:
             self._client_ip = self._server_info["client_ip"]
 
-        if (
-            "tls_required" in self._server_info
-            and self._server_info["tls_required"]
-            and self._current_server.uri.scheme != "ws"
-        ):
+        scheme = self._current_server.uri.scheme
+        tls_required = bool(self._server_info.get("tls_required", False))
+        # A tls:// URL or an explicit TLS context asks for a secure connection
+        # even when the server does not require one, as nats.go's Secure option.
+        secure = scheme not in ("ws", "wss") and self._secure_wanted()
+        if secure and not tls_required and not self._server_info.get("tls_available", False):
+            raise errors.SecureConnWantedError
+
+        if (tls_required and scheme != "ws") or secure:
             if not handshake_first:
                 await self._transport.drain()  # just in case something is left
 

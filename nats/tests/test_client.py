@@ -2572,6 +2572,36 @@ class ClientTLSTest(TLSServerTestCase):
         await nc.close()
 
 
+class ClientSecureWantedTest(SingleServerTestCase):
+    @async_test
+    async def test_tls_scheme_against_server_without_tls(self):
+        nc = NATS()
+
+        # A tls:// URL must not silently fall back to plaintext.
+        with self.assertRaises(nats.errors.SecureConnWantedError):
+            await nc.connect("tls://127.0.0.1:4222", allow_reconnect=False)
+        self.assertFalse(nc.is_connected)
+
+    @async_test
+    async def test_tls_context_against_server_without_tls(self):
+        nc = NATS()
+
+        # An explicit TLS context must not silently fall back to plaintext.
+        with self.assertRaises(nats.errors.SecureConnWantedError):
+            await nc.connect(
+                "nats://127.0.0.1:4222",
+                tls=ssl.create_default_context(),
+                allow_reconnect=False,
+            )
+        self.assertFalse(nc.is_connected)
+
+    @async_test
+    async def test_plaintext_without_tls_options(self):
+        nc = await nats.connect("nats://127.0.0.1:4222")
+        self.assertTrue(nc.is_connected)
+        await nc.close()
+
+
 class ClientTLSReconnectTest(MultiTLSServerAuthTestCase):
     @async_test
     async def test_tls_reconnect(self):
