@@ -565,6 +565,30 @@ class ObjectStore:
 
         return info
 
+    async def put_bytes(self, name: str, data: bytes) -> api.ObjectInfo:
+        """
+        put_bytes places the bytes into this object-store under ``name``.
+        """
+        return await self.put(name, bytes(data))
+
+    async def put_string(self, name: str, data: str) -> api.ObjectInfo:
+        """
+        put_string places the UTF-8 encoded string into this object-store under ``name``.
+        """
+        return await self.put(name, data.encode())
+
+    async def put_file(self, file: str, name: Optional[str] = None) -> api.ObjectInfo:
+        """
+        put_file places the contents of the file at path ``file`` into this
+        object-store, named by the path unless ``name`` is given.
+        """
+        loop = asyncio.get_running_loop()
+        f = await loop.run_in_executor(None, open, file, "rb")
+        try:
+            return await self.put(file if name is None else name, f)
+        finally:
+            await loop.run_in_executor(None, f.close)
+
     async def status(self) -> ObjectStoreStatus:
         """
         status retrieves runtime status about a bucket.

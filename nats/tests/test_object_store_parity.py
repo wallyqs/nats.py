@@ -552,3 +552,41 @@ class ObjectReaderTest(SingleJetStreamServerTestCase):
         assert await obs.get_bytes("A", show_deleted=True) == b""
 
         await nc.close()
+
+
+class ObjectPutConvenienceTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_put_bytes_string_file(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        obs = await js.create_object_store("PUTCONV")
+
+        info = await obs.put_bytes("B", b"bytes")
+        assert info.name == "B"
+        assert info.size == 5
+        assert await obs.get_bytes("B") == b"bytes"
+
+        info = await obs.put_string("S", "héllo")
+        assert info.size == len("héllo".encode())
+        assert await obs.get_string("S") == "héllo"
+
+        data = os.urandom(300 * 1024)
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        tmp.write(data)
+        tmp.close()
+        try:
+            # Named by its path, as nats.go's PutFile.
+            info = await obs.put_file(tmp.name)
+            assert info.name == tmp.name
+            assert info.size == len(data)
+            assert info.chunks == 3
+            assert info.digest == get_object_digest_value(sha256(data))
+            assert await obs.get_bytes(tmp.name) == data
+
+            info = await obs.put_file(tmp.name, name="F")
+            assert info.name == "F"
+            assert await obs.get_bytes("F") == data
+        finally:
+            os.unlink(tmp.name)
+
+        await nc.close()
