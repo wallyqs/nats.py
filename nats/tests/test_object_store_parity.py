@@ -1,5 +1,6 @@
 import base64
 import binascii
+import io
 import json
 import unittest
 from hashlib import sha256
@@ -8,17 +9,24 @@ import nats
 import nats.js.api
 import pytest
 from nats.js.errors import (
+    BucketMalformedError,
+    BucketRequiredError,
     DigestMismatchError,
     InvalidBucketNameError,
     InvalidDigestFormatError,
     InvalidObjectNameError,
     InvalidStoreNameError,
+    LinkIsABucketError,
     LinkNotAllowedError,
+    NoLinkToDeletedError,
+    NoLinkToLinkError,
     NoObjectsFoundError,
     NotFoundError,
+    ObjectAlreadyExists,
     ObjectDeletedError,
     ObjectNameRequiredError,
     ObjectNotFoundError,
+    ObjectRequiredError,
     UpdateMetaDeletedError,
 )
 from nats.js.kv import MSG_ROLLUP_SUBJECT
@@ -218,5 +226,107 @@ class ObjectMetadataTest(SingleJetStreamServerTestCase):
         raw = await js.get_last_msg("OBJ_OBJMETA", "$O.OBJMETA.M.Qg==")
         assert "metadata" not in json.loads(raw.data)
         assert (await obs.get_info("B")).metadata is None
+
+        await nc.close()
+
+
+class ObjectLinkTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_add_link(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        obs = await js.create_object_store("LINKS")
+        other = await js.create_object_store("OTHER")
+
+        a = await obs.put("A", b"AAA")
+        b = await other.put("B", b"BBB")
+
+        # Link in the same bucket.
+        link = await obs.add_link("toA", a)
+        assert link.name == "toA"
+        assert link.bucket == "LINKS"
+        assert link.is_link()
+        assert link.options.link.bucket == "LINKS"
+        assert link.options.link.name == "A"
+        assert link.mtime is not None
+
+        info = await obs.get_info("toA")
+        assert info.is_link()
+        assert info.size == 0
+        res = await obs.get("toA")
+        assert res.data == b"AAA"
+        assert res.info.name == "A"
+
+        # Link to another bucket, followed when writing into a file too.
+        await obs.add_link("toB", b)
+        assert (await obs.get("toB")).data == b"BBB"
+        buf = io.BytesIO()
+        await obs.get("toB", writeinto=buf)
+        assert buf.getvalue() == b"BBB"
+
+        # A link may replace a link.
+        link = await obs.add_link("toA", b)
+        assert (await obs.get("toA")).data == b"BBB"
+
+        # But not an object, even a deleted one.
+        with pytest.raises(ObjectAlreadyExists):
+            await obs.add_link("A", b)
+        await obs.put("D", b"D")
+        await obs.delete("D")
+        with pytest.raises(ObjectAlreadyExists):
+            await obs.add_link("D", b)
+
+        # The checks on the arguments.
+        with pytest.raises(ObjectNameRequiredError):
+            await obs.add_link("", a)
+        with pytest.raises(ObjectRequiredError) as e:
+            await obs.add_link("x", None)
+        assert str(e.value) == "nats: object required"
+        with pytest.raises(ObjectRequiredError):
+            await obs.add_link("x", nats.js.api.ObjectInfo(name="", bucket="LINKS", nuid="n"))
+        deleted = await obs.get_info("D", show_deleted=True)
+        with pytest.raises(NoLinkToDeletedError) as e:
+            await obs.add_link("x", deleted)
+        assert str(e.value) == "nats: not allowed to link to a deleted object"
+        with pytest.raises(NoLinkToLinkError) as e:
+            await obs.add_link("x", await obs.get_info("toB"))
+        assert str(e.value) == "nats: not allowed to link to another link"
+
+        await nc.close()
+
+    @async_test
+    async def test_add_bucket_link(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        obs = await js.create_object_store("BLINKS")
+        other = await js.create_object_store("BOTHER")
+
+        link = await obs.add_bucket_link("dir", other)
+        assert link.name == "dir"
+        assert link.bucket == "BLINKS"
+        assert link.is_link()
+        assert link.options.link.bucket == "BOTHER"
+        assert link.options.link.name is None
+
+        info = await obs.get_info("dir")
+        assert info.options.link.bucket == "BOTHER"
+        with pytest.raises(LinkIsABucketError):
+            await obs.get("dir")
+
+        # A link may replace a link but not an object.
+        await obs.add_bucket_link("dir", obs)
+        assert (await obs.get_info("dir")).options.link.bucket == "BLINKS"
+        await obs.put("A", b"A")
+        with pytest.raises(ObjectAlreadyExists):
+            await obs.add_bucket_link("A", other)
+
+        with pytest.raises(ObjectNameRequiredError):
+            await obs.add_bucket_link("", other)
+        with pytest.raises(BucketRequiredError) as e:
+            await obs.add_bucket_link("x", None)
+        assert str(e.value) == "nats: bucket required"
+        with pytest.raises(BucketMalformedError) as e:
+            await obs.add_bucket_link("x", "BOTHER")
+        assert str(e.value) == "nats: bucket malformed"
 
         await nc.close()

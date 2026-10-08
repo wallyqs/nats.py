@@ -27,16 +27,21 @@ import nats.errors
 from nats.js import api
 from nats.js.errors import (
     BadObjectMetaError,
+    BucketMalformedError,
+    BucketRequiredError,
     DigestMismatchError,
     InvalidDigestFormatError,
     InvalidObjectNameError,
     LinkIsABucketError,
     LinkNotAllowedError,
+    NoLinkToDeletedError,
+    NoLinkToLinkError,
     NoObjectsFoundError,
     NotFoundError,
     ObjectAlreadyExists,
     ObjectNameRequiredError,
     ObjectNotFoundError,
+    ObjectRequiredError,
     UpdateMetaDeletedError,
 )
 from nats.js.kv import MSG_ROLLUP_SUBJECT, StopIterSentinel
@@ -233,8 +238,11 @@ class ObjectStore:
         if info.is_link():
             if info.options.link.name is None or info.options.link.name == "":
                 raise LinkIsABucketError
-            lobs = await self._js.object_store(info.options.link.bucket)
-            return await lobs.get(info.options.link.name)
+            if info.options.link.bucket == self._name:
+                lobs = self
+            else:
+                lobs = await self._js.object_store(info.options.link.bucket)
+            return await lobs.get(info.options.link.name, writeinto=writeinto)
 
         result = self.ObjectResult(info=info)
 
@@ -460,6 +468,78 @@ class ObjectStore:
                 obj=base64.urlsafe_b64encode(bytes(name, "utf-8")).decode(),
             )
             await self._js.purge_stream(self._stream, subject=old_meta_subj)
+
+    async def add_link(self, name: str, obj: Optional[api.ObjectInfo]) -> api.ObjectInfo:
+        """
+        add_link will add a link named ``name`` to the object described by
+        ``obj``, which may be in another bucket. An existing link with that
+        name is replaced, an existing object is not.
+        """
+        if not name:
+            raise ObjectNameRequiredError
+        if obj is None or not obj.name:
+            raise ObjectRequiredError
+        if obj.deleted:
+            raise NoLinkToDeletedError
+        if obj.is_link():
+            raise NoLinkToLinkError
+
+        await self._check_link_name(name)
+        info = api.ObjectInfo(
+            name=name,
+            bucket=self._name,
+            nuid=self._js._nc._nuid.next().decode(),
+            size=0,
+            chunks=0,
+            options=api.ObjectMetaOptions(link=api.ObjectLink(bucket=obj.bucket, name=obj.name)),
+        )
+        await self._publish_link(info)
+        return info
+
+    async def add_bucket_link(self, name: str, bucket: "ObjectStore") -> api.ObjectInfo:
+        """
+        add_bucket_link will add a link named ``name`` to another object store.
+        An existing link with that name is replaced, an existing object is not.
+        """
+        if not name:
+            raise ObjectNameRequiredError
+        if bucket is None:
+            raise BucketRequiredError
+        if not isinstance(bucket, ObjectStore):
+            raise BucketMalformedError
+
+        await self._check_link_name(name)
+        info = api.ObjectInfo(
+            name=name,
+            bucket=self._name,
+            nuid=self._js._nc._nuid.next().decode(),
+            size=0,
+            chunks=0,
+            options=api.ObjectMetaOptions(link=api.ObjectLink(bucket=bucket._name)),
+        )
+        await self._publish_link(info)
+        return info
+
+    async def _check_link_name(self, name: str) -> None:
+        # A link may replace a link, but not an object (even a deleted one).
+        try:
+            einfo = await self.get_info(name, show_deleted=True)
+        except ObjectNotFoundError:
+            return
+        if not einfo.is_link():
+            raise ObjectAlreadyExists
+
+    async def _publish_link(self, info: api.ObjectInfo) -> None:
+        meta_subj = OBJ_META_PRE_TEMPLATE.format(
+            bucket=self._name,
+            obj=base64.urlsafe_b64encode(bytes(info.name, "utf-8")).decode(),
+        )
+        await self._js.publish(
+            meta_subj,
+            json.dumps(info.as_dict()).encode(),
+            headers={api.Header.ROLLUP: MSG_ROLLUP_SUBJECT},
+        )
+        info.mtime = datetime.now(timezone.utc).isoformat()
 
     class ObjectWatcher:
         STOP_ITER = StopIterSentinel()

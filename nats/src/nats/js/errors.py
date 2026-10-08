@@ -405,6 +405,51 @@ class LinkNotAllowedError(Error):
         return "nats: link cannot be set when putting the object in bucket"
 
 
+class ObjectRequiredError(Error):
+    """
+    Raised when adding a link without the info of the object to link to.
+    """
+
+    def __str__(self) -> str:
+        return "nats: object required"
+
+
+class NoLinkToDeletedError(Error):
+    """
+    Raised when adding a link to a deleted object.
+    """
+
+    def __str__(self) -> str:
+        return "nats: not allowed to link to a deleted object"
+
+
+class NoLinkToLinkError(Error):
+    """
+    Raised when adding a link to an object that is itself a link.
+    """
+
+    def __str__(self) -> str:
+        return "nats: not allowed to link to another link"
+
+
+class BucketRequiredError(Error):
+    """
+    Raised when adding a bucket link without the bucket to link to.
+    """
+
+    def __str__(self) -> str:
+        return "nats: bucket required"
+
+
+class BucketMalformedError(Error):
+    """
+    Raised when adding a bucket link to something that is not an ObjectStore.
+    """
+
+    def __str__(self) -> str:
+        return "nats: bucket malformed"
+
+
 class KeyValueLimitMarkerTTLNotSupportedError(Error):
     """
     Raised when limit_marker_ttl is used but the connected server does not support it (pre-2.11).
