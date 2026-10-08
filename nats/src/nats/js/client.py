@@ -2086,22 +2086,21 @@ class JetStreamContext(JetStreamManager):
             sources = []
             for source in config.sources:
                 source = source.evolve()
-                # A source with its own subject transforms is kept as given.
-                if not source.subject_transforms:
-                    if source.name.startswith(KV_STREAM_PREFIX):
-                        source_bucket = source.name[len(KV_STREAM_PREFIX) :]
-                    else:
-                        source_bucket = source.name
-                        source.name = KV_STREAM_TEMPLATE.format(bucket=source_bucket)
-                    # Keys of another bucket are mapped into this bucket's
-                    # subjects (not needed for the same bucket in another domain).
-                    if source.external is None or source_bucket != config.bucket:
-                        source.subject_transforms = [
-                            api.SubjectTransform(
-                                src=f"$KV.{source_bucket}.>",
-                                dest=f"$KV.{config.bucket}.>",
-                            )
-                        ]
+                if source.name.startswith(KV_STREAM_PREFIX):
+                    source_bucket = source.name[len(KV_STREAM_PREFIX) :]
+                else:
+                    source_bucket = source.name
+                    source.name = KV_STREAM_TEMPLATE.format(bucket=source_bucket)
+                # Keys of another bucket are mapped into this bucket's subjects
+                # (not needed for the same bucket in another domain). As in
+                # nats.go, this replaces any transforms given with the source.
+                if source.external is None or source_bucket != config.bucket:
+                    source.subject_transforms = [
+                        api.SubjectTransform(
+                            src=f"$KV.{source_bucket}.>",
+                            dest=f"$KV.{config.bucket}.>",
+                        )
+                    ]
                 sources.append(source)
             stream.sources = sources
         return stream

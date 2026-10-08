@@ -250,7 +250,11 @@ class KVConfigTest(SingleJetStreamServerTestCase):
 
         sources = [
             nats.js.api.StreamSource(name="ONE"),
-            nats.js.api.StreamSource(name="KV_TWO"),
+            # As in nats.go, transforms given with a KV source are replaced.
+            nats.js.api.StreamSource(
+                name="KV_TWO",
+                subject_transforms=[nats.js.api.SubjectTransform(src="$KV.TWO.k2", dest="$KV.AGG.other")],
+            ),
         ]
         agg = await js.create_key_value(bucket="AGG", sources=sources)
         # The caller's sources are left untouched.
@@ -263,7 +267,9 @@ class KVConfigTest(SingleJetStreamServerTestCase):
         assert set(by_name) == {"KV_ONE", "KV_TWO"}
         assert by_name["KV_ONE"].subject_transforms[0].src == "$KV.ONE.>"
         assert by_name["KV_ONE"].subject_transforms[0].dest == "$KV.AGG.>"
+        assert len(by_name["KV_TWO"].subject_transforms) == 1
         assert by_name["KV_TWO"].subject_transforms[0].src == "$KV.TWO.>"
+        assert by_name["KV_TWO"].subject_transforms[0].dest == "$KV.AGG.>"
 
         await _wait_for_messages(js, "KV_AGG", 2)
         assert (await agg.get("k1")).value == b"1"
