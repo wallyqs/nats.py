@@ -3,6 +3,7 @@ import json
 import unittest
 
 import nats.js.api
+import nats.js.consume
 import pytest
 from nats.aio.msg import Msg
 from nats.js import api
@@ -775,12 +776,21 @@ class StreamHandleTest(SingleJetStreamServerTestCase):
         assert sorted(info.name for info in infos) == ["other", "pull", "push", "push2"]
         assert await stream.delete_consumer("other")
 
-        # The remaining message, handle.b at sequence 4.
-        psub = await stream.consumer("pull")
-        msgs = await psub.fetch(1, timeout=1)
+        # The remaining message, handle.b at sequence 4, from the pull
+        # consumer handle (nats.go Stream.Consumer).
+        consumer = await stream.consumer("pull")
+        assert isinstance(consumer, nats.js.consume.PullConsumer)
+        assert (consumer.stream, consumer.name) == ("HANDLE", "pull")
+        assert consumer.cached_info().config.description == "updated"
+        msgs = [msg async for msg in await consumer.fetch(1, max_wait=1)]
         assert msgs[0].subject == "handle.b"
+        await msgs[0].ack()
         with pytest.raises(NotPullConsumerError):
             await stream.consumer("push")
+        with pytest.raises(ConsumerNotFoundError):
+            await stream.consumer("missing")
+        with pytest.raises(InvalidConsumerNameError):
+            await stream.consumer("bad.name")
 
         received = asyncio.Queue()
 

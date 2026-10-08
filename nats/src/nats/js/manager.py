@@ -38,7 +38,6 @@ from nats.js.errors import (
     JetStreamNotEnabledError,
     MsgDeleteUnsuccessfulError,
     MsgNotFoundError,
-    NotPullConsumerError,
     NotPushConsumerError,
     StreamNameRequiredError,
     StreamNotFoundError,
@@ -50,6 +49,7 @@ from nats.js.errors import (
 if TYPE_CHECKING:
     from nats import NATS
     from nats.aio.msg import Msg
+    from nats.js.consume import PullConsumer
 
 NATS_HDR_LINE = bytearray(b"NATS/1.0")
 NATS_HDR_LINE_SIZE = len(NATS_HDR_LINE)
@@ -959,8 +959,9 @@ class Stream:
         stream = await js.stream("ORDERS")
         print(stream.cached_info().state.messages)
         await stream.create_consumer(durable_name="processor")
-        psub = await stream.consumer("processor")
-        msgs = await psub.fetch(10)
+        consumer = await stream.consumer("processor")
+        async for msg in await consumer.fetch(10):
+            await msg.ack()
     """
 
     def __init__(self, jsm: JetStreamManager, name: str, info: Optional[api.StreamInfo] = None) -> None:
@@ -1141,23 +1142,19 @@ class Stream:
         return self._jsm.consumer_names(self._name)
 
     def _context(self) -> Any:
-        if not hasattr(self._jsm, "pull_subscribe_bind"):
+        if not hasattr(self._jsm, "pull_consumer"):
             raise Error("consuming requires a JetStreamContext (nc.jetstream())")
         return self._jsm
 
-    async def consumer(self, name: str, **params) -> Any:
+    async def consumer(self, name: str) -> PullConsumer:
         """
-        Returns a pull subscription bound to the stream's pull consumer
-        (nats.go Stream.Consumer). ``params`` are passed to
-        JetStreamContext.pull_subscribe_bind.
+        Returns a handle on the stream's pull consumer, to fetch and
+        consume its messages (nats.go Stream.Consumer); see
+        JetStreamContext.pull_consumer.
 
         :raises NotPullConsumerError: if the consumer is a push consumer.
         """
-        js = self._context()
-        info = await self._jsm.consumer_info(self._name, name)
-        if info.config.deliver_subject:
-            raise NotPullConsumerError(description="consumer is not a pull consumer")
-        return await js.pull_subscribe_bind(consumer=name, stream=self._name, **params)
+        return await self._context().pull_consumer(self._name, name)
 
     async def push_consumer(self, name: str, cb: Optional[Any] = None, **params) -> Any:
         """
