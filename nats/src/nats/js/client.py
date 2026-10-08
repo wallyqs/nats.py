@@ -71,6 +71,16 @@ DEFAULT_JS_SUB_PENDING_BYTES_LIMIT = 256 * 1024 * 1024
 # Max history limit for key value.
 KV_MAX_HISTORY = 64
 
+# 409 status descriptions of pull requests that the server would reject
+# again on retry, so they are reported instead of treated as a timeout.
+_TERMINAL_CONFLICTS = (
+    "Consumer Deleted",
+    "Consumer is push based",
+    "Exceeded MaxRequestBatch",
+    "Exceeded MaxRequestExpires",
+    "Exceeded MaxRequestMaxBytes",
+)
+
 
 class JetStreamContext(JetStreamManager):
     """
@@ -710,21 +720,28 @@ class JetStreamContext(JetStreamManager):
         if not status:
             return True
         # Skip most 4XX errors and do not raise exception.
-        if JetStreamContext._is_temporary_error(status):
+        if JetStreamContext._is_temporary_error(status, msg):
             return False
         raise nats.js.errors.APIError.from_msg(msg)
 
     @classmethod
-    def _is_temporary_error(cls, status: Optional[str]) -> bool:
+    def _is_temporary_error(cls, status: Optional[str], msg: Optional[Msg] = None) -> bool:
+        if status == api.StatusCode.CONFLICT:
+            # Some conflicts would repeat on every retry of the same request.
+            return msg is None or not JetStreamContext._is_terminal_conflict(msg)
         if (
             status == api.StatusCode.NO_MESSAGES
-            or status == api.StatusCode.CONFLICT
             or status == api.StatusCode.REQUEST_TIMEOUT
             or status == api.StatusCode.PIN_ID_MISMATCH
         ):
             return True
         else:
             return False
+
+    @classmethod
+    def _is_terminal_conflict(cls, msg: Msg) -> bool:
+        desc = msg.headers.get(api.Header.DESCRIPTION, "") if msg.headers else ""
+        return desc.startswith(_TERMINAL_CONFLICTS)
 
     @classmethod
     def _is_pin_id_mismatch_error(cls, status: Optional[str]) -> bool:
@@ -1251,7 +1268,7 @@ class JetStreamContext(JetStreamManager):
                                 continue
 
                         # In case of a temporary error, treat it as a timeout to retry.
-                        if JetStreamContext._is_temporary_error(status):
+                        if JetStreamContext._is_temporary_error(status, msg):
                             raise nats.errors.TimeoutError
                         else:
                             # Any other type of status message is an error.
@@ -1482,6 +1499,8 @@ class JetStreamContext(JetStreamManager):
                         needed -= 1
                         msgs.append(msg)
                         break
+                    elif not msgs and not JetStreamContext._is_temporary_error(status, msg):
+                        raise nats.js.errors.APIError.from_msg(msg)
                     elif status == api.StatusCode.NO_MESSAGES or status:
                         # If there is still time, try again to get the next message
                         # or timeout.  This could be due to concurrent uses of fetch

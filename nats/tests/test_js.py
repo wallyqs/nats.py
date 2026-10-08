@@ -347,6 +347,33 @@ class PullSubscribeTest(SingleJetStreamServerTestCase):
         await asyncio.sleep(1)
 
     @async_test
+    async def test_fetch_consumer_deleted(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        jsm = nc.jsm()
+
+        await jsm.add_stream(name="DELETED", subjects=["deleted"])
+
+        for batch in (1, 3):
+            with self.subTest(batch=batch):
+                await jsm.add_consumer("DELETED", durable_name="dur", ack_policy="explicit")
+                sub = await js.pull_subscribe_bind("dur", "DELETED")
+
+                fetch = asyncio.create_task(sub.fetch(batch, timeout=5))
+                await asyncio.sleep(0.5)
+                await jsm.delete_consumer("DELETED", "dur")
+
+                # A deleted consumer is reported instead of waiting for the
+                # fetch to time out as if no messages were available.
+                with pytest.raises(nats.js.errors.APIError) as err:
+                    await asyncio.wait_for(fetch, timeout=2)
+                assert err.value.code == 409
+                assert err.value.description == "Consumer Deleted"
+                await sub.unsubscribe()
+
+        await nc.close()
+
+    @async_test
     async def test_fetch_one(self):
         nc = NATS()
         await nc.connect()
