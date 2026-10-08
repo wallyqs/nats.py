@@ -221,6 +221,39 @@ class TcpTransport(Transport):
         return self._io_writer.get_extra_info(name, default)
 
 
+def _dialer_connector(dialer: CustomDialer) -> "aiohttp.TCPConnector":
+    """
+    An aiohttp connector that opens the WebSocket's TCP connection with the
+    custom dialer, as nats.go uses its CustomDialer for WebSocket
+    connections too. The handshake, and TLS for wss, run over it.
+    """
+
+    class DialerConnector(aiohttp.TCPConnector):
+        def __init__(self) -> None:
+            super().__init__(force_close=True)
+            # A StreamWriter that is collected closes its transport.
+            self._dialed: List[Tuple[asyncio.StreamReader, asyncio.StreamWriter]] = []
+
+        async def _create_direct_connection(self, req, traces, timeout, *, client_error=aiohttp.ClientConnectorError):
+            host = req.url.raw_host
+            reader, writer = await dialer(host, req.port)
+            self._dialed.append((reader, writer))
+            transport = writer.transport
+            protocol = self._factory()
+            sslcontext = self._get_ssl_context(req)
+            if sslcontext:
+                server_hostname = (getattr(req, "server_hostname", None) or host).rstrip(".")
+                transport = await asyncio.get_running_loop().start_tls(
+                    transport, protocol, sslcontext, server_hostname=server_hostname
+                )
+            else:
+                transport.set_protocol(protocol)
+            protocol.connection_made(transport)
+            return transport, protocol
+
+    return DialerConnector()
+
+
 WebSocketHeaders = Dict[str, Union[str, List[str]]]
 WebSocketHeadersCallback = Callable[[], Union[WebSocketHeaders, Awaitable[WebSocketHeaders]]]
 
@@ -232,11 +265,13 @@ class WebSocketTransport(Transport):
         ws_headers_cb: Optional[WebSocketHeadersCallback] = None,
         compression: bool = False,
         proxy_path: Optional[str] = None,
+        dialer: Optional[CustomDialer] = None,
     ):
         if not aiohttp:
             raise ImportError("Could not import aiohttp transport, please install it with `pip install aiohttp`")
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
-        self._client: aiohttp.ClientSession = aiohttp.ClientSession()
+        connector = _dialer_connector(dialer) if dialer is not None else None
+        self._client: aiohttp.ClientSession = aiohttp.ClientSession(connector=connector)
         self._pending = asyncio.Queue()
         self._close_task = asyncio.Future()
         self._using_tls: Optional[bool] = None

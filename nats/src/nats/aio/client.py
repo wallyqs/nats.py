@@ -616,7 +616,9 @@ class Client:
             place of the server URL's path, e.g. when behind a proxy.
         :param custom_dialer: Coroutine function called with (host, port) that
             opens the TCP connection and returns its (StreamReader,
-            StreamWriter), e.g. to go through a proxy or tunnel.
+            StreamWriter), e.g. to go through a proxy or tunnel. It is used
+            for WebSocket connections too (the WebSocket handshake, and TLS
+            for wss, run over the dialed connection).
         :param flusher_timeout: Max seconds the background flusher waits for
             a write to the server; a slower write is reported to error_cb as
             FlushTimeoutError and handled as a write error.
@@ -2074,6 +2076,7 @@ class Client:
                     ws_headers_cb=self.options.get("ws_connection_headers_cb"),
                     compression=self.options.get("ws_compression", False),
                     proxy_path=self.options.get("ws_proxy_path"),
+                    dialer=self.options.get("custom_dialer"),
                 )
             else:
                 self._transport = TcpTransport(dialer=self.options.get("custom_dialer"))
