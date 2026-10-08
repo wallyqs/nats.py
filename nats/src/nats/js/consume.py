@@ -15,7 +15,8 @@
 Consumer handles modelled on nats.go's jetstream package: a pull consumer
 that fetches batches of messages or pulls continuously
 (:class:`PullConsumer`, :class:`ConsumeContext`, :class:`MessagesContext`),
-and an ordered consumer built on it (:class:`OrderedConsumer`).
+an ordered consumer built on it (:class:`OrderedConsumer`), and a push
+consumer handle (:class:`PushConsumer`).
 """
 
 from __future__ import annotations
@@ -1553,3 +1554,168 @@ class _OrderedMessagesContext:
         self._closed = True
         if isinstance(ctx, MessagesContext):
             ctx.stop()
+
+
+class PushConsumer:
+    """
+    PushConsumer is a handle on a push consumer, one with a deliver subject
+    (nats.go jetstream.PushConsumer), obtained from
+    :meth:`JetStreamContext.push_consumer`.
+    """
+
+    def __init__(self, js: JetStreamContext, stream: str, name: str, info: api.ConsumerInfo) -> None:
+        self._js = js
+        self._nc = js._nc
+        self._stream = stream
+        self._name = name
+        self._info = info
+        self._consuming: Optional[PushConsumeContext] = None
+
+    @property
+    def stream(self) -> str:
+        return self._stream
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    async def info(self) -> api.ConsumerInfo:
+        """Fetch the consumer info from the server, updating :meth:`cached_info`."""
+        self._info = await self._js.consumer_info(self._stream, self._name)
+        return self._info
+
+    def cached_info(self) -> api.ConsumerInfo:
+        """The consumer info last fetched, without asking the server."""
+        return self._info
+
+    async def consume(
+        self,
+        cb: Callable[[Msg], Awaitable[None]],
+        *,
+        error_cb: Optional[Callable[[PushConsumeContext, Exception], Any]] = None,
+    ) -> PushConsumeContext:
+        """
+        consume subscribes to the deliver subject of the consumer (in its
+        deliver group, if any) and calls ``cb`` with each message (nats.go
+        PushConsumer.Consume). Flow control requests are answered; with an
+        idle heartbeat configured, two missed heartbeats are reported to
+        ``error_cb`` as NoHeartbeatError. A consumer is consumed once at a
+        time.
+        """
+        if cb is None:
+            raise nats.js.errors.HandlerRequiredError
+        if self._consuming is not None and not self._consuming.is_closed:
+            raise nats.js.errors.ConsumerAlreadyConsumingError
+        ctx = PushConsumeContext(self, cb, error_cb)
+        config = self._info.config
+        if config.deliver_subject is None:
+            raise nats.js.errors.NotPushConsumerError
+        ctx._sub = await self._nc.subscribe(config.deliver_subject, queue=config.deliver_group or "", cb=ctx._handle)
+        if config.idle_heartbeat:
+            ctx._hb_task = asyncio.ensure_future(ctx._monitor_heartbeats(config.idle_heartbeat))
+        self._consuming = ctx
+        return ctx
+
+
+class PushConsumeContext:
+    """Controls a running :meth:`PushConsumer.consume`, as :class:`ConsumeContext` does."""
+
+    def __init__(
+        self,
+        consumer: PushConsumer,
+        cb: Callable[[Msg], Awaitable[None]],
+        error_cb: Optional[Callable[[PushConsumeContext, Exception], Any]],
+    ) -> None:
+        self._consumer = consumer
+        self._nc = consumer._nc
+        self._cb = cb
+        self._error_cb = error_cb
+        self._sub: Optional[Subscription] = None
+        self._hb_task: Optional[asyncio.Future] = None
+        self._closed = False
+        self._closed_event = asyncio.Event()
+        self._last_activity = time.monotonic()
+        self._in_handler = False
+
+    @property
+    def is_closed(self) -> bool:
+        """Whether consuming has fully stopped."""
+        return self._closed_event.is_set()
+
+    async def closed(self) -> None:
+        """Wait until consuming has fully stopped."""
+        await self._closed_event.wait()
+
+    def stop(self) -> None:
+        """Stop consuming at once; messages buffered but not handled are discarded."""
+        self._end(False)
+
+    def drain(self) -> None:
+        """Stop consuming once the buffered messages are handled."""
+        self._end(True)
+
+    def _end(self, drain: bool) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        asyncio.ensure_future(self._finish(drain))
+
+    async def _finish(self, drain: bool) -> None:
+        if self._hb_task is not None:
+            self._hb_task.cancel()
+        sub = self._sub
+        if sub is not None:
+            try:
+                if drain:
+                    await sub.drain()
+                else:
+                    await sub.unsubscribe()
+            except Exception:
+                pass
+        self._closed_event.set()
+
+    async def _report(self, err: Exception) -> None:
+        if self._error_cb is None:
+            return
+        try:
+            await _call(self._error_cb, self, err)
+        except Exception as e:
+            await self._nc._error_cb(e)
+
+    async def _handle(self, msg: Msg) -> None:
+        self._in_handler = True
+        try:
+            await self._process(msg)
+        finally:
+            self._in_handler = False
+            self._last_activity = time.monotonic()
+
+    async def _process(self, msg: Msg) -> None:
+        status = msg.headers.get(api.Header.STATUS) if msg.headers else None
+        if not status:
+            await self._cb(msg)
+            return
+        desc = (msg.headers.get(api.Header.DESCRIPTION) or "").lower() if msg.headers else ""
+        if status == api.StatusCode.CONTROL_MESSAGE:
+            if desc == "flowcontrol request" and msg.reply:
+                try:
+                    await self._nc.publish(msg.reply)
+                except Exception as e:
+                    await self._report(e)
+            return
+        if status == api.StatusCode.CONFLICT:
+            err = _status_error(msg, status)
+            if isinstance(err, nats.js.errors.ConsumerDeletedError):
+                await self._report(err)
+                self.stop()
+            elif isinstance(err, nats.js.errors.ConsumerLeadershipChangedError):
+                await self._report(err)
+
+    async def _monitor_heartbeats(self, hb: float) -> None:
+        while not self._closed:
+            wait = self._last_activity + 2 * hb - time.monotonic()
+            if self._in_handler or wait > 0:
+                await asyncio.sleep(wait if wait > 0 else hb)
+                continue
+            self._last_activity = time.monotonic()
+            await self._report(nats.js.errors.NoHeartbeatError())

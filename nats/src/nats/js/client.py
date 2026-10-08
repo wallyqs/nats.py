@@ -36,7 +36,7 @@ import nats.js.errors
 from nats.aio.msg import Msg
 from nats.aio.subscription import Subscription
 from nats.js import api
-from nats.js.consume import OrderedConsumer, OrderedConsumerConfig, PullConsumer
+from nats.js.consume import OrderedConsumer, OrderedConsumerConfig, PullConsumer, PushConsumer
 from nats.js.errors import (
     BadBucketError,
     BucketNotFoundError,
@@ -1043,6 +1043,26 @@ class JetStreamContext(JetStreamManager):
         info = await self.add_consumer(stream, config=oc._next_config())
         oc._current = PullConsumer(self, stream, info.name, info)
         return oc
+
+    async def push_consumer(self, stream: str, consumer: str) -> PushConsumer:
+        """
+        push_consumer returns a handle on an existing push consumer, one
+        with a deliver subject (nats.go Stream.PushConsumer). Its info is
+        fetched and available from ``cached_info()``.
+
+        ::
+
+            consumer = await js.push_consumer("mystream", "dur")
+
+            async def cb(msg):
+                await msg.ack()
+
+            ctx = await consumer.consume(cb)
+        """
+        info = await self.consumer_info(stream, consumer)
+        if not info.config.deliver_subject:
+            raise nats.js.errors.NotPushConsumerError
+        return PushConsumer(self, stream, info.name, info)
 
     @classmethod
     def is_status_msg(cls, msg: Optional[Msg]) -> Optional[str]:

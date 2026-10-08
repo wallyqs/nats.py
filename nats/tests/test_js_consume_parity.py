@@ -957,3 +957,98 @@ class OrderedConsumerTest(SingleJetStreamServerTestCase):
             await oc.info()
         assert str(OrderedConsumerResetError()) == "nats: recreating ordered consumer"
         await nc.close()
+
+
+class PushConsumerTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_consume(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="PUSH", subjects=["push.>"])
+        for i in range(5):
+            await js.publish("push.a", str(i).encode())
+        await js.add_consumer(
+            "PUSH", durable_name="dur", deliver_subject="deliver.push", ack_policy="explicit", idle_heartbeat=0.5
+        )
+        consumer = await js.push_consumer("PUSH", "dur")
+        assert consumer.cached_info().name == "dur"
+
+        received = []
+        done = asyncio.Event()
+
+        async def cb(msg):
+            received.append(int(msg.data))
+            await msg.ack()
+            if len(received) == 5:
+                done.set()
+
+        ctx = await consumer.consume(cb)
+        await asyncio.wait_for(done.wait(), 2)
+        assert received == list(range(5))
+        with pytest.raises(ConsumerAlreadyConsumingError):
+            await consumer.consume(cb)
+        info = await consumer.info()
+        assert info.num_ack_pending == 0
+        assert consumer.cached_info() is info
+
+        ctx.stop()
+        await asyncio.wait_for(ctx.closed(), 1)
+        # Once stopped, it can be consumed again.
+        ctx = await consumer.consume(cb)
+        ctx.drain()
+        await asyncio.wait_for(ctx.closed(), 1)
+
+        await js.add_consumer("PUSH", durable_name="pull")
+        with pytest.raises(NotPushConsumerError):
+            await js.push_consumer("PUSH", "pull")
+        await nc.close()
+
+    @async_test
+    async def test_flow_control(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="FC", subjects=["fc"])
+        payload = b"x" * 64 * 1024
+        for _ in range(100):
+            await js.publish("fc", payload)
+        await js.add_consumer(
+            "FC",
+            durable_name="dur",
+            deliver_subject="deliver.fc",
+            ack_policy="none",
+            flow_control=True,
+            idle_heartbeat=1,
+        )
+        consumer = await js.push_consumer("FC", "dur")
+        received = []
+        done = asyncio.Event()
+
+        async def cb(msg):
+            received.append(msg)
+            if len(received) == 100:
+                done.set()
+
+        ctx = await consumer.consume(cb)
+        await asyncio.wait_for(done.wait(), 4)
+        ctx.stop()
+        await nc.close()
+
+    @async_test
+    async def test_missing_heartbeat(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="HB", subjects=["hb"])
+        info = await js.add_consumer("HB", durable_name="dur", deliver_subject="deliver.hb", idle_heartbeat=0.5)
+        # Listen where the heartbeats do not go.
+        info.config.deliver_subject = "elsewhere"
+        consumer = nats.js.consume.PushConsumer(js, "HB", "dur", info)
+        errors = []
+
+        async def cb(msg):
+            pass
+
+        ctx = await consumer.consume(cb, error_cb=lambda ctx, err: errors.append(err))
+        await asyncio.sleep(1.3)
+        assert len(errors) == 1 and isinstance(errors[0], NoHeartbeatError)
+        ctx.stop()
+        await nc.close()
