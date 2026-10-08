@@ -547,6 +547,10 @@ class ServiceConfig:
     queue_group_disabled: bool = False
     """Whether the endpoints of the service subscribe without a queue group by default."""
 
+    endpoint: Optional[EndpointConfig] = None
+    """An endpoint added when the service starts, before its monitoring
+    endpoints (nats.go's Config.Endpoint, which nats.go names "default")."""
+
     def __post_init__(self) -> None:
         if not self.name:
             raise ConfigValidationError("Name cannot be empty.")
@@ -757,6 +761,7 @@ class Service(AsyncContextManager):
         self._queue_group = config.queue_group
         self._queue_group_disabled = config.queue_group_disabled
         self._stats_handler = config.stats_handler
+        self._default_endpoint = config.endpoint
 
         self._client = client
         self._subscriptions = {}
@@ -775,6 +780,9 @@ class Service(AsyncContextManager):
     async def start(self) -> None:
         if self._subscriptions:
             return
+
+        if self._default_endpoint is not None:
+            await self.add_endpoint(self._default_endpoint)
 
         verb_request_handlers = {
             ServiceVerb.PING: self._handle_ping_request,

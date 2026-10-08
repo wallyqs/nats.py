@@ -428,3 +428,51 @@ class MicroEndpointTest(SingleServerTestCase):
 
         await svc.stop()
         await nc.close()
+
+
+class MicroDefaultEndpointTest(SingleServerTestCase):
+    @async_test
+    async def test_config_endpoint(self):
+        async def handler(request: Request):
+            await request.respond(b"default:" + request.data)
+
+        nc = await nats.connect()
+        svc = await add_service(
+            nc,
+            name="svc",
+            version="0.1.0",
+            queue_group="sq",
+            endpoint=EndpointConfig(name="default", subject="svc.default", handler=handler, metadata={"k": "v"}),
+        )
+
+        resp = await nc.request("svc.default", b"hi", timeout=1)
+        self.assertEqual(resp.data, b"default:hi")
+
+        info = svc.info()
+        self.assertEqual(len(info.endpoints), 1)
+        self.assertEqual(info.endpoints[0].name, "default")
+        self.assertEqual(info.endpoints[0].subject, "svc.default")
+        # Inherits the service's queue group.
+        self.assertEqual(info.endpoints[0].queue_group, "sq")
+        self.assertEqual(info.endpoints[0].metadata, {"k": "v"})
+        self.assertEqual(svc.stats().endpoints[0].num_requests, 1)
+
+        # More endpoints can still be added.
+        await svc.add_endpoint(name="other", handler=handler)
+        self.assertEqual([e.name for e in svc.info().endpoints], ["default", "other"])
+        await svc.stop()
+
+        # Also when the service is started as a context manager, with the
+        # endpoint's own queue group and the subject defaulting to the name.
+        config = ServiceConfig(
+            name="svc2",
+            version="0.1.0",
+            queue_group="sq",
+            endpoint=EndpointConfig(name="default", queue_group="eq", handler=handler),
+        )
+        async with nats.micro.Service(nc, config) as svc2:
+            resp = await nc.request("default", b"x", timeout=1)
+            self.assertEqual(resp.data, b"default:x")
+            self.assertEqual(svc2.info().endpoints[0].queue_group, "eq")
+
+        await nc.close()
