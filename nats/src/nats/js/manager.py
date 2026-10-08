@@ -37,7 +37,7 @@ from nats.js.errors import (
     InvalidSubjectError,
     JetStreamNotEnabledError,
     MsgDeleteUnsuccessfulError,
-    NotFoundError,
+    MsgNotFoundError,
     NotPullConsumerError,
     NotPushConsumerError,
     StreamNameRequiredError,
@@ -826,7 +826,12 @@ class JetStreamManager:
             status = msg.headers.get("Status")
             if status:
                 if status == "404":
-                    raise NotFoundError
+                    # nats.go ErrMsgNotFound, a NotFoundError as before.
+                    raise MsgNotFoundError(
+                        code=404,
+                        err_code=ErrorCode.MESSAGE_NOT_FOUND,
+                        description=msg.headers.get(api.Header.DESCRIPTION) or "message not found",
+                    )
                 else:
                     raise APIError.from_msg(msg)
 

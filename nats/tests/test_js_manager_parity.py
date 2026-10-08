@@ -645,6 +645,34 @@ class JetStreamOptionsTest(SingleJetStreamServerTestCase):
         await nc.close()
 
 
+class DirectGetNotFoundTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_direct_get_msg_not_found(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="DGET", subjects=["dget.>"], allow_direct=True)
+        await js.publish("dget.a", b"1")
+
+        # nats.go ErrMsgNotFound on both the direct and the API get, which
+        # stays a NotFoundError.
+        for direct in (True, False):
+            with self.subTest(direct=direct):
+                with pytest.raises(MsgNotFoundError) as err:
+                    await js.get_msg("DGET", 5, direct=direct)
+                assert isinstance(err.value, NotFoundError)
+                assert err.value.code == 404
+                assert err.value.err_code == 10037
+                with pytest.raises(MsgNotFoundError):
+                    await js.get_last_msg("DGET", "dget.missing", direct=direct)
+
+        stream = await js.stream("DGET")
+        with pytest.raises(MsgNotFoundError):
+            await stream.get_msg(5)
+        with pytest.raises(MsgNotFoundError):
+            await stream.get_last_msg_for_subject("dget.missing")
+        await nc.close()
+
+
 class StreamHandleTest(SingleJetStreamServerTestCase):
     @async_test
     async def test_stream_handle(self):
