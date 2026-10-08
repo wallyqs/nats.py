@@ -178,3 +178,225 @@ class BatchErrorIdentityTest(SingleJetStreamServerTestCase):
         assert str(SubjectRequiredError()) == "nats: at least one subject is required"
         assert isinstance(BatchAckTimeoutError(3, 1), TimeoutError)
         assert str(BatchAckTimeoutError(3, 1)) == "nats: batch message 3 ack timeout; current ack sequence: 1"
+
+
+class BatchPublisherTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_add_and_commit(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="ORDERS", subjects=["orders.>"], allow_atomic=True)
+
+        batch = new_batch_publisher(js)
+        assert batch.size() == 0
+        assert not batch.is_closed()
+        await batch.add("orders.new", b"1")
+        await batch.add_msg(nats.aio.msg.Msg(nc, subject="orders.new", data=b"2", headers={"X-Custom": "a"}))
+        assert batch.size() == 2
+        # Nothing is stored before the commit.
+        info = await js.stream_info("ORDERS")
+        assert info.state.messages == 0
+
+        ack = await batch.commit("orders.new", b"3")
+        assert isinstance(ack, BatchAck)
+        assert ack.stream == "ORDERS"
+        assert ack.seq == 3
+        assert ack.batch_id == batch.batch_id
+        assert ack.batch_size == 3
+        assert batch.size() == 3
+        assert batch.is_closed()
+
+        info = await js.stream_info("ORDERS")
+        assert info.state.messages == 3
+        msg = await js.get_msg("ORDERS", 2)
+        assert msg.data == b"2"
+        assert msg.headers["X-Custom"] == "a"
+        assert msg.headers[BATCH_ID_HEADER] == batch.batch_id
+        assert msg.headers[BATCH_SEQ_HEADER] == "2"
+        msg = await js.get_msg("ORDERS", 3)
+        assert msg.headers[BATCH_COMMIT_HEADER] == "1"
+
+        with pytest.raises(BatchClosedError):
+            await batch.add("orders.new", b"4")
+        with pytest.raises(BatchClosedError):
+            await batch.commit("orders.new", b"4")
+        with pytest.raises(BatchClosedError):
+            await batch.close()
+        with pytest.raises(BatchClosedError):
+            batch.discard()
+        await nc.close()
+
+    @async_test
+    async def test_commit_msg_and_first_message_commit(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="ORDERS", subjects=["orders.>"], allow_atomic=True)
+
+        batch = new_batch_publisher(js)
+        ack = await batch.commit_msg(nats.aio.msg.Msg(nc, subject="orders.one", data=b"only"))
+        assert ack.batch_size == 1
+        assert ack.seq == 1
+        assert batch.is_closed()
+        await nc.close()
+
+    @async_test
+    async def test_close_commits_with_end_of_batch(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="ORDERS", subjects=["orders.>"], allow_atomic=True)
+
+        batch = new_batch_publisher(js)
+        with pytest.raises(EmptyBatchError):
+            await batch.close()
+        assert not batch.is_closed()
+
+        await batch.add("orders.a", b"1")
+        await batch.add("orders.b", b"2")
+        ack = await batch.close()
+        assert ack.stream == "ORDERS"
+        assert ack.seq == 2
+        assert ack.batch_size == 2
+        assert batch.is_closed()
+        # The end-of-batch marker is not stored and the last message carries
+        # the regular commit header.
+        info = await js.stream_info("ORDERS")
+        assert info.state.messages == 2
+        msg = await js.get_msg("ORDERS", 2)
+        assert msg.data == b"2"
+        assert msg.headers[BATCH_COMMIT_HEADER] == "1"
+        await nc.close()
+
+    @async_test
+    async def test_discard(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="ORDERS", subjects=["orders.>"], allow_atomic=True)
+
+        batch = new_batch_publisher(js)
+        await batch.add("orders.a", b"1")
+        batch.discard()
+        assert batch.is_closed()
+        assert batch.size() == 1
+        with pytest.raises(BatchClosedError):
+            await batch.add("orders.a", b"2")
+        with pytest.raises(BatchClosedError):
+            batch.discard()
+        info = await js.stream_info("ORDERS")
+        assert info.state.messages == 0
+        await nc.close()
+
+    @async_test
+    async def test_flow_control_and_errors(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="PLAIN", subjects=["plain.>"])
+
+        # The first message waits for its ack, which carries the error.
+        batch = new_batch_publisher(js)
+        with pytest.raises(BatchPublishNotEnabledError) as e:
+            await batch.add("plain.a", b"1")
+        assert e.value.err_code == JS_ERR_CODE_BATCH_PUBLISH_NOT_ENABLED
+
+        # Without acks the error only comes with the commit.
+        batch = new_batch_publisher(js, BatchFlowControl(ack_first=False))
+        await batch.add("plain.a", b"1")
+        await batch.add("plain.a", b"2")
+        with pytest.raises(BatchPublishNotEnabledError):
+            await batch.commit("plain.a", b"3")
+
+        # Every second message waits for its ack.
+        batch = new_batch_publisher(js, BatchFlowControl(ack_first=False, ack_every=2, ack_timeout=1.0))
+        await batch.add("plain.a", b"1")
+        with pytest.raises(BatchPublishNotEnabledError):
+            await batch.add("plain.a", b"2")
+
+        # No stream listens on the subject.
+        batch = new_batch_publisher(js)
+        with pytest.raises(NoStreamResponseError):
+            await batch.add("nothing.here", b"1")
+        await nc.close()
+
+    @async_test
+    async def test_message_options(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="ORDERS", subjects=["orders.>"], allow_atomic=True, allow_msg_ttl=True)
+        await js.publish("orders.a", b"0")
+
+        batch = new_batch_publisher(js)
+        await batch.add(
+            "orders.a",
+            b"1",
+            expect_stream="ORDERS",
+            expect_last_sequence=1,
+            expect_last_subject_sequence=1,
+            expect_last_subject_sequence_subject="orders.*",
+        )
+        await batch.add("orders.b", b"2", msg_ttl=90)
+        ack = await batch.commit("orders.c", b"3")
+        assert ack.batch_size == 3
+        msg = await js.get_msg("ORDERS", 2)
+        assert msg.headers["Nats-Expected-Stream"] == "ORDERS"
+        assert msg.headers["Nats-Expected-Last-Sequence"] == "1"
+        assert msg.headers["Nats-Expected-Last-Subject-Sequence"] == "1"
+        assert msg.headers[EXPECTED_LAST_SUBJECT_SEQUENCE_SUBJECT_HEADER] == "orders.*"
+        msg = await js.get_msg("ORDERS", 3)
+        assert msg.headers["Nats-TTL"] == "1m30s"
+
+        # A failed expectation fails the batch.
+        batch = new_batch_publisher(js)
+        await batch.add("orders.a", b"1", expect_stream="OTHER")
+        with pytest.raises(BadRequestError) as e:
+            await batch.commit("orders.a", b"2")
+        assert e.value.err_code == 10060
+
+        batch = new_batch_publisher(js)
+        await batch.add("orders.a", b"1", expect_last_subject_sequence=0)
+        with pytest.raises(BadRequestError) as e:
+            await batch.commit("orders.a", b"2")
+        assert e.value.err_code == 10071
+
+        batch = new_batch_publisher(js)
+        with pytest.raises(InvalidOptionError):
+            await batch.add("orders.a", b"1", expect_last_subject_sequence=1, expect_last_subject_sequence_subject="")
+        with pytest.raises(InvalidOptionError):
+            await batch.add("orders.a", b"1", expect_last_subject_sequence_subject="orders.a")
+        assert batch.size() == 0
+        await nc.close()
+
+    @async_test
+    async def test_publish_msg_batch(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="ORDERS", subjects=["orders.>"], allow_atomic=True)
+
+        with pytest.raises(EmptyBatchError):
+            await publish_msg_batch(js, [])
+
+        msgs = [
+            nats.aio.msg.Msg(nc, subject="orders.new", data=str(i).encode(), headers={BATCH_COMMIT_HEADER: "1"})
+            for i in range(5)
+        ]
+        msgs.append(nats.aio.msg.Msg(nc, subject="orders.new", data=b"5"))
+        ack = await publish_msg_batch(js, msgs, BatchFlowControl(ack_first=True, ack_every=2))
+        assert ack.stream == "ORDERS"
+        assert ack.seq == 6
+        assert ack.batch_size == 6
+        info = await js.stream_info("ORDERS")
+        assert info.state.messages == 6
+        msg = await js.get_msg("ORDERS", 3)
+        assert BATCH_COMMIT_HEADER not in msg.headers
+        assert msg.headers[BATCH_SEQ_HEADER] == "3"
+        await nc.close()
+
+    def test_format_duration(self):
+        fmt = jetstreamext._format_duration
+        assert fmt(0) == "0s"
+        assert fmt(1) == "1s"
+        assert fmt(1.5) == "1.5s"
+        assert fmt(90) == "1m30s"
+        assert fmt(3600) == "1h0m0s"
+        assert fmt(0.5) == "500ms"
+        assert fmt(0.0015) == "1.5ms"
+        assert fmt(2e-6) == "2µs"
+        assert fmt(3e-9) == "3ns"
