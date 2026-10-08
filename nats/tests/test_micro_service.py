@@ -650,6 +650,16 @@ class MicroServiceTest(SingleServerTestCase):
                 subject = control_subject(data["verb"], name=data.get("name"), id=data.get("id"))
                 assert subject == data["expected_subject"]
 
+        # Empty strings are treated as absent, as in nats.go.
+        assert control_subject(ServiceVerb.PING, name="", id="") == "$SRV.PING"
+        assert control_subject(ServiceVerb.PING, name="test", id="") == "$SRV.PING.test"
+
+        # An ID without a service name cannot form a valid subject.
+        for name in (None, ""):
+            with self.subTest(name=f"id_without_name_{name!r}"):
+                with self.assertRaises(ValueError):
+                    control_subject(ServiceVerb.PING, name=name, id="123")
+
     @async_test
     async def test_custom_queue_group(self):
         async def noop_handler(request: Request):

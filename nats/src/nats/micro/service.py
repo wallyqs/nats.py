@@ -819,9 +819,11 @@ def control_subject(
     id: Optional[str] = None,
     prefix=DEFAULT_PREFIX,
 ) -> str:
-    if name is None and id is None:
+    if not name and id:
+        raise ValueError("service name is required to generate ID control subject")
+    if not name:
         return f"{prefix}.{verb.value}"
-    elif id is None:
+    elif not id:
         return f"{prefix}.{verb.value}.{name}"
     else:
         return f"{prefix}.{verb.value}.{name}.{id}"
