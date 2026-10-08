@@ -36,7 +36,7 @@ import nats.js.errors
 from nats.aio.msg import Msg
 from nats.aio.subscription import Subscription
 from nats.js import api
-from nats.js.consume import PullConsumer
+from nats.js.consume import OrderedConsumer, OrderedConsumerConfig, PullConsumer
 from nats.js.errors import (
     BadBucketError,
     BucketNotFoundError,
@@ -1023,6 +1023,26 @@ class JetStreamContext(JetStreamManager):
         if info.config.deliver_subject:
             raise nats.js.errors.NotPullConsumerError(description="consumer is not a pull consumer")
         return PullConsumer(self, stream, info.name, info)
+
+    async def ordered_consumer(self, stream: str, config: Optional[OrderedConsumerConfig] = None) -> OrderedConsumer:
+        """
+        ordered_consumer returns a pull-based ordered consumer on a stream
+        (nats.go Stream.OrderedConsumer): messages are delivered in order and
+        without acks, the underlying consumer being recreated as needed.
+
+        ::
+
+            oc = await js.ordered_consumer("mystream")
+            async for msg in await oc.messages():
+                print(msg.data)
+        """
+        if config is None:
+            config = OrderedConsumerConfig()
+        prefix = config.name_prefix or self._nc._nuid.next().decode()
+        oc = OrderedConsumer(self, stream, config, prefix)
+        info = await self.add_consumer(stream, config=oc._next_config())
+        oc._current = PullConsumer(self, stream, info.name, info)
+        return oc
 
     @classmethod
     def is_status_msg(cls, msg: Optional[Msg]) -> Optional[str]:

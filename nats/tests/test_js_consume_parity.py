@@ -821,3 +821,139 @@ class PullConsumeTest(SingleJetStreamServerTestCase):
         msgs = await grouped.messages(group="A")
         msgs.stop()
         await nc.close()
+
+
+class OrderedConsumerTest(SingleJetStreamServerTestCase):
+    async def _setup(self, n=10):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="ORD", subjects=["ord.>"])
+        for i in range(n):
+            await js.publish(f"ord.{i % 2}", str(i).encode())
+        return nc, js
+
+    @async_test
+    async def test_messages(self):
+        nc, js = await self._setup()
+        oc = await js.ordered_consumer("ORD", nats.js.consume.OrderedConsumerConfig(name_prefix="pfx"))
+        assert oc.cached_info().name == "pfx_1"
+        assert oc.cached_info().config.ack_policy == api.AckPolicy.NONE
+        msgs = await oc.messages()
+        got = [(await msgs.next(timeout=2)).data for _ in range(10)]
+        assert got == [str(i).encode() for i in range(10)]
+
+        # The consumer is deleted: it is recreated after the last message.
+        await js.delete_consumer("ORD", oc.cached_info().name)
+        for i in range(10, 15):
+            await js.publish("ord.0", str(i).encode())
+        got = [(await msgs.next(timeout=4)).data for _ in range(5)]
+        assert got == [str(i).encode() for i in range(10, 15)]
+        assert oc.cached_info().name.startswith("pfx_")
+        assert oc.cached_info().name != "pfx_1"
+        msgs.stop()
+        with pytest.raises(MsgIteratorClosedError):
+            await msgs.next()
+        await nc.close()
+
+    @async_long_test
+    async def test_messages_stop_after_and_config(self):
+        nc, js = await self._setup()
+        config = nats.js.consume.OrderedConsumerConfig(
+            filter_subjects=["ord.1"],
+            deliver_policy=api.DeliverPolicy.BY_START_SEQUENCE,
+            opt_start_seq=5,
+        )
+        oc = await js.ordered_consumer("ORD", config)
+        msgs = await oc.messages(stop_after=2)
+        got = [msg.data async for msg in msgs]
+        assert got == [b"5", b"7"]
+        await nc.close()
+
+    @async_long_test
+    async def test_consume(self):
+        nc, js = await self._setup()
+        oc = await js.ordered_consumer("ORD")
+        received = []
+        errors = []
+        first = asyncio.Event()
+        done = asyncio.Event()
+
+        async def cb(msg):
+            received.append(int(msg.data))
+            if len(received) == 10:
+                first.set()
+            if len(received) == 15:
+                done.set()
+
+        async def error_cb(ctx, err):
+            errors.append(err)
+
+        ctx = await oc.consume(cb, error_cb=error_cb)
+        await asyncio.wait_for(first.wait(), 3)
+        await js.delete_consumer("ORD", oc.cached_info().name)
+        for i in range(10, 15):
+            await js.publish("ord.0", str(i).encode())
+        await asyncio.wait_for(done.wait(), 5)
+        assert received == list(range(15))
+        assert any(isinstance(err, ConsumerDeletedError) for err in errors)
+
+        with pytest.raises(OrderedConsumerConcurrentRequestsError):
+            await oc.consume(cb)
+        with pytest.raises(OrderConsumerUsedAsConsumeError):
+            await oc.fetch(1)
+        ctx.stop()
+        await asyncio.wait_for(ctx.closed(), 2)
+        assert ctx.is_closed
+        await nc.close()
+
+    @async_test
+    async def test_consume_stop_after(self):
+        nc, js = await self._setup()
+        oc = await js.ordered_consumer("ORD")
+        received = []
+
+        async def cb(msg):
+            received.append(int(msg.data))
+
+        ctx = await oc.consume(cb, stop_after=4)
+        await asyncio.wait_for(ctx.closed(), 3)
+        assert received == [0, 1, 2, 3]
+        await nc.close()
+
+    @async_test
+    async def test_fetch(self):
+        nc, js = await self._setup()
+        oc = await js.ordered_consumer("ORD")
+        batch = await oc.fetch(4, max_wait=1)
+        assert [int(m.data) async for m in batch] == [0, 1, 2, 3]
+        batch = await oc.fetch(4, max_wait=1)
+        assert [int(m.data) async for m in batch] == [4, 5, 6, 7]
+        msg = await oc.next(max_wait=1)
+        assert msg.data == b"8"
+        batch = await oc.fetch_no_wait(5)
+        assert [int(m.data) async for m in batch] == [9]
+        batch = await oc.fetch_bytes(1000, max_wait=1)
+        assert [m async for m in batch] == []
+
+        running = await oc.fetch(1, max_wait=2)
+        with pytest.raises(OrderedConsumerConcurrentRequestsError):
+            await oc.fetch(1)
+        assert [m async for m in running] == []
+
+        with pytest.raises(OrderConsumerUsedAsFetchError):
+            await oc.messages()
+        await nc.close()
+
+    @async_test
+    async def test_recreate_fails(self):
+        nc, js = await self._setup()
+        oc = await js.ordered_consumer("ORD", nats.js.consume.OrderedConsumerConfig(max_reset_attempts=1))
+        assert (await oc.info()).name == oc.cached_info().name
+        await js.delete_stream("ORD")
+        with pytest.raises(NotFoundError):
+            await oc.fetch(1)
+        assert oc.cached_info() is None
+        with pytest.raises(OrderedConsumerNotCreatedError):
+            await oc.info()
+        assert str(OrderedConsumerResetError()) == "nats: recreating ordered consumer"
+        await nc.close()

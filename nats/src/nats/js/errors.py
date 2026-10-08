@@ -691,6 +691,33 @@ class MsgIteratorClosedError(Error):
         return "nats: messages iterator closed"
 
 
+class OrderedConsumerConcurrentRequestsError(Error):
+    """
+    Raised when an ordered consumer is consumed or fetched from concurrently.
+    """
+
+    def __str__(self) -> str:
+        return "nats: cannot run concurrent processing using ordered consumer"
+
+
+class OrderedConsumerNotCreatedError(Error):
+    """
+    Raised when asking the info of an ordered consumer without a current consumer.
+    """
+
+    def __str__(self) -> str:
+        return "nats: consumer instance not yet created"
+
+
+class OrderedConsumerResetError(Error):
+    """
+    Signals that an ordered consumer is being recreated (nats.go ErrOrderedConsumerReset).
+    """
+
+    def __str__(self) -> str:
+        return "nats: recreating ordered consumer"
+
+
 class NoStreamResponseError(Error):
     """
     Raised if the client gets a 503 when publishing a message.

@@ -14,16 +14,19 @@
 """
 Consumer handles modelled on nats.go's jetstream package: a pull consumer
 that fetches batches of messages or pulls continuously
-(:class:`PullConsumer`, :class:`ConsumeContext`, :class:`MessagesContext`).
+(:class:`PullConsumer`, :class:`ConsumeContext`, :class:`MessagesContext`),
+and an ordered consumer built on it (:class:`OrderedConsumer`).
 """
 
 from __future__ import annotations
 
 import asyncio
+import datetime
 import inspect
 import json
 import time
-from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple, Union
 
 import nats.errors
 import nats.js.errors
@@ -1007,3 +1010,546 @@ class MessagesContext(_PullSubscription):
         await self._end_subscription(drain)
         if drain:
             self._queue.put_nowait(_CLOSED)
+
+
+@dataclass
+class OrderedConsumerConfig:
+    """
+    OrderedConsumerConfig configures an :class:`OrderedConsumer` (nats.go
+    OrderedConsumerConfig).
+
+    - ``filter_subjects``: subjects to deliver, all of the stream by default.
+    - ``deliver_policy``, ``opt_start_seq``, ``opt_start_time``: where the
+      first consumer starts (``DeliverPolicy.ALL`` by default).
+    - ``replay_policy``, ``headers_only``, ``metadata``: as in ConsumerConfig.
+    - ``inactive_threshold``: seconds before an unused consumer is removed
+      by the server (5 minutes by default).
+    - ``max_reset_attempts``: attempts to recreate the consumer before giving
+      up; ``None`` or 0 retries without limit.
+    - ``name_prefix``: prefix of the consumer names, ``<prefix>_<n>``; a NUID
+      by default.
+    """
+
+    filter_subjects: Optional[List[str]] = None
+    deliver_policy: Optional[api.DeliverPolicy] = None
+    opt_start_seq: Optional[int] = None
+    opt_start_time: Optional[datetime.datetime] = None
+    replay_policy: Optional[api.ReplayPolicy] = None
+    inactive_threshold: Optional[float] = None
+    headers_only: Optional[bool] = None
+    max_reset_attempts: Optional[int] = None
+    metadata: Optional[Dict[str, str]] = None
+    name_prefix: Optional[str] = None
+
+
+# Seconds a recreated ordered consumer may stay unused (nats.go default).
+_ORDERED_INACTIVE_THRESHOLD = 300.0
+
+# Backoff between attempts to recreate an ordered consumer.
+_ORDERED_BACKOFF_START = 1.0
+_ORDERED_BACKOFF_MAX = 10.0
+
+# How an ordered consumer is used: the first use decides.
+_KIND_NOT_SET = 0
+_KIND_CONSUME = 1
+_KIND_FETCH = 2
+
+
+class _OrderedConsumerClosed(Exception):
+    """The ordered consume or iteration stopped while the consumer was recreated."""
+
+
+def _serial_from_name(name: str) -> int:
+    _, sep, tail = name.rpartition("_")
+    if not sep or not tail.isdigit():
+        return 0
+    return int(tail)
+
+
+class OrderedConsumer:
+    """
+    OrderedConsumer delivers the messages of a stream in order, without
+    acks, by recreating an ephemeral pull consumer (named
+    ``<prefix>_<n>``) after the last delivered message whenever a message
+    is missed, heartbeats stop or the consumer is gone (nats.go ordered
+    consumer). Obtained from :meth:`JetStreamContext.ordered_consumer`.
+
+    An ordered consumer is used either with :meth:`consume` or
+    :meth:`messages`, or with :meth:`fetch`, :meth:`fetch_bytes`,
+    :meth:`fetch_no_wait` and :meth:`next`, one call at a time.
+    """
+
+    def __init__(self, js: JetStreamContext, stream: str, config: OrderedConsumerConfig, prefix: str) -> None:
+        self._js = js
+        self._nc = js._nc
+        self._stream = stream
+        self._cfg = config
+        self._prefix = prefix
+        self._kind = _KIND_NOT_SET
+        self._serial = 0
+        self._stream_seq = 0
+        self._deliver_seq = 0
+        self._current: Optional[PullConsumer] = None
+        self._current_ctx: Optional[Union[ConsumeContext, MessagesContext]] = None
+        self._running_fetch: Optional[MessageBatch] = None
+        self._active: Optional[Union[_OrderedConsumeContext, _OrderedMessagesContext]] = None
+        self._reset_lock = asyncio.Lock()
+
+    def _next_config(self) -> api.ConsumerConfig:
+        """The configuration of the next consumer (nats.go getConsumerConfig)."""
+        cfg = self._cfg
+        self._serial += 1
+        fresh = self._stream_seq == 0
+        policy = cfg.deliver_policy or api.DeliverPolicy.ALL
+        config = api.ConsumerConfig(
+            name=f"{self._prefix}_{self._serial}",
+            ack_policy=api.AckPolicy.NONE,
+            inactive_threshold=cfg.inactive_threshold or _ORDERED_INACTIVE_THRESHOLD,
+            num_replicas=1,
+            mem_storage=True,
+            headers_only=cfg.headers_only,
+            metadata=cfg.metadata,
+            replay_policy=cfg.replay_policy,
+        )
+        filters = cfg.filter_subjects or []
+        if len(filters) == 1:
+            config.filter_subject = filters[0]
+        elif filters:
+            config.filter_subjects = list(filters)
+        if fresh:
+            config.deliver_policy = policy
+            if policy == api.DeliverPolicy.BY_START_SEQUENCE:
+                config.opt_start_seq = cfg.opt_start_seq or 1
+            elif policy == api.DeliverPolicy.BY_START_TIME:
+                config.opt_start_time = cfg.opt_start_time
+            elif policy == api.DeliverPolicy.LAST_PER_SUBJECT and not filters:
+                config.filter_subjects = [">"]
+        else:
+            config.deliver_policy = api.DeliverPolicy.BY_START_SEQUENCE
+            config.opt_start_seq = self._stream_seq + 1
+        self._deliver_seq = 0
+        return config
+
+    def _check_delivered(self, msg: Msg) -> Tuple[bool, bool]:
+        """Whether a message is stale (of a replaced consumer) or out of order."""
+        meta = msg.metadata
+        if _serial_from_name(meta.consumer) != self._serial:
+            return True, False
+        if meta.sequence.consumer != self._deliver_seq + 1:
+            return False, True
+        self._deliver_seq = meta.sequence.consumer
+        self._stream_seq = meta.sequence.stream
+        return False, False
+
+    def _begin(self, consume: bool, fetch_running: bool = False) -> bool:
+        """Check the call may proceed; whether the consumer must first be recreated."""
+        if consume:
+            if self._kind == _KIND_FETCH:
+                raise nats.js.errors.OrderConsumerUsedAsFetchError
+            needs_reset = self._current is None
+            if not needs_reset and self._kind == _KIND_CONSUME:
+                raise nats.js.errors.OrderedConsumerConcurrentRequestsError
+            self._kind = _KIND_CONSUME
+            return needs_reset
+        if self._kind == _KIND_CONSUME:
+            raise nats.js.errors.OrderConsumerUsedAsConsumeError
+        if fetch_running:
+            raise nats.js.errors.OrderedConsumerConcurrentRequestsError
+        self._kind = _KIND_FETCH
+        return True
+
+    async def _reset(self) -> None:
+        """
+        Replace the current consumer with one starting after the last
+        delivered message, retrying with backoff (nats.go reset).
+        """
+        async with self._reset_lock:
+            if self._current is not None:
+                if self._current_ctx is not None:
+                    self._current_ctx.stop()
+                    self._current_ctx = None
+                asyncio.ensure_future(self._delete_quietly(self._current.name))
+                self._current = None
+            config = self._next_config()
+            attempts = self._cfg.max_reset_attempts or -1
+            attempt = 0
+            interval = _ORDERED_BACKOFF_START
+            while True:
+                if self._active is not None and self._active._closed:
+                    raise _OrderedConsumerClosed
+                try:
+                    info = await self._js.add_consumer(self._stream, config=config)
+                    self._current = PullConsumer(self._js, self._stream, info.name, info)
+                    return
+                except Exception:
+                    if 0 < attempts <= attempt + 1:
+                        raise
+                attempt += 1
+                await asyncio.sleep(interval)
+                interval = min(2 * interval, _ORDERED_BACKOFF_MAX)
+
+    async def _delete_quietly(self, name: str) -> None:
+        try:
+            await self._js.delete_consumer(self._stream, name)
+        except Exception:
+            pass
+
+    async def info(self) -> api.ConsumerInfo:
+        """Fetch the info of the current consumer, updating :meth:`cached_info`."""
+        if self._current is None:
+            raise nats.js.errors.OrderedConsumerNotCreatedError
+        return await self._current.info()
+
+    def cached_info(self) -> Optional[api.ConsumerInfo]:
+        """The info of the current consumer last fetched, without asking the server."""
+        if self._current is None:
+            return None
+        return self._current.cached_info()
+
+    async def _start_fetch(self) -> PullConsumer:
+        batch = self._running_fetch
+        self._begin(False, batch is not None and not batch.done)
+        if batch is not None and batch._sseq:
+            self._stream_seq = batch._sseq
+        await self._reset()
+        assert self._current is not None
+        return self._current
+
+    async def fetch(self, batch: int, **kwargs: Any) -> MessageBatch:
+        """Fetch up to ``batch`` messages after the last fetched; see :meth:`PullConsumer.fetch`."""
+        current = await self._start_fetch()
+        self._running_fetch = await current.fetch(batch, **kwargs)
+        return self._running_fetch
+
+    async def fetch_bytes(self, max_bytes: int, **kwargs: Any) -> MessageBatch:
+        """Fetch messages up to ``max_bytes``; see :meth:`PullConsumer.fetch_bytes`."""
+        current = await self._start_fetch()
+        self._running_fetch = await current.fetch_bytes(max_bytes, **kwargs)
+        return self._running_fetch
+
+    async def fetch_no_wait(self, batch: int) -> MessageBatch:
+        """Fetch up to ``batch`` messages available now; see :meth:`PullConsumer.fetch_no_wait`."""
+        current = await self._start_fetch()
+        self._running_fetch = await current.fetch_no_wait(batch)
+        return self._running_fetch
+
+    async def next(self, max_wait: Optional[float] = None, heartbeat: Optional[float] = None) -> Msg:
+        """Fetch the next message; see :meth:`PullConsumer.next`."""
+        batch = await self.fetch(1, max_wait=max_wait, heartbeat=heartbeat)
+        async for msg in batch:
+            return msg
+        if batch.error is not None:
+            raise batch.error
+        raise nats.errors.TimeoutError
+
+    async def consume(
+        self,
+        cb: Callable[[Msg], Awaitable[None]],
+        *,
+        error_cb: Optional[Callable[[Any, Exception], Any]] = None,
+        stop_after: Optional[int] = None,
+        **kwargs: Any,
+    ) -> _OrderedConsumeContext:
+        """
+        consume calls ``cb`` with each message in order, recreating the
+        consumer as needed. The options are those of
+        :meth:`PullConsumer.consume`; the heartbeat defaults to 5 seconds
+        (half the expiry under 10 seconds). Missed heartbeats, a deleted
+        consumer and no responders recreate the consumer and are reported
+        to ``error_cb``.
+        """
+        if cb is None:
+            raise nats.js.errors.HandlerRequiredError
+        needs_reset = self._begin(True)
+        # Validate the options before creating anything.
+        _PullOptions(True, **_pull_kwargs(kwargs, stop_after))
+        ctx = _OrderedConsumeContext(self, cb, error_cb, stop_after, kwargs)
+        self._active = ctx
+        if needs_reset:
+            await self._reset()
+        await ctx._consume()
+        return ctx
+
+    async def messages(self, *, stop_after: Optional[int] = None, **kwargs: Any) -> _OrderedMessagesContext:
+        """
+        messages returns an iterator over the messages in order,
+        recreating the consumer as needed. The options are those of
+        :meth:`PullConsumer.messages`.
+        """
+        needs_reset = self._begin(True)
+        kwargs.pop("err_on_missing_heartbeat", None)
+        _PullOptions(True, **_pull_kwargs(kwargs, stop_after))
+        ctx = _OrderedMessagesContext(self, stop_after, kwargs)
+        self._active = ctx
+        if needs_reset:
+            await self._reset()
+        await ctx._renew_iterator()
+        return ctx
+
+
+def _pull_kwargs(kwargs: Dict[str, Any], stop_after: Optional[int]) -> Dict[str, Any]:
+    """The keyword arguments of consume()/messages() as _PullOptions takes them."""
+    names = (
+        "max_messages",
+        "max_bytes",
+        "bytes_limit",
+        "expires",
+        "threshold_messages",
+        "threshold_bytes",
+        "min_pending",
+        "min_ack_pending",
+        "priority",
+        "group",
+        "heartbeat",
+    )
+    unknown = set(kwargs) - set(names)
+    if unknown:
+        raise TypeError(f"unexpected options: {', '.join(sorted(unknown))}")
+    opts = {name: kwargs.get(name) for name in names}
+    opts["stop_after"] = stop_after
+    return opts
+
+
+def _ordered_heartbeat(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """The ordered consumer's default heartbeat, as the inner consumers must use it."""
+    if kwargs.get("heartbeat") is not None:
+        return kwargs
+    expires = kwargs.get("expires") or DEFAULT_EXPIRES
+    return dict(kwargs, heartbeat=expires / 2 if expires < 10 else 5.0)
+
+
+class _OrderedConsumeContext:
+    """Controls :meth:`OrderedConsumer.consume`, with the methods of :class:`ConsumeContext`."""
+
+    def __init__(
+        self,
+        oc: OrderedConsumer,
+        cb: Callable[[Msg], Awaitable[None]],
+        error_cb: Optional[Callable[[Any, Exception], Any]],
+        stop_after: Optional[int],
+        kwargs: Dict[str, Any],
+    ) -> None:
+        self._oc = oc
+        self._cb = cb
+        self._error_cb = error_cb
+        self._stop_after = stop_after
+        self._kwargs = _ordered_heartbeat(kwargs)
+        self._delivered = 0
+        self._closed = False
+        self._closed_event = asyncio.Event()
+        self._resetting = False
+        self._reset_task: Optional[asyncio.Future] = None
+
+    @property
+    def is_closed(self) -> bool:
+        """Whether consuming has fully stopped."""
+        return self._closed_event.is_set()
+
+    async def closed(self) -> None:
+        """Wait until consuming has fully stopped."""
+        await self._closed_event.wait()
+
+    def stop(self) -> None:
+        """Stop consuming at once."""
+        self._end(False)
+
+    def drain(self) -> None:
+        """Stop consuming once the buffered messages are handled."""
+        self._end(True)
+
+    def _end(self, drain: bool) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        ctx = self._oc._current_ctx
+        asyncio.ensure_future(self._finish(ctx, drain))
+
+    async def _finish(self, ctx: Optional[Union[ConsumeContext, MessagesContext]], drain: bool) -> None:
+        if isinstance(ctx, ConsumeContext):
+            if drain:
+                ctx.drain()
+            else:
+                ctx.stop()
+            await ctx.closed()
+        self._closed_event.set()
+
+    async def _consume(self) -> None:
+        oc = self._oc
+        assert oc._current is not None
+        stop_after = None
+        if self._stop_after:
+            stop_after = self._stop_after - self._delivered
+        serial = oc._serial
+        ctx = await oc._current.consume(
+            self._handler(serial),
+            error_cb=self._internal_error_cb(serial),
+            stop_after=stop_after,
+            **self._kwargs,
+        )
+        if self._closed:
+            ctx.stop()
+        oc._current_ctx = ctx
+
+    async def _report(self, err: Exception) -> None:
+        if self._error_cb is None:
+            return
+        try:
+            await _call(self._error_cb, self, err)
+        except Exception as e:
+            await self._oc._nc._error_cb(e)
+
+    def _handler(self, serial: int) -> Callable[[Msg], Awaitable[None]]:
+        async def handler(msg: Msg) -> None:
+            oc = self._oc
+            if self._closed or serial != oc._serial:
+                return
+            try:
+                stale, mismatch = oc._check_delivered(msg)
+            except nats.errors.Error as e:
+                await self._report(e)
+                return
+            if stale:
+                return
+            if mismatch:
+                self._request_reset(serial)
+                return
+            self._delivered += 1
+            await self._cb(msg)
+            if self._stop_after and self._delivered >= self._stop_after:
+                self.stop()
+
+        return handler
+
+    def _internal_error_cb(self, serial: int) -> Callable[[Any, Exception], Awaitable[None]]:
+        async def error_cb(ctx: Any, err: Exception) -> None:
+            if isinstance(err, nats.errors.ConnectionClosedError):
+                await self._report(err)
+                self.stop()
+                return
+            await self._report(err)
+            if isinstance(
+                err,
+                (nats.js.errors.NoHeartbeatError, nats.js.errors.ConsumerDeletedError, nats.errors.NoRespondersError),
+            ):
+                self._request_reset(serial)
+
+        return error_cb
+
+    def _request_reset(self, serial: int) -> None:
+        if self._closed or self._resetting or serial != self._oc._serial:
+            return
+        self._resetting = True
+        self._reset_task = asyncio.ensure_future(self._recreate())
+
+    async def _recreate(self) -> None:
+        try:
+            await self._oc._reset()
+            if not self._closed:
+                await self._consume()
+        except _OrderedConsumerClosed:
+            pass
+        except Exception as e:
+            # The consumer could not be recreated: consuming stops.
+            await self._report(e)
+            self.stop()
+        finally:
+            self._resetting = False
+
+
+class _OrderedMessagesContext:
+    """Iterates over :meth:`OrderedConsumer.messages`, with the methods of :class:`MessagesContext`."""
+
+    def __init__(self, oc: OrderedConsumer, stop_after: Optional[int], kwargs: Dict[str, Any]) -> None:
+        self._oc = oc
+        self._stop_after = stop_after
+        self._kwargs = _ordered_heartbeat(kwargs)
+        self._delivered = 0
+        self._closed = False
+        self._draining = False
+
+    async def _renew_iterator(self) -> None:
+        oc = self._oc
+        assert oc._current is not None
+        stop_after = None
+        if self._stop_after:
+            stop_after = self._stop_after - self._delivered
+        oc._current_ctx = await oc._current.messages(
+            stop_after=stop_after, err_on_missing_heartbeat=True, **self._kwargs
+        )
+
+    async def _renew(self) -> None:
+        try:
+            await self._oc._reset()
+        except _OrderedConsumerClosed:
+            raise nats.js.errors.MsgIteratorClosedError
+        await self._renew_iterator()
+
+    def __aiter__(self) -> _OrderedMessagesContext:
+        return self
+
+    async def __anext__(self) -> Msg:
+        try:
+            return await self.next()
+        except nats.js.errors.MsgIteratorClosedError:
+            raise StopAsyncIteration
+
+    async def next(self, timeout: Optional[float] = None) -> Msg:
+        """
+        next returns the next message in order, recreating the consumer when
+        a message was missed, heartbeats stopped or the consumer is gone.
+        """
+        while True:
+            if self._closed:
+                raise nats.js.errors.MsgIteratorClosedError
+            if self._stop_after and self._delivered >= self._stop_after:
+                self.stop()
+                raise nats.js.errors.MsgIteratorClosedError
+            ctx = self._oc._current_ctx
+            if not isinstance(ctx, MessagesContext):
+                await self._renew()
+                continue
+            try:
+                msg = await ctx.next(timeout=timeout)
+            except (nats.errors.TimeoutError, nats.errors.ConnectionClosedError):
+                raise
+            except nats.js.errors.MsgIteratorClosedError:
+                # Stopped, drained, or all of stop_after delivered.
+                self._closed = True
+                raise
+            except Exception:
+                if self._draining:
+                    self._closed = True
+                    raise nats.js.errors.MsgIteratorClosedError
+                await self._renew()
+                continue
+            stale, mismatch = self._oc._check_delivered(msg)
+            if stale:
+                continue
+            if mismatch:
+                if self._draining:
+                    self._closed = True
+                    raise nats.js.errors.MsgIteratorClosedError
+                await self._renew()
+                continue
+            self._delivered += 1
+            return msg
+
+    def stop(self) -> None:
+        """Stop iterating at once."""
+        self._end(False)
+
+    def drain(self) -> None:
+        """Stop pulling; the buffered messages can still be taken."""
+        self._end(True)
+
+    def _end(self, drain: bool) -> None:
+        if self._closed or self._draining:
+            return
+        ctx = self._oc._current_ctx
+        if drain and isinstance(ctx, MessagesContext):
+            self._draining = True
+            ctx.drain()
+            return
+        self._closed = True
+        if isinstance(ctx, MessagesContext):
+            ctx.stop()
