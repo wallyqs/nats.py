@@ -22,6 +22,7 @@ from secrets import token_hex
 from typing import (
     TYPE_CHECKING,
     Any,
+    AsyncIterator,
     Awaitable,
     Callable,
     Dict,
@@ -1783,6 +1784,51 @@ class JetStreamContext(JetStreamManager):
             compression=api.StoreCompression.S2 if config.compression else None,
             metadata=config.metadata,
         )
+
+    async def object_store_names(self) -> AsyncIterator[str]:
+        """
+        object_store_names yields the bucket names of the object stores in JetStream.
+
+        ::
+
+            async for name in js.object_store_names():
+                print(name)
+        """
+        async for name in self._object_store_streams("NAMES"):
+            if name.startswith("OBJ_"):
+                yield name[len("OBJ_") :]
+
+    async def object_stores(self) -> AsyncIterator[ObjectStore.ObjectStoreStatus]:
+        """
+        object_stores yields the status of each object store in JetStream.
+
+        ::
+
+            async for status in js.object_stores():
+                print(status.bucket, status.size)
+        """
+        async for resp in self._object_store_streams("LIST"):
+            info = api.StreamInfo.from_response(resp)
+            name = info.config.name
+            if name is not None and name.startswith("OBJ_"):
+                yield ObjectStore.ObjectStoreStatus(stream_info=info, bucket=name[len("OBJ_") :])
+
+    async def _object_store_streams(self, kind: str) -> AsyncIterator[Any]:
+        # Pages through the streams listed (STREAM.NAMES or STREAM.LIST)
+        # under the chunk subjects of every object store, as nats.go does.
+        offset = 0
+        while True:
+            resp = await self._api_request(
+                f"{self._prefix}.STREAM.{kind}",
+                json.dumps({"offset": offset, "subject": "$O.*.C.>"}).encode(),
+                timeout=self._timeout,
+            )
+            streams = resp.get("streams") or []
+            for stream in streams:
+                yield stream
+            offset += len(streams)
+            if not streams or offset >= resp.get("total", 0):
+                return
 
     async def delete_object_store(self, bucket: str) -> bool:
         """

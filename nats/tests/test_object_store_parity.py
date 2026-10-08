@@ -419,3 +419,47 @@ class ObjectStoreManagerTest(SingleJetStreamServerTestCase):
         assert (await js.object_store("CFGONLY"))._stream == "OBJ_CFGONLY"
 
         await nc.close()
+
+
+class ObjectStoreListingTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_object_store_names_and_stores(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        assert [name async for name in js.object_store_names()] == []
+        assert [status async for status in js.object_stores()] == []
+
+        await js.create_object_store("ONE", description="first")
+        two = await js.create_object_store("TWO")
+        await two.put("A", b"AAA")
+        # Neither a key value bucket nor a plain stream is listed.
+        await js.create_key_value(bucket="KV")
+        await js.add_stream(name="PLAIN", subjects=["plain"])
+
+        names = [name async for name in js.object_store_names()]
+        assert sorted(names) == ["ONE", "TWO"]
+
+        statuses = {status.bucket: status async for status in js.object_stores()}
+        assert sorted(statuses) == ["ONE", "TWO"]
+        assert statuses["ONE"].description == "first"
+        assert statuses["ONE"].backing_store == "JetStream"
+        assert statuses["TWO"].size > 0
+        assert statuses["TWO"].stream_info.config.name == "OBJ_TWO"
+
+        await nc.close()
+
+    @async_test
+    async def test_object_stores_paging(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        # More than one page of STREAM.LIST (256 streams per page).
+        expected = sorted(f"B{i:03d}" for i in range(260))
+        for bucket in expected:
+            await js.create_object_store(bucket, storage=nats.js.api.StorageType.MEMORY)
+
+        assert sorted([name async for name in js.object_store_names()]) == expected
+        assert sorted([status.bucket async for status in js.object_stores()]) == expected
+
+        await nc.close()
