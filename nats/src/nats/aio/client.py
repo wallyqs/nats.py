@@ -420,6 +420,10 @@ class Client:
 
         self._reconnection_task: Optional[asyncio.Task[None]] = None
         self._reconnect_backoffs: int = 0
+        # Servers tried in the current pass through the pool, and whether the
+        # next pass skips its back off, for custom_reconnect_delay_cb.
+        self._reconnect_pass_tried: int = 0
+        self._reconnect_skip_backoff: bool = False
         self._reconnection_task_future: Optional[asyncio.Future] = None
         self._max_payload: int = DEFAULT_MAX_PAYLOAD_SIZE
 
@@ -581,8 +585,10 @@ class Client:
             background, as reconnections do (publishes are buffered meanwhile).
             connected_cb reports when the connection is established.
         :param custom_reconnect_delay_cb: Function called with the number of
-            times the client backed off while reconnecting (starting at 1) that
-            returns the seconds to wait, replacing reconnect_time_wait.
+            times the client went through the whole server pool while
+            reconnecting (starting at 1) that returns the seconds to wait
+            before trying the last server of each pass. reconnect_time_wait
+            is not used then.
         :param reconnect_jitter: Up to this many seconds, chosen at random, are
             added to reconnect_time_wait, so that clients do not all reconnect
             at once.
@@ -2124,7 +2130,9 @@ class Client:
             # Not yet exceeded max_reconnect_attempts so can still use
             # this server in the future.
             self._server_pool.append(s)
-            if s.last_attempt is not None and now < s.last_attempt + self.options["reconnect_time_wait"]:
+            if self.is_reconnecting and self.options.get("custom_reconnect_delay_cb") is not None:
+                await self._reconnect_pass_backoff()
+            elif s.last_attempt is not None and now < s.last_attempt + self.options["reconnect_time_wait"]:
                 # Backoff connecting to server if we attempted recently.
                 await asyncio.sleep(self._reconnect_delay())
             try:
@@ -2140,6 +2148,20 @@ class Client:
                 if self.is_reconnecting:
                     await self._notify_reconnect_error(e)
                 continue
+
+    async def _reconnect_pass_backoff(self) -> None:
+        """
+        Backs off once per pass through the server pool, before trying the
+        last server of the pass, as nats.go's doReconnect does when a
+        CustomReconnectDelayCB is set (ReconnectWait is then ignored). A
+        forced reconnect does not back off before its first attempt.
+        """
+        skip, self._reconnect_skip_backoff = self._reconnect_skip_backoff, False
+        if skip or self._reconnect_pass_tried + 1 < len(self._server_pool):
+            self._reconnect_pass_tried += 1
+            return
+        self._reconnect_pass_tried = 0
+        await asyncio.sleep(self._reconnect_delay())
 
     def _reconnect_delay(self) -> float:
         """
@@ -2231,7 +2253,7 @@ class Client:
         self._ps.reset()
         if self._reconnection_task is not None and not self._reconnection_task.cancelled():
             self._reconnection_task.cancel()
-        self._reconnection_task = asyncio.get_running_loop().create_task(self._attempt_reconnect())
+        self._reconnection_task = asyncio.get_running_loop().create_task(self._attempt_reconnect(forced=True))
 
     async def _process_op_err(self, e: Exception) -> None:
         """
@@ -2259,10 +2281,11 @@ class Client:
             self._close_err = e
             await self._close(Client.CLOSED, True)
 
-    async def _attempt_reconnect(self, initial: bool = False) -> None:
+    async def _attempt_reconnect(self, initial: bool = False, forced: bool = False) -> None:
         """
         Reconnects to a server of the pool. With ``initial``, it establishes
-        the first connection instead, for retry_on_failed_connect.
+        the first connection instead, for retry_on_failed_connect. A
+        ``forced`` reconnect tries the first server without backing off.
         """
         assert self._current_server, "Client.connect must be called first"
         if self._reading_task is not None and not self._reading_task.cancelled():
@@ -2293,6 +2316,8 @@ class Client:
             shuffle(self._server_pool)
 
         self._reconnect_backoffs = 0
+        self._reconnect_pass_tried = 0
+        self._reconnect_skip_backoff = forced
 
         # Create a future that the client can use to control waiting
         # on the reconnection attempts.

@@ -695,6 +695,87 @@ class ReconnectDelayTest(SingleServerTestCase):
         await asyncio.wait_for(reconnected.wait(), 3)
         await nc.close()
 
+    @async_test
+    async def test_custom_reconnect_delay_cb_without_reconnect_time_wait(self):
+        backoffs = []
+        reconnected = asyncio.Event()
+
+        def delay(attempts):
+            backoffs.append(attempts)
+            return 0.05
+
+        async def reconnected_cb():
+            reconnected.set()
+
+        async def error_cb(e):
+            pass
+
+        nc = await nats.connect(
+            custom_reconnect_delay_cb=delay,
+            reconnect_time_wait=0,
+            reconnected_cb=reconnected_cb,
+            error_cb=error_cb,
+            max_reconnect_attempts=-1,
+        )
+        self.server_pool[0].stop()
+        # The callback replaces reconnect_time_wait, even when it is zero.
+        while len(backoffs) < 3:
+            await asyncio.sleep(0.05)
+        self.assertEqual(backoffs[:3], [1, 2, 3])
+        start_natsd(self.server_pool[0])
+        await asyncio.wait_for(reconnected.wait(), 3)
+        await nc.close()
+
+    @async_test
+    async def test_custom_reconnect_delay_cb_once_per_pass(self):
+        events = []
+
+        def delay(attempts):
+            events.append(("delay", attempts))
+            return 0.01
+
+        async def reconnect_error_cb(e):
+            events.append("attempt")
+
+        async def error_cb(e):
+            pass
+
+        nc = await nats.connect(
+            servers=["nats://127.0.0.1:4222", "nats://127.0.0.1:4991", "nats://127.0.0.1:4992"],
+            dont_randomize=True,
+            custom_reconnect_delay_cb=delay,
+            reconnect_error_cb=reconnect_error_cb,
+            error_cb=error_cb,
+            max_reconnect_attempts=-1,
+        )
+        self.server_pool[0].stop()
+        while len([e for e in events if e != "attempt"]) < 3:
+            await asyncio.sleep(0.01)
+        await nc.close()
+        # As nats.go: the callback is called with the pass count, once per
+        # pass through the three servers, before the pass's last server.
+        expected = ["attempt", "attempt", ("delay", 1)]
+        expected += ["attempt"] * 3 + [("delay", 2)] + ["attempt"] * 3 + [("delay", 3)]
+        self.assertEqual(events[: len(expected)], expected)
+
+    @async_test
+    async def test_custom_reconnect_delay_cb_not_used_by_force_reconnect(self):
+        backoffs = []
+        reconnected = asyncio.Event()
+
+        async def reconnected_cb():
+            reconnected.set()
+
+        nc = await nats.connect(
+            custom_reconnect_delay_cb=lambda attempts: backoffs.append(attempts) or 2,
+            reconnected_cb=reconnected_cb,
+        )
+        # As nats.go's ForceReconnect, the first server is tried at once.
+        await nc.force_reconnect()
+        await asyncio.wait_for(reconnected.wait(), 1)
+        self.assertEqual(backoffs, [])
+        await nc.close()
+
     def test_reconnect_jitter(self):
         nc = NATS()
         nc.options.update(
