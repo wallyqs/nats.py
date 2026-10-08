@@ -1039,6 +1039,10 @@ class ObjectStoreConfig(Base):
     storage: Optional[StorageType] = None
     replicas: int = 1
     placement: Optional[Placement] = None
+    # Whether the underlying stream is S2 compressed.
+    compression: bool = False
+    # Optional user defined metadata of the underlying stream.
+    metadata: Optional[Dict[str, str]] = None
 
     def as_dict(self) -> Dict[str, object]:
         result = super().as_dict()

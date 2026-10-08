@@ -330,3 +330,32 @@ class ObjectLinkTest(SingleJetStreamServerTestCase):
         assert str(e.value) == "nats: bucket malformed"
 
         await nc.close()
+
+
+class ObjectStoreConfigTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_compression_and_metadata(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        obs = await js.create_object_store(
+            "COMPRESSED",
+            config=nats.js.api.ObjectStoreConfig(compression=True, metadata={"team": "a"}),
+        )
+        status = await obs.status()
+        assert status.is_compressed
+        assert status.backing_store == "JetStream"
+        assert status.metadata["team"] == "a"
+        assert status.stream_info.config.compression == nats.js.api.StoreCompression.S2
+
+        # Objects still round trip.
+        await obs.put("A", b"A" * 10000)
+        assert (await obs.get("A")).data == b"A" * 10000
+
+        obs = await js.create_object_store("PLAIN")
+        status = await obs.status()
+        assert not status.is_compressed
+        assert status.backing_store == "JetStream"
+        assert "team" not in (status.metadata or {})
+
+        await nc.close()

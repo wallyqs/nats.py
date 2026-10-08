@@ -1708,6 +1708,8 @@ class JetStreamContext(JetStreamManager):
             discard=api.DiscardPolicy.NEW,
             allow_rollup_hdrs=True,
             allow_direct=True,
+            compression=api.StoreCompression.S2 if config.compression else None,
+            metadata=config.metadata,
         )
         await self.add_stream(stream)
 

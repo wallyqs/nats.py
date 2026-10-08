@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import nats.errors
 from nats.js import api
@@ -164,6 +164,28 @@ class ObjectStore:
             size is the combined size of all data in the bucket including metadata, in bytes.
             """
             return self.stream_info.state.bytes
+
+        @property
+        def backing_store(self) -> str:
+            """
+            backing_store indicates what technology is used for storage of the bucket.
+            """
+            return "JetStream"
+
+        @property
+        def metadata(self) -> Optional[Dict[str, str]]:
+            """
+            metadata is the user supplied metadata of the bucket.
+            """
+            return self.stream_info.config.metadata
+
+        @property
+        def is_compressed(self) -> bool:
+            """
+            is_compressed indicates if the data is compressed on disk.
+            """
+            compression = self.stream_info.config.compression
+            return compression is not None and compression != api.StoreCompression.NONE
 
     def __init__(
         self,
