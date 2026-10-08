@@ -15,6 +15,7 @@ from typing import (
     List,
     Optional,
     Protocol,
+    Tuple,
     overload,
 )
 
@@ -67,6 +68,10 @@ class EndpointConfig:
 
     metadata: Optional[Dict[str, str]] = None
     """The metadata of the endpoint."""
+
+    queue_group_disabled: bool = False
+    """Subscribe without a queue group, so that every service instance receives each request.
+    When not set, it is inherited from the parent group or service unless a queue group is set."""
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -209,6 +214,24 @@ class EndpointInfo:
         }
 
 
+def _resolve_queue_group(
+    queue_group: Optional[str],
+    parent_queue_group: Optional[str],
+    disabled: bool,
+    parent_disabled: bool,
+) -> Tuple[Optional[str], bool]:
+    """Resolves a queue group against its parent's, as nats.go micro's
+    resolveQueueGroup: the own disabled flag, then the own queue group, then
+    the parent's disabled flag, then the parent's queue group."""
+    if disabled:
+        return None, True
+    if queue_group:
+        return queue_group, False
+    if parent_disabled:
+        return None, True
+    return parent_queue_group, False
+
+
 class Endpoint:
     """Endpoint manages a service endpoint."""
 
@@ -216,7 +239,11 @@ class Endpoint:
         self._service = service
         self._name = config.name
         self._subject = config.subject or config.name
-        self._queue_group = config.queue_group or DEFAULT_QUEUE_GROUP
+        self._queue_group_disabled = config.queue_group_disabled
+        if self._queue_group_disabled:
+            self._queue_group = ""
+        else:
+            self._queue_group = config.queue_group or DEFAULT_QUEUE_GROUP
         self._handler = config.handler
         self._metadata = config.metadata
 
@@ -290,6 +317,9 @@ class GroupConfig:
     queue_group: Optional[str] = None
     """The default queue group of the group."""
 
+    queue_group_disabled: bool = False
+    """Whether the endpoints of the group subscribe without a queue group by default."""
+
 
 class EndpointManager(Protocol):
     """
@@ -308,6 +338,7 @@ class EndpointManager(Protocol):
         queue_group: Optional[str] = None,
         subject: Optional[str] = None,
         metadata: Optional[Dict[str, str]] = None,
+        queue_group_disabled: bool = False,
     ) -> None: ...
 
     async def add_endpoint(self, config: Optional[EndpointConfig] = None, **kwargs) -> None: ...
@@ -319,7 +350,9 @@ class GroupManager(Protocol):
     """
 
     @overload
-    def add_group(self, *, name: str, queue_group: Optional[str] = None) -> Group: ...
+    def add_group(
+        self, *, name: str, queue_group: Optional[str] = None, queue_group_disabled: bool = False
+    ) -> Group: ...
 
     @overload
     def add_group(self, config: GroupConfig) -> Group: ...
@@ -332,6 +365,7 @@ class Group(GroupManager, EndpointManager):
         self._service = service
         self._prefix = config.name
         self._queue_group = config.queue_group
+        self._queue_group_disabled = config.queue_group_disabled
 
     @overload
     async def add_endpoint(self, config: EndpointConfig) -> None: ...
@@ -345,6 +379,7 @@ class Group(GroupManager, EndpointManager):
         queue_group: Optional[str] = None,
         subject: Optional[str] = None,
         metadata: Optional[Dict[str, str]] = None,
+        queue_group_disabled: bool = False,
     ) -> None: ...
 
     async def add_endpoint(self, config: Optional[EndpointConfig] = None, **kwargs) -> None:
@@ -353,16 +388,22 @@ class Group(GroupManager, EndpointManager):
         else:
             config = replace(config, **kwargs)
 
+        queue_group, queue_group_disabled = _resolve_queue_group(
+            config.queue_group, self._queue_group, config.queue_group_disabled, self._queue_group_disabled
+        )
         config = replace(
             config,
             subject=f"{self._prefix.strip('.')}.{config.subject or config.name}".strip("."),
-            queue_group=config.queue_group or self._queue_group,
+            queue_group=queue_group,
+            queue_group_disabled=queue_group_disabled,
         )
 
         await self._service.add_endpoint(config)
 
     @overload
-    def add_group(self, *, name: str, queue_group: Optional[str] = None) -> Group: ...
+    def add_group(
+        self, *, name: str, queue_group: Optional[str] = None, queue_group_disabled: bool = False
+    ) -> Group: ...
 
     @overload
     def add_group(self, config: GroupConfig) -> Group: ...
@@ -373,10 +414,14 @@ class Group(GroupManager, EndpointManager):
         else:
             config = GroupConfig(**kwargs)
 
+        queue_group, queue_group_disabled = _resolve_queue_group(
+            config.queue_group, self._queue_group, config.queue_group_disabled, self._queue_group_disabled
+        )
         config = replace(
             config,
             name=f"{self._prefix}.{config.name}",
-            queue_group=config.queue_group or self._queue_group,
+            queue_group=queue_group,
+            queue_group_disabled=queue_group_disabled,
         )
 
         return Group(self._service, config)
@@ -413,6 +458,9 @@ class ServiceConfig:
     """
     A handler function used to configure a custom *STATS* endpoint.
     """
+
+    queue_group_disabled: bool = False
+    """Whether the endpoints of the service subscribe without a queue group by default."""
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -622,6 +670,7 @@ class Service(AsyncContextManager):
         self._description = config.description
         self._metadata = config.metadata or {}
         self._queue_group = config.queue_group
+        self._queue_group_disabled = config.queue_group_disabled
         self._stats_handler = config.stats_handler
 
         self._client = client
@@ -682,6 +731,7 @@ class Service(AsyncContextManager):
         queue_group: Optional[str] = None,
         subject: Optional[str] = None,
         metadata: Optional[Dict[str, str]] = None,
+        queue_group_disabled: bool = False,
     ) -> None: ...
 
     async def add_endpoint(self, config: Optional[EndpointConfig] = None, **kwargs) -> None:
@@ -690,14 +740,19 @@ class Service(AsyncContextManager):
         else:
             config = replace(config, **kwargs)
 
-        config = replace(config, queue_group=config.queue_group or self._queue_group)
+        queue_group, queue_group_disabled = _resolve_queue_group(
+            config.queue_group, self._queue_group, config.queue_group_disabled, self._queue_group_disabled
+        )
+        config = replace(config, queue_group=queue_group, queue_group_disabled=queue_group_disabled)
 
         endpoint = Endpoint(self, config)
         await endpoint._start()
         self._endpoints.append(endpoint)
 
     @overload
-    def add_group(self, *, name: str, queue_group: Optional[str] = None) -> Group: ...
+    def add_group(
+        self, *, name: str, queue_group: Optional[str] = None, queue_group_disabled: bool = False
+    ) -> Group: ...
 
     @overload
     def add_group(self, config: GroupConfig) -> Group: ...
@@ -708,7 +763,10 @@ class Service(AsyncContextManager):
         else:
             config = GroupConfig(**kwargs)
 
-        config = replace(config, queue_group=config.queue_group or self._queue_group)
+        queue_group, queue_group_disabled = _resolve_queue_group(
+            config.queue_group, self._queue_group, config.queue_group_disabled, self._queue_group_disabled
+        )
+        config = replace(config, queue_group=queue_group, queue_group_disabled=queue_group_disabled)
 
         return Group(self, config)
 

@@ -195,3 +195,99 @@ class MicroRequestTest(SingleServerTestCase):
 
         await svc.stop()
         await nc.close()
+
+
+async def count_responses(nc, subject, wait=0.3):
+    inbox = nc.new_inbox()
+    sub = await nc.subscribe(inbox)
+    await nc.publish(subject, b"", reply=inbox)
+    await nc.flush()
+    await asyncio.sleep(wait)
+    count = sub.pending_msgs
+    await sub.unsubscribe()
+    return count
+
+
+class MicroQueueGroupTest(SingleServerTestCase):
+    @async_test
+    async def test_queue_group_disabled(self):
+        async def handler(request: Request):
+            await request.respond(b"ok")
+
+        nc = await nats.connect()
+        services = []
+        for _ in range(2):
+            svc = await add_service(nc, name="svc", version="0.1.0", queue_group_disabled=True)
+            # Inherits the service's disabled queue group.
+            await svc.add_endpoint(name="plain", handler=handler)
+            # Its own queue group wins over the service's disabled flag.
+            await svc.add_endpoint(name="queued", queue_group="custom", handler=handler)
+
+            group = svc.add_group(name="g", queue_group="gq")
+            # Disabled on the endpoint only.
+            await group.add_endpoint(name="noqueue", queue_group_disabled=True, handler=handler)
+            await group.add_endpoint(name="grouped", handler=handler)
+
+            disabled_group = svc.add_group(name="d")
+            await disabled_group.add_endpoint(name="inherited", handler=handler)
+            nested = disabled_group.add_group(name="n", queue_group="nq")
+            await nested.add_endpoint(name="nested", handler=handler)
+            services.append(svc)
+
+        info = {e.subject: e.queue_group for e in services[0].info().endpoints}
+        self.assertEqual(
+            info,
+            {
+                "plain": "",
+                "queued": "custom",
+                "g.noqueue": "",
+                "g.grouped": "gq",
+                "d.inherited": "",
+                "d.n.nested": "nq",
+            },
+        )
+        stats = {e.subject: e.queue_group for e in services[0].stats().endpoints}
+        self.assertEqual(stats, info)
+
+        expected = {
+            "plain": 2,
+            "queued": 1,
+            "g.noqueue": 2,
+            "g.grouped": 1,
+            "d.inherited": 2,
+            "d.n.nested": 1,
+        }
+        for subject, count in expected.items():
+            with self.subTest(subject=subject):
+                self.assertEqual(await count_responses(nc, subject), count)
+
+        for svc in services:
+            await svc.stop()
+        await nc.close()
+
+    @async_test
+    async def test_queue_group_default(self):
+        async def handler(request: Request):
+            await request.respond(b"ok")
+
+        nc = await nats.connect()
+        services = []
+        for _ in range(2):
+            svc = await add_service(nc, name="svc", version="0.1.0")
+            await svc.add_endpoint(EndpointConfig(name="e", handler=handler, queue_group_disabled=True))
+            group = svc.add_group(name="g", queue_group_disabled=True)
+            await group.add_endpoint(name="e", handler=handler)
+            await group.add_endpoint(name="q", queue_group="q2", handler=handler)
+            await svc.add_endpoint(name="default", handler=handler)
+            services.append(svc)
+
+        self.assertEqual(await count_responses(nc, "e"), 2)
+        self.assertEqual(await count_responses(nc, "g.e"), 2)
+        self.assertEqual(await count_responses(nc, "g.q"), 1)
+        self.assertEqual(await count_responses(nc, "default"), 1)
+        info = {e.subject: e.queue_group for e in services[1].info().endpoints}
+        self.assertEqual(info, {"e": "", "g.e": "", "g.q": "q2", "default": "q"})
+
+        for svc in services:
+            await svc.stop()
+        await nc.close()
