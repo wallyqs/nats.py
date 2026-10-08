@@ -220,19 +220,56 @@ class ServerErrorMappingTest(unittest.IsolatedAsyncioTestCase):
         server.close()
         await server.wait_closed()
 
-    async def test_auth_revoked_closes(self):
+    async def _auth_error_twice(self, err_msg, **options):
         nc = NATS()
-        closed = []
+        nc.options.update(options)
+        nc._current_server = nats.aio.client.Srv(nc._parse_server_uri("nats://127.0.0.1:4222"))
+        closed, processed, reported = [], [], []
 
         async def close(status, do_cbs=True):
             closed.append(status)
 
+        async def process_op_err(e):
+            processed.append(e)
+
+        async def error_cb(e):
+            reported.append(e)
+
         nc._close = close
-        await nc._process_err("'user authentication revoked'")
+        nc._process_op_err = process_op_err
+        nc._error_cb = error_cb
+        await nc._process_err(err_msg)
         await asyncio.sleep(0)
+        # As nats.go's processAuthError: reported, then a reconnect.
+        self.assertEqual(closed, [])
+        self.assertEqual(len(processed), 1)
+        self.assertEqual(reported, processed)
+        await nc._process_err(err_msg)
+        await asyncio.sleep(0)
+        self.assertEqual(len(reported), 2)
+        return nc, closed, processed
+
+    async def test_auth_revoked_reconnects_then_closes(self):
+        nc, closed, processed = await self._auth_error_twice("'user authentication revoked'")
         self.assertIsInstance(nc.last_error, nats.errors.AuthRevokedError)
         self.assertEqual(str(nc.last_error), "nats: user authentication revoked")
+        # The same error again from the same server aborts.
         self.assertEqual(closed, [NATS.CLOSED])
+        self.assertEqual(len(processed), 1)
+        self.assertIs(nc._close_err, nc.last_error)
+
+    async def test_authorization_violation_reconnects_then_closes(self):
+        nc, closed, processed = await self._auth_error_twice("'authorization violation'")
+        self.assertIsInstance(nc.last_error, nats.errors.AuthorizationError)
+        self.assertEqual(closed, [NATS.CLOSED])
+        self.assertEqual(len(processed), 1)
+
+    async def test_auth_error_ignore_abort_keeps_reconnecting(self):
+        nc, closed, processed = await self._auth_error_twice(
+            "'user authentication revoked'", ignore_auth_error_abort=True
+        )
+        self.assertEqual(closed, [])
+        self.assertEqual(len(processed), 2)
 
     async def test_account_auth_expired_reconnects(self):
         nc = NATS()
@@ -590,6 +627,124 @@ class AuthErrorAbortTest(ConfiguredServerTestCase):
         await asyncio.wait_for(reconnected.wait(), 4)
         self.assertTrue(nc.is_connected)
         await nc.close()
+
+
+class LiveAuthErrorServer:
+    """
+    A NATS server that accepts the first connection and later sends it an
+    authentication -ERR, then rejects every later CONNECT with ``reject``.
+    """
+
+    def __init__(self, live_err, reject=b"-ERR 'Authorization Violation'\r\n"):
+        self.live_err = live_err
+        self.reject = reject
+        self.connections = 0
+        self.first = asyncio.get_running_loop().create_future()
+
+    async def __aenter__(self):
+        self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        self.url = f"nats://127.0.0.1:{self.server.sockets[0].getsockname()[1]}"
+        return self
+
+    async def __aexit__(self, *exc):
+        self.server.close()
+
+    def send_live_err(self):
+        writer = self.first.result()
+        writer.write(self.live_err)
+        writer.close()
+
+    async def _handle(self, reader, writer):
+        self.connections += 1
+        accept = self.connections == 1
+        info = {"server_id": "FAKE", "version": "2.10.0", "max_payload": 1048576}
+        writer.write(b"INFO " + json.dumps(info).encode() + b"\r\n")
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                if line.startswith(b"CONNECT") and not accept:
+                    writer.write(self.reject)
+                    await writer.drain()
+                    break
+                if line.startswith(b"PING"):
+                    writer.write(b"PONG\r\n")
+                    await writer.drain()
+                    if accept and not self.first.done():
+                        self.first.set_result(writer)
+        except ConnectionError:
+            pass
+        writer.close()
+
+
+class LiveAuthErrorTest(unittest.IsolatedAsyncioTestCase):
+    async def run_live_auth_error(self, live_err, **options):
+        events = []
+        closed = asyncio.Event()
+
+        async def error_cb(e):
+            events.append(("error", type(e)))
+
+        async def disconnected_cb():
+            events.append("disconnected")
+
+        async def closed_cb():
+            closed.set()
+
+        async with LiveAuthErrorServer(live_err) as server:
+            nc = await nats.connect(
+                server.url,
+                error_cb=error_cb,
+                disconnected_cb=disconnected_cb,
+                closed_cb=closed_cb,
+                reconnect_time_wait=0.05,
+                max_reconnect_attempts=-1,
+                **options,
+            )
+            server.send_live_err()
+            if options.get("ignore_auth_error_abort"):
+
+                async def reconnecting():
+                    while server.connections < 4 and not nc.is_closed:
+                        await asyncio.sleep(0.02)
+
+                await asyncio.wait_for(reconnecting(), 2)
+                self.assertFalse(nc.is_closed)
+                await nc.close()
+            else:
+                await asyncio.wait_for(closed.wait(), 2)
+            return nc, events, server
+
+    async def test_authorization_violation_reconnects_then_aborts(self):
+        nc, events, server = await self.run_live_auth_error(b"-ERR 'Authorization Violation'\r\n")
+        # As nats.go: reported to the error callback, then a reconnect, and
+        # the same error again from the same server closes the connection.
+        self.assertEqual(
+            events[:4],
+            [
+                ("error", nats.errors.AuthorizationError),
+                "disconnected",
+                ("error", nats.errors.AuthorizationError),
+                "disconnected",
+            ],
+        )
+        self.assertEqual(server.connections, 2)
+        self.assertIsInstance(nc.last_error, nats.errors.AuthorizationError)
+
+    async def test_auth_revoked_reconnects(self):
+        nc, events, server = await self.run_live_auth_error(b"-ERR 'User Authentication Revoked'\r\n")
+        self.assertEqual(events[:2], [("error", nats.errors.AuthRevokedError), "disconnected"])
+        # A different auth error on reconnect does not abort at once.
+        self.assertEqual(server.connections, 3)
+        self.assertIsInstance(nc.last_error, nats.errors.AuthorizationError)
+
+    async def test_ignore_auth_error_abort_keeps_reconnecting(self):
+        nc, events, server = await self.run_live_auth_error(
+            b"-ERR 'Authorization Violation'\r\n", ignore_auth_error_abort=True
+        )
+        self.assertEqual(events[0], ("error", nats.errors.AuthorizationError))
+        self.assertGreaterEqual(server.connections, 4)
 
 
 class RetryOnFailedConnectTest(unittest.TestCase):

@@ -2189,29 +2189,33 @@ class Client:
             await self._process_op_err(errors.StaleConnectionError())
             return
 
+        auth_err: Optional[Exception] = None
         if AUTHENTICATION_EXPIRED in err_msg:
             if ACCOUNT_AUTHENTICATION_EXPIRED in err_msg:
-                await self._process_op_err(errors.AccountAuthExpiredError())
+                auth_err = errors.AccountAuthExpiredError()
             else:
-                await self._process_op_err(errors.AuthenticationExpiredError())
+                auth_err = errors.AuthenticationExpiredError()
+        elif AUTHORIZATION_VIOLATION in err_msg:
+            auth_err = errors.AuthorizationError()
+        elif AUTHENTICATION_REVOKED in err_msg:
+            auth_err = _server_error(err_msg.strip("'"))
+        if auth_err is not None:
+            await self._process_auth_err(auth_err)
             return
 
-        if AUTHORIZATION_VIOLATION in err_msg:
-            self._err = errors.AuthorizationError()
-        else:
-            prot_err = err_msg.strip("'")
-            err = _server_error(prot_err)
-            self._err = err
+        prot_err = err_msg.strip("'")
+        err = _server_error(prot_err)
+        self._err = err
 
-            # Neither error makes the server close the connection, so they
-            # are only reported, as nats.go's processTransientError.
-            if isinstance(err, (errors.PermissionViolationError, errors.MaxSubscriptionsExceededError)):
-                if isinstance(err, errors.PermissionViolationError) and self.options.get(
-                    "permission_err_on_subscribe", False
-                ):
-                    self._process_permission_violation(prot_err, err)
-                await self._error_cb(err)
-                return
+        # Neither error makes the server close the connection, so they
+        # are only reported, as nats.go's processTransientError.
+        if isinstance(err, (errors.PermissionViolationError, errors.MaxSubscriptionsExceededError)):
+            if isinstance(err, errors.PermissionViolationError) and self.options.get(
+                "permission_err_on_subscribe", False
+            ):
+                self._process_permission_violation(prot_err, err)
+            await self._error_cb(err)
+            return
 
         do_cbs = False
         if not self.is_connecting:
@@ -2222,6 +2226,23 @@ class Client:
         # For now we handle similar as other clients and close.
         self._close_err = self._err
         asyncio.create_task(self._close(Client.CLOSED, do_cbs))
+
+    async def _process_auth_err(self, err: Exception) -> None:
+        """
+        Handles an authentication error the server sent on an established
+        connection, as nats.go's processErr and processAuthError: the error
+        is reported to error_cb and the client reconnects, unless the current
+        server already rejected the credentials with the same error (and
+        ignore_auth_error_abort is not set), in which case it closes.
+        """
+        self._err = err
+        if not self.is_connecting:
+            await self._error_cb(err)
+        if self._abort_on_auth_error(err):
+            self._close_err = err
+            asyncio.create_task(self._close(Client.CLOSED, not self.is_connecting))
+            return
+        await self._process_op_err(err)
 
     def _process_permission_violation(self, description: str, err: Exception) -> None:
         """
