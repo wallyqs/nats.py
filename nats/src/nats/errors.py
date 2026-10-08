@@ -199,6 +199,11 @@ class MaxMessagesError(Error):
         return "nats: maximum messages delivered"
 
 
+class InvalidArgError(Error, ValueError):
+    def __str__(self) -> str:
+        return "nats: invalid argument"
+
+
 class BadTimeoutError(Error):
     def __str__(self) -> str:
         return "nats: timeout invalid"

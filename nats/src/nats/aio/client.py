@@ -543,6 +543,8 @@ class Client:
         custom_dialer: Optional[CustomDialer] = None,
         flusher_timeout: Optional[float] = None,
         reconnect_on_flusher_error: bool = True,
+        sub_pending_msgs_limit: int = DEFAULT_SUB_PENDING_MSGS_LIMIT,
+        sub_pending_bytes_limit: int = DEFAULT_SUB_PENDING_BYTES_LIMIT,
     ) -> None:
         """
         Establishes a connection to NATS.
@@ -615,6 +617,10 @@ class Client:
         :param reconnect_on_flusher_error: Reconnect when the background flusher
             fails to write (the default). When False, the error is recorded in
             last_error and reported to error_cb only.
+        :param sub_pending_msgs_limit: Default pending messages limit of the
+            subscriptions, used when subscribe() is not given one.
+        :param sub_pending_bytes_limit: Default pending bytes limit of the
+            subscriptions, used when subscribe() is not given one.
 
         Connecting setting all callbacks::
 
@@ -779,6 +785,8 @@ class Client:
         self.options["custom_dialer"] = custom_dialer
         self.options["flusher_timeout"] = flusher_timeout
         self.options["reconnect_on_flusher_error"] = reconnect_on_flusher_error
+        self.options["sub_pending_msgs_limit"] = sub_pending_msgs_limit
+        self.options["sub_pending_bytes_limit"] = sub_pending_bytes_limit
         self.options["skip_subject_validation"] = skip_subject_validation
         self._skip_subject_validation = skip_subject_validation
         self.options["no_callbacks_after_client_close"] = no_callbacks_after_client_close
@@ -1159,6 +1167,7 @@ class Client:
         # Cleanup subscriptions since not reconnecting so no need
         # to replay the subscriptions anymore.
         for sub in self._subs.values():
+            sub._notify_closed()
             # Async subs use join when draining already so just cancel here.
             if sub._wait_for_msgs_task and not sub._wait_for_msgs_task.done():
                 sub._wait_for_msgs_task.cancel()
@@ -1360,11 +1369,14 @@ class Client:
         cb: Optional[Callable[[Msg], Awaitable[None]]] = None,
         future: Optional[asyncio.Future] = None,
         max_msgs: int = 0,
-        pending_msgs_limit: int = DEFAULT_SUB_PENDING_MSGS_LIMIT,
-        pending_bytes_limit: int = DEFAULT_SUB_PENDING_BYTES_LIMIT,
+        pending_msgs_limit: Optional[int] = None,
+        pending_bytes_limit: Optional[int] = None,
     ) -> Subscription:
         """
         subscribe registers interest in a given subject.
+
+        The pending limits default to the connection's sub_pending_msgs_limit
+        and sub_pending_bytes_limit.
 
         If a callback is provided, messages will be processed asynchronously.
 
@@ -1383,6 +1395,11 @@ class Client:
 
         if self.is_draining:
             raise errors.ConnectionDrainingError
+
+        if pending_msgs_limit is None:
+            pending_msgs_limit = self.options.get("sub_pending_msgs_limit", DEFAULT_SUB_PENDING_MSGS_LIMIT)
+        if pending_bytes_limit is None:
+            pending_bytes_limit = self.options.get("sub_pending_bytes_limit", DEFAULT_SUB_PENDING_BYTES_LIMIT)
 
         self._sid += 1
         sid = self._sid
@@ -2365,7 +2382,7 @@ class Client:
                         self._transport.write(unsub_cmd)
 
                 for sid in subs_to_remove:
-                    self._subs.pop(sid)
+                    self._subs.pop(sid)._notify_closed()
 
                 await self._transport.drain()
 
@@ -2763,6 +2780,7 @@ class Client:
             # internal queue and the task will finish once the last
             # message is processed.
             self._subs.pop(sid, None)
+            sub._notify_closed()
 
         hdr = await self._process_headers(headers)
         msg = self._build_message(sid, subject, reply, data, hdr)
@@ -2828,14 +2846,21 @@ class Client:
                     # Subtract the bytes since the message will be thrown away
                     # so it would not be pending data.
                     sub._pending_size -= payload_size
+                    sub._dropped += 1
 
                     await self._error_cb(
                         errors.SlowConsumerError(subject=msg.subject, reply=msg.reply, sid=sid, sub=sub)
                     )
                     return
                 sub._pending_queue.put_nowait(msg)
+                pending_msgs = sub._pending_queue.qsize()
+                if pending_msgs > sub._max_pending_msgs:
+                    sub._max_pending_msgs = pending_msgs
+                if sub._pending_size > sub._max_pending_bytes:
+                    sub._max_pending_bytes = sub._pending_size
             except asyncio.QueueFull:
                 sub._pending_size -= len(msg.data)
+                sub._dropped += 1
                 await self._error_cb(errors.SlowConsumerError(subject=msg.subject, reply=msg.reply, sid=sid, sub=sub))
 
             # Store the ACK metadata from the message to

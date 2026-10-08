@@ -18,11 +18,13 @@ import asyncio
 import inspect
 from typing import (
     TYPE_CHECKING,
+    Any,
     AsyncIterator,
     Awaitable,
     Callable,
     List,
     Optional,
+    Tuple,
 )
 from uuid import uuid4
 
@@ -79,6 +81,16 @@ class Subscription:
 
     """
 
+    # Defaults for subclasses that do not call __init__ (the JetStream
+    # subscriptions wrap a plain one and copy its fields).
+    _max_pending_msgs = 0
+    _max_pending_bytes = 0
+    _dropped = 0
+    _draining = False
+    _closed_cb: Optional[Callable[[str], Any]] = None
+    _closed_cb_called = False
+    _permission_error: Optional[Exception] = None
+
     def __init__(
         self,
         conn,
@@ -114,6 +126,15 @@ class Subscription:
         self._pending_size = 0
         self._wait_for_msgs_task = None
         self._message_iterator = None
+
+        # High-water marks of the pending queue, messages dropped for being a
+        # slow consumer, draining state and the closed callback.
+        self._max_pending_msgs = 0
+        self._max_pending_bytes = 0
+        self._dropped = 0
+        self._draining = False
+        self._closed_cb: Optional[Callable[[str], Any]] = None
+        self._closed_cb_called = False
 
         # Permissions violation the server reported for this subscription,
         # raised by next_msg and iteration when the connection was made
@@ -180,6 +201,87 @@ class Subscription:
         Number of delivered messages to this subscription so far.
         """
         return self._received
+
+    @property
+    def pending_limits(self) -> Tuple[int, int]:
+        """
+        The (messages, bytes) limits of the pending queue, past which
+        messages are dropped, as nats.go's PendingLimits.
+        """
+        return self._pending_msgs_limit, self._pending_bytes_limit
+
+    def set_pending_limits(self, msgs_limit: int, bytes_limit: int) -> None:
+        """
+        Changes the limits of the pending queue, as nats.go's
+        SetPendingLimits. Zero is not allowed; a negative value removes the
+        limit.
+        """
+        if self._closed or self._conn.is_closed:
+            raise errors.BadSubscriptionError
+        if msgs_limit == 0 or bytes_limit == 0:
+            raise errors.InvalidArgError
+        self._pending_msgs_limit = msgs_limit
+        self._pending_bytes_limit = bytes_limit
+        # asyncio.Queue has no setter; a size of 0 or less is unbounded.
+        self._pending_queue._maxsize = max(msgs_limit, 0)  # type: ignore[attr-defined]
+
+    def _delivery(self) -> Subscription:
+        """The subscription the connection delivers to (a wrapped one, if any)."""
+        return self.__dict__.get("_sub", self)
+
+    @property
+    def max_pending(self) -> Tuple[int, int]:
+        """
+        The most (messages, bytes) the pending queue held,
+        as nats.go's MaxPending.
+        """
+        sub = self._delivery()
+        return sub._max_pending_msgs, sub._max_pending_bytes
+
+    def clear_max_pending(self) -> None:
+        """Resets max_pending, as nats.go's ClearMaxPending."""
+        sub = self._delivery()
+        sub._max_pending_msgs = 0
+        sub._max_pending_bytes = 0
+
+    @property
+    def dropped(self) -> int:
+        """
+        The number of messages dropped because the pending limits were
+        reached (slow consumer), as nats.go's Dropped.
+        """
+        return self._delivery()._dropped
+
+    @property
+    def is_draining(self) -> bool:
+        """Whether the subscription is draining, as nats.go's IsDraining."""
+        return self._draining or self._delivery()._draining
+
+    @property
+    def is_valid(self) -> bool:
+        """
+        Whether the subscription still receives messages: not unsubscribed,
+        drained or done with its auto-unsubscribe limit, on an open
+        connection. As nats.go's IsValid.
+        """
+        return not self._closed and not self._conn.is_closed and self._conn._subs.get(self._id) is self._delivery()
+
+    def set_closed_cb(self, cb: Optional[Callable[[str], Any]]) -> None:
+        """
+        Sets a function (or coroutine function) called with the subject
+        once the subscription is closed: unsubscribed, drained, done with
+        its auto-unsubscribe limit or closed with the connection.
+        As nats.go's SetClosedHandler.
+        """
+        self._closed_cb = cb
+
+    def _notify_closed(self) -> None:
+        if self._closed_cb is None or self._closed_cb_called:
+            return
+        self._closed_cb_called = True
+        result = self._closed_cb(self._subject)
+        if inspect.isawaitable(result):
+            asyncio.ensure_future(result)
 
     async def next_msg(self, timeout: Optional[float] = 1.0) -> Msg:
         """
@@ -282,6 +384,7 @@ class Subscription:
         await self._drain()
 
     async def _drain(self) -> None:
+        self._draining = True
         try:
             # Announce server that no longer want to receive more
             # messages in this sub and just process the ones remaining.
@@ -305,6 +408,8 @@ class Subscription:
             raise
         finally:
             self._closed = True
+            self._draining = False
+            self._notify_closed()
 
     async def unsubscribe(self, limit: int = 0):
         """
@@ -328,6 +433,7 @@ class Subscription:
             self._closed = True
             self._stop_processing()
             self._conn._remove_sub(self._id)
+            self._notify_closed()
 
         if not self._conn.is_reconnecting:
             await self._conn._send_unsubscribe(self._id, limit=limit)

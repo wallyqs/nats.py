@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 import nats
+import nats.aio.subscription
 import nats.errors
 from nats.aio.client import Client as NATS
 
@@ -21,6 +22,7 @@ from tests.utils import (
     NATSD,
     ClusteringTestCase,
     NkeysServerTestCase,
+    SingleJetStreamServerTestCase,
     SingleServerTestCase,
     SingleWebSocketServerTestCase,
     TLSServerTestCase,
@@ -1257,6 +1259,132 @@ class MsgTest(SingleServerTestCase):
             await Msg(_client=nc, subject="foo", reply="bar").respond_msg(None)
         with self.assertRaises(nats.errors.MsgNoReplyError):
             await Msg(_client=nc, subject="foo").respond_msg(Msg(_client=nc))
+        await nc.close()
+
+
+class SubscriptionTest(SingleServerTestCase):
+    @async_test
+    async def test_pending_limits_and_dropped(self):
+        errs = []
+
+        async def error_cb(e):
+            errs.append(e)
+
+        nc = await nats.connect(error_cb=error_cb)
+        sub = await nc.subscribe("foo", pending_msgs_limit=5)
+        self.assertEqual(sub.pending_limits, (5, nats.aio.subscription.DEFAULT_SUB_PENDING_BYTES_LIMIT))
+        for i in range(8):
+            await nc.publish("foo", b"x")
+        await nc.flush()
+        self.assertEqual(sub.dropped, 3)
+        self.assertEqual(sub.max_pending, (5, 5))
+        self.assertEqual(len([e for e in errs if isinstance(e, nats.errors.SlowConsumerError)]), 3)
+
+        for i in range(5):
+            await sub.next_msg()
+        self.assertEqual(sub.max_pending, (5, 5))
+        sub.clear_max_pending()
+        self.assertEqual(sub.max_pending, (0, 0))
+
+        # Raising the limit lets more messages queue up; negative is unlimited.
+        sub.set_pending_limits(-1, -1)
+        self.assertEqual(sub.pending_limits, (-1, -1))
+        for i in range(8):
+            await nc.publish("foo", b"x")
+        await nc.flush()
+        self.assertEqual(sub.pending_msgs, 8)
+        self.assertEqual(sub.dropped, 3)
+
+        with self.assertRaises(nats.errors.InvalidArgError):
+            sub.set_pending_limits(0, 100)
+        await sub.unsubscribe()
+        with self.assertRaises(nats.errors.BadSubscriptionError):
+            sub.set_pending_limits(10, 100)
+        await nc.close()
+
+    @async_test
+    async def test_connection_default_pending_limits(self):
+        nc = await nats.connect(sub_pending_msgs_limit=10, sub_pending_bytes_limit=1024)
+        sub = await nc.subscribe("foo")
+        self.assertEqual(sub.pending_limits, (10, 1024))
+        sub = await nc.subscribe("foo", pending_msgs_limit=20)
+        self.assertEqual(sub.pending_limits, (20, 1024))
+        await nc.close()
+
+    @async_test
+    async def test_is_valid_and_closed_cb(self):
+        nc = await nats.connect()
+        closed = []
+
+        async def async_closed(subject):
+            closed.append(subject)
+
+        sub = await nc.subscribe("unsub")
+        sub.set_closed_cb(closed.append)
+        self.assertTrue(sub.is_valid)
+        await sub.unsubscribe()
+        self.assertFalse(sub.is_valid)
+        self.assertEqual(closed, ["unsub"])
+
+        sub = await nc.subscribe("auto")
+        sub.set_closed_cb(async_closed)
+        await sub.unsubscribe(limit=1)
+        await nc.publish("auto", b"")
+        await nc.flush()
+        await asyncio.sleep(0)
+        self.assertFalse(sub.is_valid)
+        self.assertEqual(closed, ["unsub", "auto"])
+
+        sub = await nc.subscribe("conn")
+        sub.set_closed_cb(closed.append)
+        await nc.close()
+        self.assertFalse(sub.is_valid)
+        self.assertEqual(closed, ["unsub", "auto", "conn"])
+
+    @async_test
+    async def test_is_draining(self):
+        nc = await nats.connect()
+        release = asyncio.Event()
+        closed = []
+
+        async def cb(msg):
+            await release.wait()
+
+        sub = await nc.subscribe("foo", cb=cb)
+        sub.set_closed_cb(closed.append)
+        await nc.publish("foo", b"")
+        await nc.flush()
+        self.assertFalse(sub.is_draining)
+        drain = asyncio.create_task(sub.drain())
+        await asyncio.sleep(0.1)
+        self.assertTrue(sub.is_draining)
+        release.set()
+        await asyncio.wait_for(drain, 2)
+        self.assertFalse(sub.is_draining)
+        self.assertFalse(sub.is_valid)
+        self.assertEqual(closed, ["foo"])
+        await nc.close()
+
+
+class JetStreamSubscriptionTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_push_subscription_state(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="S", subjects=["s"])
+        await js.publish("s", b"1")
+        closed = []
+        sub = await js.subscribe("s")
+        sub.set_closed_cb(closed.append)
+        msg = await sub.next_msg()
+        self.assertEqual(msg.data, b"1")
+        self.assertTrue(sub.is_valid)
+        self.assertEqual(sub.dropped, 0)
+        self.assertEqual(sub.max_pending[0], 1)
+        self.assertFalse(sub.is_draining)
+        await sub.unsubscribe()
+        self.assertFalse(sub.is_valid)
+        self.assertEqual(closed, [sub.subject])
         await nc.close()
 
 
