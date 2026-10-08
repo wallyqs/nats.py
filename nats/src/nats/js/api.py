@@ -1004,6 +1004,14 @@ class KeyValueConfig(Base):
     republish: Optional[RePublish] = None
     direct: Optional[bool] = None
     limit_marker_ttl: Optional[float] = None  # in seconds; client-side only
+    # Compress the bucket's stream with S2 (stream compression).
+    compression: bool = False
+    # Mirror another bucket (nats.go adds the KV_ prefix to its name).
+    mirror: Optional[StreamSource] = None
+    # Source other buckets into this one (nats.go adds the KV_ prefix to
+    # their names and maps their subjects into this bucket).
+    sources: Optional[List[StreamSource]] = None
+    metadata: Optional[Dict[str, str]] = None
 
     def as_dict(self) -> Dict[str, object]:
         result = super().as_dict()

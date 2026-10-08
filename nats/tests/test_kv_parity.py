@@ -1,3 +1,5 @@
+import asyncio
+
 import nats
 import nats.js.api
 import pytest
@@ -16,7 +18,11 @@ from nats.js.errors import (
     NotFoundError,
 )
 
-from tests.utils import SingleJetStreamServerTestCase, async_test
+from tests.utils import (
+    SingleJetStreamServerDomainTestCase,
+    SingleJetStreamServerTestCase,
+    async_test,
+)
 
 
 class KVErrorsTest(SingleJetStreamServerTestCase):
@@ -164,5 +170,128 @@ class KVManagerTest(SingleJetStreamServerTestCase):
         kv = await js.create_or_update_key_value(bucket="UPSERT", history=4)
         assert (await kv.status()).history == 4
         assert (await kv.get("a")).value == b"1"
+
+        await nc.close()
+
+
+async def _wait_for_messages(js, stream, count):
+    for _ in range(100):
+        si = await js.stream_info(stream)
+        if si.state.messages >= count:
+            return si
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"{stream} did not reach {count} messages")
+
+
+class KVConfigTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_compression_and_metadata(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        await js.create_key_value(bucket="COMPRESSED", compression=True, metadata={"owner": "kv"})
+        si = await js.stream_info("KV_COMPRESSED")
+        assert si.config.compression == nats.js.api.StoreCompression.S2
+        assert si.config.metadata["owner"] == "kv"
+
+        await js.create_key_value(bucket="PLAIN")
+        si = await js.stream_info("KV_PLAIN")
+        assert si.config.compression in (None, nats.js.api.StoreCompression.NONE)
+
+        await nc.close()
+
+    @async_test
+    async def test_mirror(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        origin = await js.create_key_value(bucket="ORIGIN", direct=True)
+        await origin.put("a", b"1")
+
+        # Direct gets are needed for the server to keep mirror_direct.
+        mirror = await js.create_key_value(
+            bucket="MIRROR",
+            direct=True,
+            mirror=nats.js.api.StreamSource(name="ORIGIN"),
+        )
+        si = await js.stream_info("KV_MIRROR")
+        assert si.config.mirror.name == "KV_ORIGIN"
+        assert si.config.mirror_direct is True
+        assert not si.config.subjects
+        await _wait_for_messages(js, "KV_MIRROR", 1)
+
+        # Writes through the mirror go to the mirrored bucket.
+        await mirror.put("b", b"2")
+        assert (await origin.get("b")).value == b"2"
+        await _wait_for_messages(js, "KV_MIRROR", 2)
+
+        # Binding keeps the redirection.
+        mirror = await js.key_value("MIRROR")
+        await mirror.put("c", b"3")
+        assert (await origin.get("c")).value == b"3"
+
+        await nc.close()
+
+    @async_test
+    async def test_sources(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        one = await js.create_key_value(bucket="ONE")
+        two = await js.create_key_value(bucket="TWO")
+        await one.put("k1", b"1")
+        await two.put("k2", b"2")
+
+        sources = [
+            nats.js.api.StreamSource(name="ONE"),
+            nats.js.api.StreamSource(name="KV_TWO"),
+        ]
+        agg = await js.create_key_value(bucket="AGG", sources=sources)
+        # The caller's sources are left untouched.
+        assert sources[0].name == "ONE"
+        assert sources[0].subject_transforms is None
+
+        si = await js.stream_info("KV_AGG")
+        assert si.config.subjects == ["$KV.AGG.>"]
+        by_name = {s.name: s for s in si.config.sources}
+        assert set(by_name) == {"KV_ONE", "KV_TWO"}
+        assert by_name["KV_ONE"].subject_transforms[0].src == "$KV.ONE.>"
+        assert by_name["KV_ONE"].subject_transforms[0].dest == "$KV.AGG.>"
+        assert by_name["KV_TWO"].subject_transforms[0].src == "$KV.TWO.>"
+
+        await _wait_for_messages(js, "KV_AGG", 2)
+        assert (await agg.get("k1")).value == b"1"
+        assert (await agg.get("k2")).value == b"2"
+
+        await nc.close()
+
+
+class KVMirrorDomainTest(SingleJetStreamServerDomainTestCase):
+    @async_test
+    async def test_mirror_of_bucket_in_other_domain(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        origin = await js.create_key_value(bucket="ORIGIN")
+        await origin.put("a", b"1")
+
+        api_prefix = "$JS.test-domain.API"
+        mirror = await js.create_key_value(
+            bucket="MIRROR",
+            mirror=nats.js.api.StreamSource(
+                name="ORIGIN",
+                external=nats.js.api.ExternalStream(api=api_prefix),
+            ),
+        )
+        # Reads use the mirrored bucket's subjects, writes go through the
+        # other domain's API prefix.
+        assert mirror._pre == "$KV.ORIGIN."
+        assert mirror._mutation_pre == f"{api_prefix}.$KV.ORIGIN."
+
+        # The write reaches the mirrored bucket through the domain's API.
+        # (Syncing a mirror needs a leafnode to the other domain, so reads
+        # are only checked through the subjects above.)
+        await mirror.put("b", b"2")
+        assert (await origin.get("b")).value == b"2"
 
         await nc.close()

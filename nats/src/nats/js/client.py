@@ -1714,6 +1714,42 @@ class JetStreamContext(JetStreamManager):
             placement=config.placement,
             subject_delete_marker_ttl=subject_delete_marker_ttl,
         )
+        if config.compression:
+            stream.compression = api.StoreCompression.S2
+        if config.metadata:
+            stream.metadata = config.metadata
+
+        if config.mirror is not None:
+            # A mirror has no subjects of its own; it is read through direct
+            # gets of the mirror (nats.go sets MirrorDirect).
+            mirror = config.mirror.evolve()
+            if not mirror.name.startswith(KV_STREAM_PREFIX):
+                mirror.name = KV_STREAM_TEMPLATE.format(bucket=mirror.name)
+            stream.mirror = mirror
+            stream.mirror_direct = True
+            stream.subjects = None
+        elif config.sources:
+            sources = []
+            for source in config.sources:
+                source = source.evolve()
+                # A source with its own subject transforms is kept as given.
+                if not source.subject_transforms:
+                    if source.name.startswith(KV_STREAM_PREFIX):
+                        source_bucket = source.name[len(KV_STREAM_PREFIX) :]
+                    else:
+                        source_bucket = source.name
+                        source.name = KV_STREAM_TEMPLATE.format(bucket=source_bucket)
+                    # Keys of another bucket are mapped into this bucket's
+                    # subjects (not needed for the same bucket in another domain).
+                    if source.external is None or source_bucket != config.bucket:
+                        source.subject_transforms = [
+                            api.SubjectTransform(
+                                src=f"$KV.{source_bucket}.>",
+                                dest=f"$KV.{config.bucket}.>",
+                            )
+                        ]
+                sources.append(source)
+            stream.sources = sources
         return stream
 
     def _map_stream_to_kv(self, si: api.StreamInfo) -> KeyValue:
@@ -1724,12 +1760,32 @@ class JetStreamContext(JetStreamManager):
         stream = si.config.name
         assert stream is not None
         bucket = stream[len(KV_STREAM_PREFIX) :] if stream.startswith(KV_STREAM_PREFIX) else stream
+        pre = KV_PRE_TEMPLATE.format(bucket=bucket)
+        put_pre = None
+        use_js_prefix = True
+
+        # A mirror writes to the bucket it mirrors. When that bucket is in
+        # another domain, keys are also read under its subjects and writes
+        # go through that domain's API prefix.
+        mirror = si.config.mirror
+        if mirror is not None:
+            name = mirror.name
+            origin = name[len(KV_STREAM_PREFIX) :] if name.startswith(KV_STREAM_PREFIX) else name
+            if mirror.external is not None and mirror.external.api:
+                use_js_prefix = False
+                pre = KV_PRE_TEMPLATE.format(bucket=origin)
+                put_pre = f"{mirror.external.api}.{KV_PRE_TEMPLATE.format(bucket=origin)}"
+            else:
+                put_pre = KV_PRE_TEMPLATE.format(bucket=origin)
+
         return KeyValue(
             name=bucket,
             stream=stream,
-            pre=KV_PRE_TEMPLATE.format(bucket=bucket),
+            pre=pre,
             js=self,
             direct=bool(si.config.allow_direct),
+            put_pre=put_pre,
+            use_js_prefix=use_js_prefix,
         )
 
     async def delete_key_value(self, bucket: str) -> bool:

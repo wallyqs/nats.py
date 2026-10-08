@@ -142,6 +142,8 @@ class KeyValue:
         pre: str,
         js: JetStreamContext,
         direct: bool,
+        put_pre: Optional[str] = None,
+        use_js_prefix: bool = True,
     ) -> None:
         self._name = name
         self._stream = stream
@@ -153,9 +155,11 @@ class KeyValue:
         # context targets a non-default domain (nats.go useJSPfx behavior):
         # "$JS.<domain>.API.$KV.<bucket>.<key>". Reads and watchers keep the
         # local data subject since stream subjects are not prefixed.
-        self._mutation_pre = pre
-        if js._prefix != api.DEFAULT_PREFIX:
-            self._mutation_pre = f"{js._prefix}.{pre}"
+        # A bucket that mirrors another one writes to the mirrored bucket
+        # (put_pre), already qualified when that bucket is in another domain.
+        self._mutation_pre = pre if put_pre is None else put_pre
+        if use_js_prefix and js._prefix != api.DEFAULT_PREFIX:
+            self._mutation_pre = f"{js._prefix}.{self._mutation_pre}"
 
     async def get(self, key: str, revision: Optional[int] = None, validate_keys: bool = True) -> Entry:
         """
