@@ -823,14 +823,15 @@ class ConsumerInfo(Base):
     # Indicates if the consumer is currently paused.
     # Introduced in nats-server 2.11.0.
     paused: Optional[bool] = None
-    # RFC 3339 timestamp until which the consumer is paused.
+    # Seconds remaining until the consumer resumes.
     # Introduced in nats-server 2.11.0.
-    pause_remaining: Optional[str] = None
+    pause_remaining: Optional[float] = None
     # Introduced in nats-server 2.11.0.
     priority_groups: Optional[list[PriorityGroupState]] = None
 
     @classmethod
     def from_response(cls, resp: Dict[str, Any]):
+        cls._convert_nanoseconds(resp, "pause_remaining")
         cls._convert(resp, "delivered", SequenceInfo)
         cls._convert(resp, "ack_floor", SequenceInfo)
         cls._convert(resp, "config", ConsumerConfig)
@@ -854,7 +855,13 @@ class ConsumerPause(Base):
 
     paused: bool
     pause_until: Optional[str] = None
-    pause_remaining: Optional[str] = None
+    # Seconds remaining until the consumer resumes.
+    pause_remaining: Optional[float] = None
+
+    @classmethod
+    def from_response(cls, resp: Dict[str, Any]):
+        cls._convert_nanoseconds(resp, "pause_remaining")
+        return super().from_response(resp)
 
 
 @dataclass

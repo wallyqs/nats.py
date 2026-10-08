@@ -1952,11 +1952,15 @@ class ConsumerPauseResumeTest(SingleJetStreamServerTestCase):
 
         pause_resp = await jsm.pause_consumer("PAUSETEST", consumer_name, pause_until)
         assert pause_resp.paused is True
-        assert pause_resp.pause_remaining is not None
+        # The server reports nanoseconds; the client exposes seconds.
+        assert isinstance(pause_resp.pause_remaining, float)
+        assert 3500 < pause_resp.pause_remaining <= 3600
 
         # Verify consumer is still paused when we check info
         cinfo = await jsm.consumer_info("PAUSETEST", consumer_name)
         assert cinfo.paused is True
+        assert isinstance(cinfo.pause_remaining, float)
+        assert 3500 < cinfo.pause_remaining <= 3600
 
         # Resume the consumer
         resume_resp = await jsm.resume_consumer("PAUSETEST", consumer_name)
