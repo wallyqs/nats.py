@@ -476,3 +476,140 @@ class MicroDefaultEndpointTest(SingleServerTestCase):
             self.assertEqual(svc2.info().endpoints[0].queue_group, "eq")
 
         await nc.close()
+
+
+class MicroLifecycleTest(SingleServerTestCase):
+    @async_test
+    async def test_done_handler_on_stop(self):
+        done = []
+
+        async def async_done(svc):
+            done.append(("async", svc.id))
+
+        nc = await nats.connect()
+        svc = await add_service(nc, name="svc", version="0.1.0", done_handler=async_done)
+        await svc.add_endpoint(name="e", handler=noop_handler)
+        await svc.stop()
+        await svc.stop()
+        self.assertEqual(done, [("async", svc.id)])
+        self.assertTrue(svc.stopped.is_set())
+
+        # A plain function works too.
+        svc2 = await add_service(nc, name="svc", version="0.1.0", done_handler=lambda s: done.append(("sync", s.id)))
+        await svc2.stop()
+        self.assertEqual(done[-1], ("sync", svc2.id))
+        await nc.close()
+
+    @async_test
+    async def test_connection_close_stops_service(self):
+        events = []
+
+        async def closed_cb():
+            events.append("closed_cb")
+
+        nc = await nats.connect(closed_cb=closed_cb)
+        services = []
+        for i in range(2):
+            svc = await add_service(
+                nc,
+                name=f"svc{i}",
+                version="0.1.0",
+                done_handler=lambda s, i=i: events.append(f"done{i}"),
+            )
+            await svc.add_endpoint(name="e", subject=f"svc{i}.e", handler=noop_handler)
+            services.append(svc)
+
+        await nc.close()
+        self.assertTrue(all(svc.stopped.is_set() for svc in services))
+        self.assertEqual(sorted(events[:2]), ["done0", "done1"])
+        # The connection's own closed callback still runs, after the services stop.
+        self.assertEqual(events[2:], ["closed_cb"])
+
+    @async_test
+    async def test_stop_restores_connection_callbacks(self):
+        async def closed_cb():
+            pass
+
+        async def error_cb(e):
+            pass
+
+        nc = await nats.connect(closed_cb=closed_cb, error_cb=error_cb)
+        svc = await add_service(nc, name="svc", version="0.1.0")
+        self.assertIsNot(nc._closed_cb, closed_cb)
+        self.assertIsNot(nc._error_cb, error_cb)
+        await svc.stop()
+        self.assertIs(nc._closed_cb, closed_cb)
+        self.assertIs(nc._error_cb, error_cb)
+
+        # Stopped out of order, the remaining service still stops on close.
+        done = []
+        first = await add_service(nc, name="a", version="0.1.0", done_handler=lambda s: done.append("a"))
+        second = await add_service(nc, name="b", version="0.1.0", done_handler=lambda s: done.append("b"))
+        await first.stop()
+        await nc.close()
+        self.assertTrue(second.stopped.is_set())
+        self.assertEqual(done, ["a", "b"])
+
+    @async_test
+    async def test_error_handler_on_slow_consumer(self):
+        errors = []
+        conn_errors = []
+        done = asyncio.Event()
+
+        async def error_cb(e):
+            conn_errors.append(e)
+
+        def error_handler(svc, err):
+            errors.append(err)
+
+        release = asyncio.Event()
+
+        async def handler(request: Request):
+            await release.wait()
+
+        nc = await nats.connect(error_cb=error_cb)
+        svc = await add_service(
+            nc,
+            name="svc",
+            version="0.1.0",
+            error_handler=error_handler,
+            done_handler=lambda s: done.set(),
+        )
+        endpoint = await svc.add_endpoint(name="e", subject="svc.e", handler=handler, pending_msgs_limit=1)
+        await svc.add_endpoint(name="other", subject="svc.other", handler=noop_handler)
+
+        # An error on a subscription that is not the service's is not its business.
+        other = await nc.subscribe("not.svc", cb=handler, pending_msgs_limit=1)
+        for _ in range(4):
+            await nc.publish("not.svc", b"x")
+        await nc.flush()
+        await asyncio.sleep(0.1)
+        self.assertFalse(svc.stopped.is_set())
+        self.assertEqual(errors, [])
+        self.assertTrue(conn_errors)
+        self.assertTrue(all(e.sub is other for e in conn_errors))
+        conn_errors.clear()
+
+        for _ in range(4):
+            await nc.publish("svc.e", b"x")
+        await nc.flush()
+        await asyncio.wait_for(done.wait(), 2)
+
+        self.assertTrue(svc.stopped.is_set())
+        self.assertTrue(errors)
+        self.assertIsInstance(errors[0], NATSError)
+        self.assertEqual(errors[0].subject, "svc.e")
+        self.assertIsInstance(errors[0].unwrap(), nats.errors.SlowConsumerError)
+        self.assertEqual(errors[0].description, str(errors[0].unwrap()))
+        # The error is counted on the endpoint, then the connection's own
+        # error callback still receives it.
+        self.assertGreaterEqual(endpoint._num_errors, 1)
+        self.assertEqual(endpoint._last_error, errors[0].description)
+        await asyncio.sleep(0.05)
+        self.assertTrue(
+            any(isinstance(e, nats.errors.SlowConsumerError) and e.sub.subject == "svc.e" for e in conn_errors)
+        )
+
+        release.set()
+        self.assertFalse(nc.is_closed)
+        await nc.close()

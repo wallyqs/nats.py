@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import re
 import time
@@ -15,6 +17,7 @@ from typing import (
     List,
     Optional,
     Protocol,
+    Set,
     Tuple,
     overload,
 )
@@ -22,8 +25,9 @@ from typing import (
 from nats.aio.client import Client
 from nats.aio.msg import Msg
 from nats.aio.subscription import Subscription
+from nats.errors import ConnectionClosedError
 
-from .errors import ConfigValidationError, ServiceNameRequiredError, VerbNotSupportedError
+from .errors import ConfigValidationError, NATSError, ServiceNameRequiredError, VerbNotSupportedError
 from .request import Handler, Request, ServiceError
 
 DEFAULT_QUEUE_GROUP = "q"
@@ -344,7 +348,11 @@ class Endpoint:
 
     async def _stop(self) -> None:
         assert self._subscription
-        await self._subscription.unsubscribe()
+        try:
+            await self._subscription.unsubscribe()
+        except ConnectionClosedError:
+            # The connection is closed, so its subscriptions are gone already.
+            pass
         self._subscription = None
 
     def _reset(self) -> None:
@@ -517,6 +525,18 @@ It is called with each endpoint's `EndpointStats`, whose `endpoint`
 attribute is the `Endpoint` itself (nats.go passes the `*Endpoint`).
 """
 
+DoneHandler = Callable[["Service"], Any]
+"""
+A function called with the service once it has stopped. It may be a coroutine function.
+"""
+
+ErrHandler = Callable[["Service", NATSError], Any]
+"""
+A function called with the service and a `NATSError` when one of the
+service's subscriptions reports an asynchronous error (for example a slow
+consumer). It may be a coroutine function.
+"""
+
 
 @dataclass
 class ServiceConfig:
@@ -550,6 +570,15 @@ class ServiceConfig:
     endpoint: Optional[EndpointConfig] = None
     """An endpoint added when the service starts, before its monitoring
     endpoints (nats.go's Config.Endpoint, which nats.go names "default")."""
+
+    done_handler: Optional[DoneHandler] = None
+    """Called with the service once it has stopped, whether by `Service.stop`,
+    by the connection closing, or by an asynchronous subscription error."""
+
+    error_handler: Optional[ErrHandler] = None
+    """Called with the service and a `NATSError` when one of the service's
+    subscriptions reports an asynchronous error; the service is then stopped,
+    as in nats.go."""
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -762,13 +791,23 @@ class Service(AsyncContextManager):
         self._queue_group_disabled = config.queue_group_disabled
         self._stats_handler = config.stats_handler
         self._default_endpoint = config.endpoint
+        self._done_handler = config.done_handler
+        self._error_handler = config.error_handler
 
         self._client = client
         self._subscriptions = {}
         self._endpoints = []
         self._started = datetime.utcnow()
         self._stopped = Event()
+        self._stop_lock: Optional[asyncio.Lock] = None
         self._prefix = DEFAULT_PREFIX
+
+        self._callbacks_wrapped = False
+        self._closed_cb = None
+        self._error_cb = None
+        self._closed_cb_wrapper = None
+        self._error_cb_wrapper = None
+        self._tasks: Set[asyncio.Future] = set()
 
     @property
     def id(self) -> str:
@@ -780,6 +819,8 @@ class Service(AsyncContextManager):
     async def start(self) -> None:
         if self._subscriptions:
             return
+
+        self._wrap_connection_callbacks()
 
         if self._default_endpoint is not None:
             await self.add_endpoint(self._default_endpoint)
@@ -929,19 +970,114 @@ class Service(AsyncContextManager):
         self._started = datetime.utcnow()
 
     async def stop(self) -> None:
-        if self._stopped.is_set():
+        """
+        Stops the service: unsubscribes its endpoints, drains its monitoring
+        subscriptions and then calls the done handler. Stopping again does
+        nothing.
+        """
+        if self._stop_lock is None:
+            self._stop_lock = asyncio.Lock()
+
+        async with self._stop_lock:
+            if self._stopped.is_set():
+                return
+
+            for endpoint in self._endpoints:
+                await endpoint._stop()
+
+            for subscription in self._subscriptions.values():
+                try:
+                    await subscription.drain()
+                except ConnectionClosedError:
+                    # The connection is closed, so draining is not possible.
+                    break
+
+            self._endpoints = []
+            self._subscriptions = {}
+
+            self._unwrap_connection_callbacks()
+            self._stopped.set()
+
+        if self._done_handler is not None:
+            await _invoke(self._done_handler, self)
+
+    def _wrap_connection_callbacks(self) -> None:
+        """Hooks the service into the connection's callbacks, as nats.go
+        micro does: closing the connection stops the service, and an
+        asynchronous error of one of the service's subscriptions is passed to
+        the error handler and stops the service. The connection's own
+        callbacks are still called afterwards."""
+        if self._callbacks_wrapped:
             return
+        self._callbacks_wrapped = True
+
+        client = self._client
+        closed_cb = self._closed_cb = client._closed_cb
+        error_cb = self._error_cb = client._error_cb
+
+        async def on_closed() -> None:
+            try:
+                await self.stop()
+            except Exception as stop_error:
+                await error_cb(stop_error)
+            if closed_cb is not None:
+                await closed_cb()
+
+        async def on_error(error: Exception) -> None:
+            sub = getattr(error, "sub", None)
+            if not self._stopped.is_set() and isinstance(sub, Subscription) and self._owns(sub):
+                self._spawn(self._handle_subscription_error(sub, error))
+                return
+            await error_cb(error)
+
+        self._closed_cb_wrapper = client._closed_cb = on_closed
+        self._error_cb_wrapper = client._error_cb = on_error
+
+    def _unwrap_connection_callbacks(self) -> None:
+        """Restores the connection's callbacks, unless another callback was
+        installed on top of ours since; our wrappers then pass through."""
+        if not self._callbacks_wrapped:
+            return
+        client = self._client
+        if client._closed_cb is self._closed_cb_wrapper:
+            client._closed_cb = self._closed_cb
+        if client._error_cb is self._error_cb_wrapper:
+            client._error_cb = self._error_cb
+
+    def _owns(self, sub: Subscription) -> bool:
+        return any(endpoint._subscription is sub for endpoint in self._endpoints) or any(
+            subscription is sub for subscription in self._subscriptions.values()
+        )
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _handle_subscription_error(self, sub: Subscription, error: Exception) -> None:
+        """Handles an asynchronous error of one of the service's subscriptions."""
+        assert self._error_cb is not None
+
+        if self._error_handler is not None:
+            try:
+                await _invoke(self._error_handler, self, NATSError(sub.subject, str(error), error))
+            except Exception as handler_error:
+                await self._error_cb(handler_error)
 
         for endpoint in self._endpoints:
-            await endpoint._stop()
+            if endpoint._subscription is sub:
+                endpoint._num_errors += 1
+                endpoint._last_error = str(error)
+                break
 
-        for subscription in self._subscriptions.values():
-            await subscription.drain()
+        try:
+            await self.stop()
+        except Exception as stop_error:
+            await self._error_cb(error)
+            await self._error_cb(stop_error)
+            return
 
-        self._endpoints = []
-        self._subscriptions = {}
-
-        self._stopped.set()
+        await self._error_cb(error)
 
     @property
     def stopped(self) -> Event:
@@ -978,6 +1114,13 @@ class Service(AsyncContextManager):
         """Handle a stats message."""
         stats = self.stats().to_dict()
         await msg.respond(data=json.dumps(stats).encode())
+
+
+async def _invoke(handler: Callable[..., Any], *args: Any) -> None:
+    """Calls a handler that may be a plain function or a coroutine function."""
+    result = handler(*args)
+    if inspect.isawaitable(result):
+        await result
 
 
 def control_subject(
