@@ -1583,6 +1583,8 @@ class JetStreamContext(JetStreamManager):
         create_key_value takes an api.KeyValueConfig and creates a KV in JetStream.
         """
         if config is None:
+            if "bucket" not in params:
+                raise nats.js.errors.KeyValueConfigRequiredError
             config = api.KeyValueConfig(bucket=params["bucket"])
         config = config.evolve(**params)
 

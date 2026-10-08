@@ -276,6 +276,49 @@ class KeyHistoryTooLargeError(KeyValueError):
         return "nats: history limited to a max of 64"
 
 
+class KeyRevisionMismatchError(KeyWrongLastSequenceError):
+    """
+    Raised when an update, delete or purge expected a revision that is not
+    the latest revision of the key (nats.go ErrKeyRevisionMismatch).
+
+    It is a KeyWrongLastSequenceError, so existing handlers keep working,
+    and keeps the server's API error details when it has them.
+    """
+
+    def __init__(
+        self,
+        description: Optional[str] = None,
+        code: Optional[int] = None,
+        err_code: Optional[int] = None,
+        stream: Optional[str] = None,
+        seq: Optional[int] = None,
+    ) -> None:
+        APIError.__init__(
+            self,
+            code=code,
+            description=description,
+            err_code=err_code,
+            stream=stream,
+            seq=seq,
+        )
+
+    def __str__(self) -> str:
+        s = "nats: key revision mismatch"
+        if self.description:
+            s += f": {self.description}"
+        return s
+
+
+class KeyValueConfigRequiredError(Error):
+    """
+    Raised when creating a KeyValue store without a configuration
+    (nats.go ErrKeyValueConfigRequired).
+    """
+
+    def __str__(self) -> str:
+        return "nats: config required"
+
+
 class InvalidKeyError(Error):
     """
     Raised when trying to put an object in Key Value with an invalid key.

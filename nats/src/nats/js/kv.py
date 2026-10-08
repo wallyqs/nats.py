@@ -280,8 +280,16 @@ class KeyValue:
     ) -> int:
         """
         update will update the value if the latest revision matches.
+
+        Raises KeyRevisionMismatchError when ``last`` is not the latest
+        revision of the key.
         """
-        return await self._update(key, value, last=last, validate_keys=validate_keys)
+        try:
+            return await self._update(key, value, last=last, validate_keys=validate_keys)
+        except nats.js.errors.KeyRevisionMismatchError:
+            raise
+        except nats.js.errors.KeyWrongLastSequenceError as err:
+            raise nats.js.errors.KeyRevisionMismatchError(description=err.description) from err
 
     async def _update(
         self,
