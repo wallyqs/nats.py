@@ -400,3 +400,226 @@ class BatchPublisherTest(SingleJetStreamServerTestCase):
         assert fmt(0.0015) == "1.5ms"
         assert fmt(2e-6) == "2µs"
         assert fmt(3e-9) == "3ns"
+
+
+class FastPublisherTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_add_and_close(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="EVENTS", subjects=["events.>"], allow_batched=True)
+
+        fp = new_fast_publisher(js, FastPublishFlowControl(flow=10, max_outstanding_acks=2))
+        with pytest.raises(EmptyBatchError):
+            await fp.close()
+
+        msg = nats.aio.msg.Msg(nc, subject="events.raw", data=b"0")
+        ack = await fp.add_msg(msg)
+        assert ack == FastPubAck(batch_sequence=1, ack_sequence=0)
+        assert msg.reply.endswith(".10.fail.1.0.$FI")
+        assert msg.headers is None
+        last = ack
+        for i in range(1, 100):
+            last = await fp.add("events.raw", str(i).encode())
+            assert last.batch_sequence == i + 1
+            # Never more than two acks (of ten messages) outstanding.
+            assert last.batch_sequence - last.ack_sequence < 20
+        assert last.ack_sequence > 0
+        assert not fp.is_closed()
+
+        ack = await fp.close()
+        assert isinstance(ack, BatchAck)
+        assert ack.stream == "EVENTS"
+        assert ack.seq == 100
+        assert ack.batch_size == 100
+        assert fp.is_closed()
+        info = await js.stream_info("EVENTS")
+        assert info.state.messages == 100
+
+        with pytest.raises(BatchClosedError):
+            await fp.add("events.raw", b"x")
+        with pytest.raises(BatchClosedError):
+            await fp.commit("events.raw", b"x")
+        with pytest.raises(BatchClosedError):
+            await fp.close()
+        await nc.close()
+
+    @async_test
+    async def test_commit(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="EVENTS", subjects=["events.>"], allow_batched=True, allow_msg_ttl=True)
+
+        fp = new_fast_publisher(js)
+        await fp.add("events.a", b"1", expect_stream="EVENTS")
+        await fp.add("events.b", b"2", msg_ttl=60)
+        ack = await fp.commit_msg(nats.aio.msg.Msg(nc, subject="events.c", data=b"3", headers={"X": "y"}))
+        assert ack.stream == "EVENTS"
+        assert ack.seq == 3
+        assert ack.batch_size == 3
+        assert fp.is_closed()
+        msg = await js.get_msg("EVENTS", 1)
+        assert msg.headers["Nats-Expected-Stream"] == "EVENTS"
+        msg = await js.get_msg("EVENTS", 2)
+        assert msg.headers["Nats-TTL"] == "1m0s"
+        msg = await js.get_msg("EVENTS", 3)
+        assert msg.data == b"3"
+        assert msg.headers["X"] == "y"
+        await nc.close()
+
+    @async_test
+    async def test_not_enabled(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="PLAIN", subjects=["plain.>"])
+
+        errors = []
+        fp = new_fast_publisher(js, error_handler=errors.append)
+        with pytest.raises(FastBatchNotEnabledError) as e:
+            await fp.add("plain.a", b"1")
+        assert e.value.err_code == JS_ERR_CODE_FAST_BATCH_NOT_ENABLED
+        assert fp.is_closed()
+        with pytest.raises(BatchClosedError):
+            await fp.add("plain.a", b"2")
+        assert errors == []
+        await nc.close()
+
+    @async_test
+    async def test_gap_abandons_batch(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="EVENTS", subjects=["events.>"], allow_batched=True)
+
+        errors = []
+        fp = new_fast_publisher(js, error_handler=errors.append)
+        await fp.add("events.a", b"1")
+        await fp.add("events.a", b"2")
+        # Lose message 3.
+        fp._sequence += 1
+        await fp.add("events.a", b"4")
+        for _ in range(50):
+            if fp.is_closed():
+                break
+            await asyncio.sleep(0.02)
+        assert fp.is_closed()
+        assert len(errors) == 1
+        assert isinstance(errors[0], FastBatchGapDetectedError)
+        assert errors[0].expected_last_sequence == 3
+        assert errors[0].current_sequence == 4
+        with pytest.raises(BatchClosedError):
+            await fp.add("events.a", b"5")
+        info = await js.stream_info("EVENTS")
+        assert info.state.messages == 2
+        await nc.close()
+
+    @async_test
+    async def test_continue_on_gap(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="EVENTS", subjects=["events.>"], allow_batched=True)
+
+        errors = []
+
+        async def handler(err):
+            errors.append(err)
+
+        fp = new_fast_publisher(js, continue_on_gap=True, error_handler=handler)
+        msg = nats.aio.msg.Msg(nc, subject="events.a", data=b"1")
+        await fp.add_msg(msg)
+        assert msg.reply.endswith(".100.ok.1.0.$FI")
+        fp._sequence += 1
+        await fp.add("events.a", b"3")
+        ack = await fp.commit("events.a", b"4")
+        assert ack.stream == "EVENTS"
+        assert ack.seq == 3
+        assert len(errors) == 1
+        assert isinstance(errors[0], FastBatchGapDetectedError)
+        assert str(errors[0]) == "nats: fast batch gap detected: expected last sequence 2; current sequence 3"
+        await nc.close()
+
+    @async_test
+    async def test_message_error(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="EVENTS", subjects=["events.>"], allow_batched=True)
+
+        errors = []
+        fp = new_fast_publisher(js, error_handler=errors.append)
+        await fp.add("events.a", b"1")
+        await fp.add("events.a", b"2", expect_stream="OTHER")
+        for _ in range(50):
+            if fp.is_closed():
+                break
+            await asyncio.sleep(0.02)
+        assert fp.is_closed()
+        assert isinstance(errors[0], FastBatchMsgError)
+        assert errors[0].sequence == 2
+        assert errors[0].error.err_code == 10060
+        with pytest.raises(BatchClosedError):
+            await fp.commit("events.a", b"3")
+        await nc.close()
+
+    @async_test
+    async def test_ping_recovers_lost_ack(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="EVENTS", subjects=["events.>"], allow_batched=True)
+
+        fp = new_fast_publisher(js, FastPublishFlowControl(flow=2, max_outstanding_acks=1, ack_timeout=1.5))
+        handle = fp._handle_ack
+        seen = []
+
+        async def drop_first_flow_ack(msg):
+            seen.append(msg.subject)
+            if len(seen) == 2:
+                return
+            await handle(msg)
+
+        fp._handle_ack = drop_first_flow_ack
+        await fp.add("events.a", b"1")
+        ack = await fp.add("events.a", b"2")
+        # The ack of message 2 was lost and recovered by a ping.
+        assert ack == FastPubAck(batch_sequence=2, ack_sequence=2)
+        assert any(s.endswith(".2.4.$FI") for s in seen)
+        ack = await fp.close()
+        assert ack.batch_size == 2
+        await nc.close()
+
+    @async_test
+    async def test_ack_timeout(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="EVENTS", subjects=["events.>"], allow_batched=True)
+
+        fp = new_fast_publisher(js, FastPublishFlowControl(flow=2, max_outstanding_acks=1, ack_timeout=0.6))
+        handle = fp._handle_ack
+
+        async def first_ack_only(msg):
+            if msg.subject.endswith(".1.0.$FI"):
+                await handle(msg)
+
+        fp._handle_ack = first_ack_only
+        await fp.add("events.a", b"1")
+        with pytest.raises(BatchAckTimeoutError) as e:
+            await fp.add("events.a", b"2")
+        assert e.value.sequence == 2
+        assert e.value.ack_sequence == 0
+        assert isinstance(e.value, TimeoutError)
+        assert fp.is_closed()
+        await nc.close()
+
+    @async_test
+    async def test_invalid_options(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        with pytest.raises(InvalidOptionError):
+            new_fast_publisher(js, FastPublishFlowControl(ack_timeout=-1))
+        with pytest.raises(InvalidOptionError):
+            new_fast_publisher(js, FastPublishFlowControl(flow=70000))
+        with pytest.raises(InvalidOptionError):
+            new_fast_publisher(js, FastPublishFlowControl(max_outstanding_acks=-1))
+        fp = new_fast_publisher(js, FastPublishFlowControl(flow=0, max_outstanding_acks=0))
+        assert fp._flow == 100
+        assert fp._max_outstanding_acks == 2
+        assert fp._ack_timeout == js._timeout
+        await nc.close()

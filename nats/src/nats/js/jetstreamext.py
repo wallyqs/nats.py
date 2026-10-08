@@ -24,9 +24,10 @@ server actually sends; orbit.go's codes for the fast-ingest errors
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
 
 import nats.errors
 from nats.aio.msg import Msg
@@ -35,6 +36,7 @@ from nats.js.errors import APIError, BadRequestError, Error, NoStreamResponseErr
 
 if TYPE_CHECKING:
     from nats.aio.client import Client as NATS
+    from nats.aio.subscription import Subscription
     from nats.js.client import JetStreamContext
 
 # Headers of an atomic batch message (ADR-50).
@@ -684,3 +686,446 @@ async def publish_msg_batch(
         resp = await _request_msg(nc, msg, timeout)
         return _parse_batch_ack(resp.data, batch_id, count)
     raise EmptyBatchError  # unreachable: messages is not empty
+
+
+# Operations of a fast-ingest batch message, the <op> token of its reply
+# subject <inbox>.<flow>.<gap>.<seq>.<op>.$FI.
+_FAST_BATCH_START = 0
+_FAST_BATCH_ADD = 1
+_FAST_BATCH_COMMIT = 2
+_FAST_BATCH_COMMIT_EOB = 3
+_FAST_BATCH_PING = 4
+
+_DEFAULT_FAST_FLOW = 100
+_DEFAULT_MAX_OUTSTANDING_ACKS = 2
+
+
+@dataclass
+class FastPublishFlowControl:
+    """
+    Flow control of a fast-ingest batch publisher.
+
+    :param flow: Initial number of messages per server flow ack (1-65535,
+        0 keeps the default of 100); the server may change it.
+    :param max_outstanding_acks: How many flow acks may be outstanding
+        before ``add`` stalls (1-65535, 0 keeps the default of 2).
+    :param ack_timeout: Seconds to wait for acks; ``None`` or 0 is the
+        JetStream context's timeout.
+    """
+
+    flow: int = _DEFAULT_FAST_FLOW
+    max_outstanding_acks: int = _DEFAULT_MAX_OUTSTANDING_ACKS
+    ack_timeout: Optional[float] = None
+
+
+@dataclass
+class FastPubAck:
+    """
+    FastPubAck is the result of adding a message to a fast batch.
+
+    :param batch_sequence: Sequence of the message within the batch.
+    :param ack_sequence: Highest batch sequence the server acknowledged.
+        With the default gap mode every message up to it was persisted;
+        with ``continue_on_gap`` some of them may have been lost.
+    """
+
+    batch_sequence: int
+    ack_sequence: int
+
+
+class FastPublisher:
+    """
+    FastPublisher publishes a fast-ingest batch (needs a stream with
+    ``allow_batched``, nats-server v2.14.0+). Messages are stored as they
+    arrive; the server sends a flow ack every ``flow`` messages and ``add``
+    stalls while ``max_outstanding_acks`` acks are outstanding, pinging the
+    server to recover lost acks until the ack timeout. ``commit`` and
+    ``commit_msg`` end the batch with a final message, ``close`` with an
+    end-of-batch commit.
+
+    A gap the server detects abandons the batch unless the publisher was
+    made with ``continue_on_gap``; either way it is reported to the error
+    handler as FastBatchGapDetectedError, as are the server's errors for
+    single messages (FastBatchMsgError) and replies that cannot be decoded.
+
+    A FastPublisher is not safe for concurrent use: await each call before
+    making the next one. Messages take the same options as
+    BatchPublisher's.
+
+    ::
+
+        fp = new_fast_publisher(js, FastPublishFlowControl(flow=200))
+        for i in range(1000):
+            await fp.add("events.raw", str(i).encode())
+        ack = await fp.close()
+    """
+
+    def __init__(
+        self,
+        js: JetStreamContext,
+        flow_control: Optional[FastPublishFlowControl] = None,
+        continue_on_gap: bool = False,
+        error_handler: Optional[Callable[[Exception], Any]] = None,
+    ) -> None:
+        fc = flow_control or FastPublishFlowControl()
+        if fc.ack_timeout is not None and fc.ack_timeout < 0:
+            raise InvalidOptionError("ack timeout must be non-negative")
+        for name in ("flow", "max_outstanding_acks"):
+            value = getattr(fc, name)
+            if value < 0 or value > 65535:
+                raise InvalidOptionError(f"{name} must be between 0 and 65535")
+        self._js = js
+        self._nc = js._nc
+        self._flow = fc.flow or _DEFAULT_FAST_FLOW
+        self._max_outstanding_acks = fc.max_outstanding_acks or _DEFAULT_MAX_OUTSTANDING_ACKS
+        self._ack_timeout = fc.ack_timeout or js._timeout
+        self._continue_on_gap = continue_on_gap
+        self._error_handler = error_handler
+        self._inbox = self._nc.new_inbox()
+        gap = "ok" if continue_on_gap else "fail"
+        # Fixed when the publisher is made, not rebuilt when the flow changes.
+        self._reply_prefix = f"{self._inbox}.{self._flow}.{gap}."
+        self._ack_sub: Optional[Subscription] = None
+        self._sequence = 0
+        self._ack_sequence = 0
+        self._closed = False
+        # Subject of the first message, used by pings and close.
+        self._batch_subject: Optional[str] = None
+        self._first_ack: Optional[asyncio.Future] = None
+        self._commit_ack: Optional[asyncio.Future] = None
+        self._stall: Optional[asyncio.Event] = None
+        # The error reported last, raised by a call the batch's end interrupts.
+        self._last_error: Optional[Exception] = None
+        self._tasks: Set[asyncio.Task] = set()
+
+    def _reply(self, sequence: int, operation: int) -> str:
+        return f"{self._reply_prefix}{sequence}.{operation}.$FI"
+
+    async def _subscribe(self) -> None:
+        if self._stall is None:
+            self._stall = asyncio.Event()
+        if self._ack_sub is None:
+            self._ack_sub = await self._nc.subscribe(f"{self._inbox}.>", cb=self._handle_ack)
+
+    async def _unsubscribe(self) -> None:
+        sub, self._ack_sub = self._ack_sub, None
+        if sub is not None:
+            try:
+                await sub.unsubscribe()
+            except nats.errors.Error:
+                pass
+
+    def _must_wait(self) -> bool:
+        return self._ack_sequence + self._flow * self._max_outstanding_acks <= self._sequence
+
+    async def _send_ping(self) -> None:
+        """Asks the server for its latest flow ack, reusing the highest sequence sent."""
+        await self._nc.publish(
+            self._batch_subject or "",
+            b"",
+            reply=self._reply(self._sequence, _FAST_BATCH_PING),
+        )
+
+    def _ended_error(self) -> Exception:
+        return self._last_error or BatchClosedError()
+
+    async def _wait_for_acks(self) -> None:
+        """
+        Waits until fewer than max_outstanding_acks acks are outstanding,
+        pinging every third of the ack timeout. The ack timeout bounds the
+        whole wait.
+        """
+        assert self._stall is not None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._ack_timeout
+        interval = self._ack_timeout / 3
+        next_ping = loop.time() + interval
+        while True:
+            if self._closed:
+                raise self._ended_error()
+            if not self._must_wait():
+                return
+            now = loop.time()
+            if now >= deadline:
+                raise BatchAckTimeoutError(self._sequence, self._ack_sequence)
+            if now >= next_ping:
+                await self._send_ping()
+                next_ping = now + interval
+                continue
+            self._stall.clear()
+            try:
+                await asyncio.wait_for(self._stall.wait(), min(deadline, next_ping) - now)
+            except asyncio.TimeoutError:
+                pass
+
+    async def add(
+        self,
+        subject: str,
+        payload: bytes = b"",
+        msg_ttl: Optional[float] = None,
+        expect_stream: Optional[str] = None,
+        expect_last_sequence: Optional[int] = None,
+        expect_last_subject_sequence: Optional[int] = None,
+        expect_last_subject_sequence_subject: Optional[str] = None,
+    ) -> FastPubAck:
+        """
+        add publishes a message to the batch. The first message waits for
+        the server's ack; later ones wait only while too many acks are
+        outstanding.
+        """
+        return await self.add_msg(
+            _new_msg(self._nc, subject, payload),
+            msg_ttl=msg_ttl,
+            expect_stream=expect_stream,
+            expect_last_sequence=expect_last_sequence,
+            expect_last_subject_sequence=expect_last_subject_sequence,
+            expect_last_subject_sequence_subject=expect_last_subject_sequence_subject,
+        )
+
+    async def add_msg(
+        self,
+        msg: Msg,
+        msg_ttl: Optional[float] = None,
+        expect_stream: Optional[str] = None,
+        expect_last_sequence: Optional[int] = None,
+        expect_last_subject_sequence: Optional[int] = None,
+        expect_last_subject_sequence_subject: Optional[str] = None,
+    ) -> FastPubAck:
+        """
+        add_msg publishes ``msg`` to the batch and returns its FastPubAck.
+        Its reply is set to the batch's reply subject.
+        """
+        if self._closed:
+            raise BatchClosedError
+        msg.headers = _apply_msg_opts(
+            msg.headers,
+            msg_ttl,
+            expect_stream,
+            expect_last_sequence,
+            expect_last_subject_sequence,
+            expect_last_subject_sequence_subject,
+        )
+        self._sequence += 1
+        sequence = self._sequence
+        if sequence == 1:
+            return await self._start(msg)
+        msg.reply = self._reply(sequence, _FAST_BATCH_ADD)
+        await self._nc.publish(msg.subject, msg.data, reply=msg.reply, headers=msg.headers)
+        if self._must_wait():
+            try:
+                await self._wait_for_acks()
+            except Exception:
+                self._closed = True
+                await self._unsubscribe()
+                raise
+        return FastPubAck(batch_sequence=sequence, ack_sequence=self._ack_sequence)
+
+    async def _start(self, msg: Msg) -> FastPubAck:
+        """Publishes the first message and waits for its ack."""
+        await self._subscribe()
+        self._first_ack = asyncio.get_running_loop().create_future()
+        msg.reply = self._reply(1, _FAST_BATCH_START)
+        try:
+            await self._nc.publish(msg.subject, msg.data, reply=msg.reply, headers=msg.headers)
+            ack_sequence = await asyncio.wait_for(self._first_ack, self._ack_timeout)
+        except asyncio.TimeoutError:
+            self._closed = True
+            await self._unsubscribe()
+            raise BatchAckTimeoutError(1)
+        except Exception:
+            self._closed = True
+            await self._unsubscribe()
+            raise
+        finally:
+            self._first_ack = None
+        self._batch_subject = msg.subject
+        return FastPubAck(batch_sequence=1, ack_sequence=ack_sequence)
+
+    async def commit(
+        self,
+        subject: str,
+        payload: bytes = b"",
+        timeout: Optional[float] = None,
+        msg_ttl: Optional[float] = None,
+        expect_stream: Optional[str] = None,
+        expect_last_sequence: Optional[int] = None,
+        expect_last_subject_sequence: Optional[int] = None,
+        expect_last_subject_sequence_subject: Optional[str] = None,
+    ) -> BatchAck:
+        """
+        commit publishes the final message and commits the batch; see
+        commit_msg.
+        """
+        return await self.commit_msg(
+            _new_msg(self._nc, subject, payload),
+            timeout=timeout,
+            msg_ttl=msg_ttl,
+            expect_stream=expect_stream,
+            expect_last_sequence=expect_last_sequence,
+            expect_last_subject_sequence=expect_last_subject_sequence,
+            expect_last_subject_sequence_subject=expect_last_subject_sequence_subject,
+        )
+
+    async def commit_msg(
+        self,
+        msg: Msg,
+        timeout: Optional[float] = None,
+        msg_ttl: Optional[float] = None,
+        expect_stream: Optional[str] = None,
+        expect_last_sequence: Optional[int] = None,
+        expect_last_subject_sequence: Optional[int] = None,
+        expect_last_subject_sequence_subject: Optional[str] = None,
+    ) -> BatchAck:
+        """
+        commit_msg publishes ``msg`` as the final message of the batch and
+        returns the server's BatchAck, pinging for a lost ack until the ack
+        timeout. ``timeout`` (seconds) bounds the call as well.
+        """
+        if self._closed:
+            raise BatchClosedError
+        msg.headers = _apply_msg_opts(
+            msg.headers,
+            msg_ttl,
+            expect_stream,
+            expect_last_sequence,
+            expect_last_subject_sequence,
+            expect_last_subject_sequence_subject,
+        )
+        return await self._commit(msg, _FAST_BATCH_COMMIT, timeout)
+
+    async def close(self, timeout: Optional[float] = None) -> BatchAck:
+        """
+        close ends the batch with an end-of-batch commit on the first
+        message's subject, without adding a message, and returns the
+        server's BatchAck.
+        """
+        if self._sequence == 0:
+            raise EmptyBatchError
+        if self._closed:
+            raise BatchClosedError
+        return await self._commit(_new_msg(self._nc, self._batch_subject or "", b""), _FAST_BATCH_COMMIT_EOB, timeout)
+
+    async def _commit(self, msg: Msg, operation: int, timeout: Optional[float]) -> BatchAck:
+        loop = asyncio.get_running_loop()
+        self._sequence += 1
+        if self._batch_subject is None:
+            self._batch_subject = msg.subject
+        msg.reply = self._reply(self._sequence, operation)
+        commit_ack = self._commit_ack = loop.create_future()
+        try:
+            await self._subscribe()
+            await self._nc.publish(msg.subject, msg.data, reply=msg.reply, headers=msg.headers)
+            now = loop.time()
+            deadline = now + self._ack_timeout
+            call_deadline = now + timeout if timeout is not None else None
+            interval = self._ack_timeout / 3
+            next_ping = now + interval
+            while not commit_ack.done():
+                now = loop.time()
+                if call_deadline is not None and now >= call_deadline:
+                    raise nats.errors.TimeoutError
+                if now >= deadline:
+                    raise BatchAckTimeoutError(self._sequence)
+                if now >= next_ping:
+                    await self._send_ping()
+                    next_ping = now + interval
+                    continue
+                wake = min(deadline, next_ping)
+                if call_deadline is not None:
+                    wake = min(wake, call_deadline)
+                try:
+                    await asyncio.wait_for(asyncio.shield(commit_ack), wake - now)
+                except asyncio.TimeoutError:
+                    pass
+            reply = commit_ack.result()
+        finally:
+            self._closed = True
+            self._commit_ack = None
+            await self._unsubscribe()
+        if reply.get("error"):
+            raise api_error_from(reply["error"])
+        if not reply.get("stream"):
+            raise InvalidBatchAckError
+        return BatchAck.from_response(reply)
+
+    def is_closed(self) -> bool:
+        """is_closed tells whether the batch was committed or abandoned."""
+        return self._closed
+
+    async def _report(self, err: Exception) -> None:
+        if self._error_handler is None:
+            return
+        result = self._error_handler(err)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _handle_ack(self, msg: Msg) -> None:
+        """
+        Handles the batch's replies: flow acks move the acked sequence and
+        the flow, gaps and message errors go to the error handler, and a
+        reply without a type is the commit ack that ends the batch.
+        """
+        try:
+            reply = json.loads(msg.data)
+        except ValueError as e:
+            await self._report(e)
+            return
+        if not isinstance(reply, dict):
+            await self._report(InvalidBatchAckError())
+            return
+        kind = reply.get("type")
+        if kind == "ack":
+            messages = reply.get("msgs")
+            if isinstance(messages, int) and messages > 0:
+                self._flow = messages
+            self._ack_sequence = reply.get("seq") or 0
+            if self._first_ack is not None and not self._first_ack.done():
+                self._first_ack.set_result(self._ack_sequence)
+            elif self._stall is not None:
+                self._stall.set()
+            return
+        if kind == "gap":
+            self._last_error = FastBatchGapDetectedError(reply.get("last_seq"), reply.get("seq"))
+            await self._report(self._last_error)
+            return
+        if kind == "err":
+            self._last_error = FastBatchMsgError(reply.get("seq") or 0, api_error_from(reply.get("error") or {}))
+            await self._report(self._last_error)
+            return
+
+        # The commit ack, which always ends the batch.
+        self._closed = True
+        error = api_error_from(reply["error"]) if reply.get("error") else None
+        if self._commit_ack is not None and not self._commit_ack.done():
+            self._commit_ack.set_result(reply)
+        elif self._first_ack is not None and not self._first_ack.done() and error is not None:
+            self._first_ack.set_exception(error)
+        else:
+            if error is not None:
+                self._last_error = error
+                await self._report(error)
+            task = asyncio.ensure_future(self._unsubscribe())
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        if self._stall is not None:
+            self._stall.set()
+
+
+def new_fast_publisher(
+    js: JetStreamContext,
+    flow_control: Optional[FastPublishFlowControl] = None,
+    continue_on_gap: bool = False,
+    error_handler: Optional[Callable[[Exception], Any]] = None,
+) -> FastPublisher:
+    """
+    new_fast_publisher returns a FastPublisher on ``js``. By default the
+    server acks every 100 messages, ``add`` stalls once two acks are
+    outstanding, waits are bounded by the context's timeout, and a gap
+    abandons the batch.
+
+    :param continue_on_gap: Keep the batch going when the server detects
+        a gap, only reporting it to the error handler.
+    :param error_handler: Callable (or coroutine function) that receives
+        gaps, per-message server errors and undecodable replies.
+    """
+    return FastPublisher(js, flow_control, continue_on_gap, error_handler)
