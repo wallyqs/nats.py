@@ -135,6 +135,60 @@ class KeyValue:
             """
             return self.stream_info.config.subject_delete_marker_ttl
 
+        @property
+        def backing_store(self) -> str:
+            """
+            backing_store returns the name of the store backing the bucket.
+            """
+            return "JetStream"
+
+        @property
+        def is_compressed(self) -> bool:
+            """
+            is_compressed tells whether the bucket's data is compressed.
+            """
+            compression = self.stream_info.config.compression
+            return compression is not None and compression != api.StoreCompression.NONE
+
+        @property
+        def metadata(self) -> Optional[Dict[str, str]]:
+            """
+            metadata returns the user metadata of the bucket.
+            """
+            return self.stream_info.config.metadata
+
+        @property
+        def config(self) -> api.KeyValueConfig:
+            """
+            config returns the bucket's configuration, read back from its stream.
+            """
+            sc = self.stream_info.config
+            return api.KeyValueConfig(
+                bucket=self.bucket,
+                description=sc.description,
+                max_value_size=sc.max_msg_size,
+                history=sc.max_msgs_per_subject,
+                ttl=sc.max_age,
+                max_bytes=sc.max_bytes,
+                storage=sc.storage,
+                replicas=sc.num_replicas if sc.num_replicas is not None else 1,
+                placement=sc.placement,
+                republish=sc.republish,
+                direct=sc.allow_direct,
+                limit_marker_ttl=sc.subject_delete_marker_ttl,
+                compression=self.is_compressed,
+                mirror=sc.mirror,
+                sources=sc.sources,
+                metadata=sc.metadata,
+            )
+
+        @property
+        def bytes(self) -> int:
+            """
+            bytes returns the size of the bucket in bytes.
+            """
+            return self.stream_info.state.bytes
+
     def __init__(
         self,
         name: str,

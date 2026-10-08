@@ -295,3 +295,50 @@ class KVMirrorDomainTest(SingleJetStreamServerDomainTestCase):
         assert (await origin.get("b")).value == b"2"
 
         await nc.close()
+
+
+class KVStatusTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_status_fields(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        kv = await js.create_key_value(
+            bucket="STATUS",
+            description="status bucket",
+            history=3,
+            ttl=3600,
+            max_bytes=1024 * 1024,
+            max_value_size=1024,
+            compression=True,
+            metadata={"team": "kv"},
+        )
+        await kv.put("a", b"hello")
+
+        status = await kv.status()
+        assert status.backing_store == "JetStream"
+        assert status.is_compressed is True
+        assert status.metadata["team"] == "kv"
+        assert status.bytes == status.stream_info.state.bytes
+        assert status.bytes > 0
+
+        config = status.config
+        assert isinstance(config, nats.js.api.KeyValueConfig)
+        assert config.bucket == "STATUS"
+        assert config.description == "status bucket"
+        assert config.history == 3
+        assert config.ttl == 3600
+        assert config.max_bytes == 1024 * 1024
+        assert config.max_value_size == 1024
+        assert config.replicas == 1
+        assert config.compression is True
+        assert config.metadata["team"] == "kv"
+        assert config.mirror is None
+
+        plain = await js.create_key_value(bucket="STATUS_PLAIN")
+        status = await plain.status()
+        assert status.is_compressed is False
+        assert status.config.compression is False
+        assert status.bytes == 0
+
+        await nc.close()
