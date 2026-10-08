@@ -217,3 +217,164 @@ class JetStreamNotEnabledTest(SingleServerTestCase):
         assert isinstance(err.value, ServiceUnavailableError)
         assert err.value.err_code == ErrorCode.JETSTREAM_NOT_ENABLED
         await nc.close()
+
+
+LIMITS = {
+    "max_memory": -1,
+    "max_storage": -1,
+    "max_streams": -1,
+    "max_consumers": -1,
+    "max_ack_pending": -1,
+    "memory_max_stream_bytes": -1,
+    "storage_max_stream_bytes": -1,
+    "max_bytes_required": False,
+}
+
+
+class APITypesTest(unittest.TestCase):
+    def test_cluster_info_fields(self):
+        info = api.ClusterInfo.from_response(
+            {
+                "name": "C1",
+                "leader": "n1",
+                "system_account": True,
+                "traffic_account": "SYS",
+                "replicas": [{"name": "n2", "current": True, "active": 1, "peer": "abc", "pending": True}],
+                "desired": {
+                    "created": "2026-01-02T03:04:05.123456789Z",
+                    "name": "C2",
+                    "replicas": [{"name": "n3", "offline": True, "peer": "def"}],
+                    "origin": {"replicas": 3, "placement": {"cluster": "C1"}, "retention": "limits"},
+                    "status": {"description": "waiting for quorum", "type": "quorum", "err": "boom"},
+                },
+            }
+        )
+        assert info.system_acc is True
+        assert info.traffic_acc == "SYS"
+        assert info.replicas[0].peer == "abc"
+        assert info.replicas[0].pending is True
+        desired = info.desired
+        assert isinstance(desired, api.DesiredClusterInfo)
+        assert desired.created.year == 2026
+        assert desired.name == "C2"
+        assert desired.replicas == [api.DesiredPeerInfo(name="n3", offline=True, peer="def")]
+        assert desired.origin.replicas == 3
+        assert desired.origin.placement == api.Placement(cluster="C1")
+        assert desired.origin.retention == api.RetentionPolicy.LIMITS
+        assert desired.status.description == "waiting for quorum"
+        assert desired.status.type == api.MigrationStatusType.QUORUM
+        assert desired.status.err == "boom"
+
+    def test_migration_status_values(self):
+        assert [m.value for m in api.MigrationStatusType] == [
+            "meta",
+            "membership",
+            "snapshot",
+            "catchup",
+            "quorum",
+            "blocked",
+            "unavailable",
+        ]
+
+    def test_stream_source_domain(self):
+        src = api.StreamSource(name="ORIGIN", domain="hub")
+        assert src.as_dict() == {"name": "ORIGIN", "external": {"api": "$JS.hub.API"}}
+        with pytest.raises(ValueError, match="domain and external are both set"):
+            api.StreamSource(name="ORIGIN", domain="hub", external=api.ExternalStream(api="$JS.x.API")).as_dict()
+
+    def test_defaults(self):
+        assert api.DEFAULT_EXPIRES == 30.0
+        assert api.DEFAULT_MAX_MESSAGES == 500
+        assert api.DEFAULT_PUB_RETRY_ATTEMPTS == 2
+        assert api.DEFAULT_PUB_RETRY_WAIT == 0.25
+        assert api.Header.TIME_STAMP == "Nats-Time-Stamp"
+
+    def test_api_stats_and_tiers(self):
+        info = api.AccountInfo.from_response(
+            {
+                "memory": 1,
+                "storage": 2,
+                "reserved_memory": 3,
+                "reserved_storage": 4,
+                "streams": 1,
+                "consumers": 0,
+                "limits": LIMITS,
+                "api": {"level": 1, "total": 5, "errors": 0, "inflight": 2},
+                "tiers": {
+                    "R1": {
+                        "memory": 1,
+                        "storage": 2,
+                        "reserved_memory": 5,
+                        "reserved_storage": 6,
+                        "streams": 1,
+                        "consumers": 0,
+                        "limits": LIMITS,
+                    }
+                },
+            }
+        )
+        assert info.reserved_memory == 3
+        assert info.reserved_storage == 4
+        assert info.api.inflight == 2
+        assert info.tiers["R1"].reserved_memory == 5
+        assert info.tiers["R1"].reserved_storage == 6
+
+
+class APITypesServerTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_info_fields(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        await js.add_stream(name="ORIGIN1", subjects=["one.>"])
+        await js.add_stream(name="ORIGIN2", subjects=["two.>"])
+        for subject in ("one.a", "one.b", "two.a"):
+            await js.publish(subject, b"x")
+        await js.add_stream(
+            name="SOURCED",
+            sources=[
+                api.StreamSource(name="ORIGIN1", filter_subject="one.a"),
+                api.StreamSource(
+                    name="ORIGIN2",
+                    subject_transforms=[api.SubjectTransform(src="two.>", dest="moved.>")],
+                ),
+            ],
+        )
+        await js.add_stream(name="REMOTE", sources=[api.StreamSource(name="ORIGIN1", domain="hub")])
+
+        si = await js.stream_info("ORIGIN1")
+        assert si.ts is not None
+        assert si.state.first_ts is not None
+        assert si.state.last_ts >= si.state.first_ts
+        assert si.state.num_subjects == 2
+
+        for _ in range(50):
+            si = await js.stream_info("SOURCED")
+            if si.state.messages == 2:
+                break
+            await asyncio.sleep(0.05)
+        sources = {src.name: src for src in si.sources}
+        assert sources["ORIGIN1"].filter_subject == "one.a"
+        assert sources["ORIGIN2"].subject_transforms == [api.SubjectTransform(src="two.>", dest="moved.>")]
+
+        si = await js.stream_info("REMOTE")
+        assert si.config.sources[0].external.api == "$JS.hub.API"
+
+        await js.add_consumer(
+            "ORIGIN1",
+            durable_name="limits",
+            max_batch=10,
+            max_expires=2.5,
+            max_bytes=1024,
+        )
+        ci = await js.consumer_info("ORIGIN1", "limits")
+        assert ci.ts is not None
+        assert ci.config.max_batch == 10
+        assert ci.config.max_expires == 2.5
+        assert ci.config.max_bytes == 1024
+
+        info = await js.account_info()
+        assert info.reserved_memory is not None
+        assert info.reserved_storage is not None
+
+        await nc.close()

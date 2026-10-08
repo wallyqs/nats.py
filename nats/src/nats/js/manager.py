@@ -558,7 +558,7 @@ class JetStreamManager:
             raw_msg.seq = int(seq)
         raw_msg.data = msg.data
         raw_msg.headers = msg.headers
-        if time_string := msg.headers.get("Nats-Time-Stamp"):
+        if time_string := msg.headers.get(api.Header.TIME_STAMP):
             raw_msg.time = api.Base._parse_utc_iso(time_string)
 
         return raw_msg

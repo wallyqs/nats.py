@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 from dataclasses import dataclass, fields, replace
 from enum import Enum
@@ -49,6 +50,8 @@ class Header(str, Enum):
     SCHEDULE_TTL = "Nats-Schedule-TTL"
     SCHEDULER = "Nats-Scheduler"
     STATUS = "Status"
+    # Time a message was stored, set on direct get replies.
+    TIME_STAMP = "Nats-Time-Stamp"
 
 
 # Predefined schedule expressions for use as a Header.SCHEDULE value. Keep
@@ -61,6 +64,16 @@ SCHEDULE_HOURLY = "@hourly"
 
 DEFAULT_PREFIX = "$JS.API"
 INBOX_PREFIX = b"_INBOX."
+
+# Defaults of nats.go's JetStream consumers and publishers, in seconds where
+# they are durations: the expiry of a pull request (DefaultExpires), the
+# messages a continuous pull buffers (DefaultMaxMessages), and how often and
+# how long apart a publish without responders is retried
+# (DefaultPubRetryAttempts, DefaultPubRetryWait).
+DEFAULT_EXPIRES = 30.0
+DEFAULT_MAX_MESSAGES = 500
+DEFAULT_PUB_RETRY_ATTEMPTS = 2
+DEFAULT_PUB_RETRY_WAIT = 0.25
 
 
 class StatusCode(str, Enum):
@@ -253,6 +266,11 @@ class StreamSource(Base):
     subject_transforms: Optional[List[SubjectTransform]] = None
     consumer: Optional[StreamConsumerSource] = None
 
+    # JetStream domain of the source stream. Client-side only: it is sent
+    # as the external API prefix ``$JS.<domain>.API``, so it cannot be set
+    # together with ``external``.
+    domain: Optional[str] = None
+
     @classmethod
     def from_response(cls, resp: Dict[str, Any]):
         cls._convert(resp, "external", ExternalStream)
@@ -267,6 +285,11 @@ class StreamSource(Base):
             result["subject_transforms"] = [tr.as_dict() for tr in self.subject_transforms]
         if self.opt_start_time is not None:
             result["opt_start_time"] = self._to_utc_iso(self.opt_start_time)
+        result.pop("domain", None)
+        if self.domain:
+            if self.external is not None:
+                raise ValueError("nats: domain and external are both set")
+            result["external"] = {"api": f"$JS.{self.domain}.API"}
         return result
 
 
@@ -276,6 +299,17 @@ class StreamSourceInfo(Base):
     lag: Optional[int] = None
     active: Optional[int] = None
     error: Optional[Dict[str, Any]] = None
+    external: Optional[ExternalStream] = None
+    # Last sequence of the source stream that was sourced.
+    seq: Optional[int] = None
+    filter_subject: Optional[str] = None
+    subject_transforms: Optional[List[SubjectTransform]] = None
+
+    @classmethod
+    def from_response(cls, resp: Dict[str, Any]):
+        cls._convert(resp, "external", ExternalStream)
+        cls._convert(resp, "subject_transforms", SubjectTransform)
+        return super().from_response(resp)
 
 
 @dataclass
@@ -295,10 +329,16 @@ class StreamState(Base):
     num_deleted: Optional[int] = None
     lost: Optional[LostStreamData] = None
     subjects: Optional[Dict[str, int]] = None
+    # Times of the first and last messages in the stream.
+    first_ts: Optional[datetime.datetime] = None
+    last_ts: Optional[datetime.datetime] = None
+    num_subjects: Optional[int] = None
 
     @classmethod
     def from_response(cls, resp: Dict[str, Any]):
         cls._convert(resp, "lost", LostStreamData)
+        cls._convert_utc_iso(resp, "first_ts")
+        cls._convert_utc_iso(resp, "last_ts")
         return super().from_response(resp)
 
 
@@ -523,6 +563,78 @@ class PeerInfo(Base):
     offline: Optional[bool] = None
     active: Optional[int] = None
     lag: Optional[int] = None
+    # Unique ID of the peer.
+    peer: Optional[str] = None
+    # Whether the peer is part of the assignment but not yet (or no longer)
+    # a peer of the Raft group.
+    pending: Optional[bool] = None
+
+
+class MigrationStatusType(str, Enum):
+    """
+    What has to change for a stream or consumer placement migration to
+    advance. Introduced in nats-server 2.15.0.
+    """
+
+    META = "meta"
+    MEMBERSHIP = "membership"
+    SNAPSHOT = "snapshot"
+    CATCHUP = "catchup"
+    QUORUM = "quorum"
+    BLOCKED = "blocked"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass
+class DesiredPeerInfo(Base):
+    """A peer of the desired peer set of a stream or consumer."""
+
+    name: Optional[str] = None
+    offline: Optional[bool] = None
+    peer: Optional[str] = None
+
+
+@dataclass
+class DesiredClusterInfoOrigin(Base):
+    """The configuration a stream had before the update that started a migration."""
+
+    replicas: Optional[int] = None
+    placement: Optional[Placement] = None
+    retention: Optional[RetentionPolicy] = None
+
+    @classmethod
+    def from_response(cls, resp: Dict[str, Any]):
+        cls._convert(resp, "placement", Placement)
+        return super().from_response(resp)
+
+
+@dataclass
+class DesiredClusterInfoStatus(Base):
+    """What the group leader is doing to reach the desired peer set."""
+
+    description: Optional[str] = None
+    # One of MigrationStatusType's values.
+    type: Optional[MigrationStatusType] = None
+    err: Optional[str] = None
+
+
+@dataclass
+class DesiredClusterInfo(Base):
+    """The desired set of servers of a stream or consumer being migrated."""
+
+    created: Optional[datetime.datetime] = None
+    name: Optional[str] = None
+    replicas: Optional[List[DesiredPeerInfo]] = None
+    origin: Optional[DesiredClusterInfoOrigin] = None
+    status: Optional[DesiredClusterInfoStatus] = None
+
+    @classmethod
+    def from_response(cls, resp: Dict[str, Any]):
+        cls._convert_utc_iso(resp, "created")
+        cls._convert(resp, "replicas", DesiredPeerInfo)
+        cls._convert(resp, "origin", DesiredClusterInfoOrigin)
+        cls._convert(resp, "status", DesiredClusterInfoStatus)
+        return super().from_response(resp)
 
 
 @dataclass
@@ -532,13 +644,22 @@ class ClusterInfo(Base):
     replicas: Optional[List[PeerInfo]] = None
     raft_group: Optional[str] = None
     leader_since: Optional[datetime.datetime] = None
+    # Sent by the server as ``traffic_account``.
     traffic_acc: Optional[str] = None
+    # Sent by the server as ``system_account``.
+    system_acc: Optional[bool] = None
+    desired: Optional[DesiredClusterInfo] = None
 
     @classmethod
     def from_response(cls, resp: Dict[str, Any]):
         cls._convert(resp, "replicas", PeerInfo)
         if "leader_since" in resp and resp["leader_since"]:
             resp["leader_since"] = cls._parse_utc_iso(resp["leader_since"])
+        if "traffic_account" in resp:
+            resp["traffic_acc"] = resp.pop("traffic_account")
+        if "system_account" in resp:
+            resp["system_acc"] = resp.pop("system_account")
+        cls._convert(resp, "desired", DesiredClusterInfo)
         return super().from_response(resp)
 
 
@@ -555,6 +676,9 @@ class StreamInfo(Base):
     cluster: Optional[ClusterInfo] = None
     did_create: Optional[bool] = None
     created: Optional[datetime.datetime] = None
+    # Server time when the info was created. Not compared, so infos of the
+    # same state are equal.
+    ts: Optional[datetime.datetime] = dataclasses.field(default=None, compare=False)
 
     @classmethod
     def from_response(cls, resp: Dict[str, Any]):
@@ -565,6 +689,7 @@ class StreamInfo(Base):
         cls._convert(resp, "cluster", ClusterInfo)
 
         cls._convert_utc_iso(resp, "created")
+        cls._convert_utc_iso(resp, "ts")
         return super().from_response(resp)
 
 
@@ -733,6 +858,13 @@ class ConsumerConfig(Base):
     # Introduced in nats-server 2.11.0.
     priority_groups: Optional[list[str]] = None
 
+    # Pull consumer limits on a single pull request: the maximum batch
+    # (nats.go MaxRequestBatch), expiry in seconds (MaxRequestExpires) and
+    # max bytes (MaxRequestMaxBytes).
+    max_batch: Optional[int] = None
+    max_expires: Optional[float] = None
+    max_bytes: Optional[int] = None
+
     @classmethod
     def from_response(cls, resp: Dict[str, Any]):
         cls._convert_nanoseconds(resp, "ack_wait")
@@ -740,6 +872,7 @@ class ConsumerConfig(Base):
         cls._convert_nanoseconds(resp, "inactive_threshold")
         cls._convert_utc_iso(resp, "opt_start_time")
         cls._convert_nanoseconds(resp, "priority_timeout")
+        cls._convert_nanoseconds(resp, "max_expires")
         if "backoff" in resp:
             resp["backoff"] = [val / _NANOSECOND for val in resp["backoff"]]
         return super().from_response(resp)
@@ -753,6 +886,8 @@ class ConsumerConfig(Base):
         result["inactive_threshold"] = self._to_nanoseconds(self.inactive_threshold)
         if self.priority_timeout is not None:
             result["priority_timeout"] = self._to_nanoseconds(self.priority_timeout)
+        if self.max_expires is not None:
+            result["max_expires"] = self._to_nanoseconds(self.max_expires)
         if self.backoff:
             result["backoff"] = [self._to_nanoseconds(i) for i in self.backoff]
         return result
@@ -828,6 +963,9 @@ class ConsumerInfo(Base):
     pause_remaining: Optional[float] = None
     # Introduced in nats-server 2.11.0.
     priority_groups: Optional[list[PriorityGroupState]] = None
+    # Server time when the info was created. Not compared, so infos of the
+    # same state are equal.
+    ts: Optional[datetime.datetime] = dataclasses.field(default=None, compare=False)
 
     @classmethod
     def from_response(cls, resp: Dict[str, Any]):
@@ -838,11 +976,14 @@ class ConsumerInfo(Base):
         cls._convert(resp, "cluster", ClusterInfo)
         cls._convert(resp, "priority_groups", PriorityGroupState)
         cls._convert_utc_iso(resp, "created")
+        cls._convert_utc_iso(resp, "ts")
         return super().from_response(resp)
 
     def as_dict(self) -> Dict[str, object]:
         result = super().as_dict()
         result["created"] = self._to_utc_iso(self.created)
+        if self.ts is not None:
+            result["ts"] = self._to_utc_iso(self.ts)
         return result
 
 
@@ -910,6 +1051,8 @@ class Tier(Base):
     streams: int
     consumers: int
     limits: AccountLimits
+    reserved_memory: Optional[int] = None
+    reserved_storage: Optional[int] = None
 
     @classmethod
     def from_response(cls, resp: Dict[str, Any]):
@@ -924,6 +1067,8 @@ class APIStats(Base):
     total: int
     errors: int
     level: Optional[int] = None  # API level; present from NATS server 2.11+
+    # API requests currently being served.
+    inflight: Optional[int] = None
 
 
 @dataclass
@@ -944,6 +1089,8 @@ class AccountInfo(Base):
     api: APIStats
     domain: Optional[str] = None
     tiers: Optional[Dict[str, Tier]] = None
+    reserved_memory: Optional[int] = None
+    reserved_storage: Optional[int] = None
 
     @classmethod
     def from_response(cls, resp: Dict[str, Any]):
