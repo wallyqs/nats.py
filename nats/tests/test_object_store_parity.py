@@ -185,3 +185,38 @@ class ObjectStoreErrorsTest(SingleJetStreamServerTestCase):
         assert status.stream_info.state.messages == 0
 
         await nc.close()
+
+
+class ObjectMetadataTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_object_metadata(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        obs = await js.create_object_store("OBJMETA")
+
+        meta = nats.js.api.ObjectMeta(name="A", description="d", metadata={"k": "v"})
+        info = await obs.put("A", b"A", meta=meta)
+        assert info.metadata == {"k": "v"}
+
+        info = await obs.get_info("A")
+        assert info.metadata == {"k": "v"}
+        assert info.meta.metadata == {"k": "v"}
+        assert (await obs.get("A")).info.metadata == {"k": "v"}
+
+        # The stored meta uses nats.go's JSON field.
+        raw = await js.get_last_msg("OBJ_OBJMETA", "$O.OBJMETA.M.QQ==")
+        assert json.loads(raw.data)["metadata"] == {"k": "v"}
+
+        # update_meta replaces the metadata too.
+        meta = info.meta
+        meta.metadata = {"x": "y"}
+        await obs.update_meta("A", meta)
+        assert (await obs.get_info("A")).metadata == {"x": "y"}
+
+        # Without metadata the field is left out.
+        await obs.put("B", b"B")
+        raw = await js.get_last_msg("OBJ_OBJMETA", "$O.OBJMETA.M.Qg==")
+        assert "metadata" not in json.loads(raw.data)
+        assert (await obs.get_info("B")).metadata is None
+
+        await nc.close()

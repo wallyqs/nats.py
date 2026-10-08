@@ -1085,6 +1085,8 @@ class ObjectMeta(Base):
     headers: Optional[dict] = None
     #  Optional options.
     options: Optional[ObjectMetaOptions] = None
+    # Optional user defined metadata.
+    metadata: Optional[Dict[str, str]] = None
 
     @classmethod
     def from_response(cls, resp: Dict[str, Any]):
@@ -1110,7 +1112,9 @@ class ObjectInfo(Base):
     headers: Optional[dict] = None
     #  Optional options.
     options: Optional[ObjectMetaOptions] = None
-    # NOTE: name, description, headers, options together compose
+    # Optional user defined metadata.
+    metadata: Optional[Dict[str, str]] = None
+    # NOTE: name, description, headers, options, metadata together compose
     # what would be the ObjectMeta embedded type in Go.
 
     @property
@@ -1120,6 +1124,7 @@ class ObjectInfo(Base):
             description=self.description,
             headers=self.headers,
             options=self.options,
+            metadata=self.metadata,
         )
 
     def is_link(self) -> bool:

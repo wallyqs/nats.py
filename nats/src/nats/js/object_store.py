@@ -333,6 +333,7 @@ class ObjectStore:
             description=meta.description,
             headers=meta.headers,
             options=meta.options,
+            metadata=meta.metadata,
             bucket=self._name,
             nuid=newnuid.decode(),
             size=0,
@@ -439,6 +440,7 @@ class ObjectStore:
         info.name = meta.name
         info.description = meta.description
         info.headers = meta.headers
+        info.metadata = meta.metadata
 
         # Publish the meta message under the (possibly new) name.
         meta_subj = OBJ_META_PRE_TEMPLATE.format(
