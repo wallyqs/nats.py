@@ -4971,6 +4971,29 @@ class ObjectStoreTest(SingleJetStreamServerTestCase):
         await nc.close()
 
     @async_test
+    async def test_object_empty_name(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        obs = await js.create_object_store("EMPTYNAME")
+        with pytest.raises(InvalidObjectNameError):
+            await obs.put("", b"data")
+        with pytest.raises(InvalidObjectNameError):
+            await obs.put("", b"data", meta=nats.js.api.ObjectMeta(name=""))
+
+        await obs.put("A", b"A")
+        info = await obs.get_info("A")
+        meta = info.meta
+        meta.name = ""
+        with pytest.raises(InvalidObjectNameError):
+            await obs.update_meta("A", meta)
+
+        # Nothing was stored for the rejected put.
+        status = await obs.status()
+        assert status.stream_info.state.messages == 2
+        await nc.close()
+
+    @async_test
     async def test_object_watch_stop_ends_iteration(self):
         nc = await nats.connect()
         js = nc.jetstream()

@@ -27,6 +27,7 @@ from nats.js import api
 from nats.js.errors import (
     BadObjectMetaError,
     DigestMismatchError,
+    InvalidObjectNameError,
     LinkIsABucketError,
     NotFoundError,
     ObjectAlreadyExists,
@@ -50,6 +51,11 @@ OBJ_NO_PENDING = "0"
 OBJ_DEFAULT_CHUNK_SIZE = 128 * 1024  # 128k
 OBJ_DIGEST_TYPE = "SHA-256="
 OBJ_DIGEST_TEMPLATE = OBJ_DIGEST_TYPE + "{digest}"
+
+
+def _check_object_name(name: Optional[str]) -> None:
+    if not name:
+        raise InvalidObjectNameError
 
 
 class ObjectStore:
@@ -254,6 +260,7 @@ class ObjectStore:
                 max_chunk_size=OBJ_DEFAULT_CHUNK_SIZE,
             )
 
+        _check_object_name(meta.name)
         obj = meta.name
         einfo = None
 
@@ -375,6 +382,7 @@ class ObjectStore:
         """
         update_meta will place the contents from the reader into this object-store.
         """
+        _check_object_name(meta.name)
         info = None
         try:
             info = await self.get_info(name)
