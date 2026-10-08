@@ -15,10 +15,12 @@ from nats.js.errors import (
     BucketRequiredError,
     InvalidBucketNameError,
     InvalidKeyError,
+    KeyHistoryNotFoundError,
     KeyNotFoundError,
     KeyRevisionMismatchError,
     KeyValueConfigRequiredError,
     KeyWrongLastSequenceError,
+    NoKeysError,
     NotFoundError,
 )
 
@@ -557,5 +559,36 @@ class KVHandleTest(SingleJetStreamServerTestCase):
         assert str(KeyValueOp.PURGE) == "KeyValuePurgeOp"
         assert f"{KeyValueOp.PURGE}" == "KeyValuePurgeOp"
         assert KeyValueOp.DELETE.value == "DEL"
+
+        await nc.close()
+
+
+class KVHistoryTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_history_not_found_and_options(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        kv = await js.create_key_value(bucket="HIST", history=5)
+
+        with pytest.raises(KeyNotFoundError) as exc:
+            await kv.history("missing")
+        # Existing callers catching NoKeysError keep working.
+        assert isinstance(exc.value, NoKeysError)
+        assert isinstance(exc.value, KeyHistoryNotFoundError)
+        assert str(exc.value) == "nats: key not found"
+
+        await kv.put("a", b"1")
+        await kv.put("a", b"2")
+        await kv.delete("a")
+
+        history = await kv.history("a")
+        assert [e.op for e in history] == [KeyValueOp.PUT, KeyValueOp.PUT, KeyValueOp.DELETE]
+
+        history = await kv.history("a", ignore_deletes=True)
+        assert [e.value for e in history] == [b"1", b"2"]
+
+        history = await kv.history("a", meta_only=True)
+        assert len(history) == 3
+        assert all(not e.value for e in history)
 
         await nc.close()

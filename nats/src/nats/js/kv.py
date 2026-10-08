@@ -700,11 +700,22 @@ class KeyValue:
 
         return keys
 
-    async def history(self, key: str) -> List[Entry]:
+    async def history(self, key: str, ignore_deletes: bool = False, meta_only: bool = False) -> List[Entry]:
         """
         history retrieves a list of the entries so far.
+
+        Raises KeyHistoryNotFoundError, which is both a KeyNotFoundError
+        (as nats.go's History) and a NoKeysError, when there are none.
+
+        :param ignore_deletes: Leave out delete and purge markers.
+        :param meta_only: Retrieve the entries without their values.
         """
-        watcher = await self.watch(key, include_history=True)
+        watcher = await self.watch(
+            key,
+            include_history=True,
+            ignore_deletes=ignore_deletes,
+            meta_only=meta_only,
+        )
 
         entries = []
 
@@ -717,7 +728,7 @@ class KeyValue:
         await watcher.stop()
 
         if not entries:
-            raise nats.js.errors.NoKeysError
+            raise nats.js.errors.KeyHistoryNotFoundError
 
         return entries
 

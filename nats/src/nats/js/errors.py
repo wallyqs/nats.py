@@ -312,6 +312,18 @@ class KeyHistoryTooLargeError(KeyValueError):
         return "nats: history limited to a max of 64"
 
 
+class KeyHistoryNotFoundError(NoKeysError, KeyNotFoundError):
+    """
+    Raised by KeyValue.history() when the key has no revisions.
+
+    nats.go returns ErrKeyNotFound for it, so it is a KeyNotFoundError;
+    it is also the NoKeysError that history() raised before.
+    """
+
+    def __str__(self) -> str:
+        return "nats: key not found"
+
+
 class KeyRevisionMismatchError(KeyWrongLastSequenceError):
     """
     Raised when an update, delete or purge expected a revision that is not
