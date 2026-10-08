@@ -19,6 +19,8 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 from nats.aio.msg import Msg
 
+from .errors import ArgRequiredError, RespondError
+
 ERROR_HEADER = "Nats-Service-Error"
 ERROR_CODE_HEADER = "Nats-Service-Error-Code"
 
@@ -50,9 +52,10 @@ class Request:
 
         :param data: The response data.
         :param headers: Additional response headers.
+        :raises RespondError: If the request has no reply subject.
         """
         if not self._msg.reply:
-            raise ValueError("no reply subject set")
+            raise RespondError("NATS error when sending response: no reply subject set")
 
         await self._msg._client.publish(
             self._msg.reply,
@@ -73,12 +76,12 @@ class Request:
         :param description: A string describing the error which can be displayed to the client.
         :param data: The error data.
         :param headers: Additional response headers.
-        :raises ValueError: If the code or the description is empty.
+        :raises ArgRequiredError: If the code or the description is empty.
         """
         if not code:
-            raise ValueError("argument required: error code")
+            raise ArgRequiredError("argument required: error code")
         if not description:
-            raise ValueError("argument required: description")
+            raise ArgRequiredError("argument required: description")
 
         await self._send_error(code, description, data, headers)
         self._error = f"{code}:{description}"

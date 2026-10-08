@@ -17,8 +17,18 @@ from typing import Optional
 
 from nats.aio.client import Client
 
+from .errors import (
+    ArgRequiredError,
+    ConfigValidationError,
+    MarshalResponseError,
+    MicroError,
+    NATSError,
+    RespondError,
+    ServiceNameRequiredError,
+    VerbNotSupportedError,
+)
 from .request import Handler, Request
-from .service import Service, ServiceConfig
+from .service import Service, ServiceConfig, ServiceVerb, control_subject
 
 
 async def add_service(nc: Client, config: Optional[ServiceConfig] = None, **kwargs) -> Service:
@@ -34,4 +44,16 @@ async def add_service(nc: Client, config: Optional[ServiceConfig] = None, **kwar
     return service
 
 
-__all__ = ["add_service"]
+__all__ = [
+    "add_service",
+    "control_subject",
+    "ServiceVerb",
+    "ArgRequiredError",
+    "ConfigValidationError",
+    "MarshalResponseError",
+    "MicroError",
+    "NATSError",
+    "RespondError",
+    "ServiceNameRequiredError",
+    "VerbNotSupportedError",
+]

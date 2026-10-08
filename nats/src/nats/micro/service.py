@@ -22,6 +22,7 @@ from nats.aio.client import Client
 from nats.aio.msg import Msg
 from nats.aio.subscription import Subscription
 
+from .errors import ConfigValidationError, ServiceNameRequiredError, VerbNotSupportedError
 from .request import Handler, Request, ServiceError
 
 DEFAULT_QUEUE_GROUP = "q"
@@ -69,18 +70,22 @@ class EndpointConfig:
 
     def __post_init__(self) -> None:
         if not self.name:
-            raise ValueError("Name cannot be empty.")
+            raise ConfigValidationError("Name cannot be empty.")
 
         if not NAME_REGEX.match(self.name):
-            raise ValueError("Invalid name. Name must contain only alphanumeric characters, underscores, and hyphens.")
+            raise ConfigValidationError(
+                "Invalid name. Name must contain only alphanumeric characters, underscores, and hyphens."
+            )
 
         if self.subject:
             if not SUBJECT_REGEX.match(self.subject):
-                raise ValueError("Invalid subject. Subject must not contain spaces, and can only have '>' at the end.")
+                raise ConfigValidationError(
+                    "Invalid subject. Subject must not contain spaces, and can only have '>' at the end."
+                )
 
         if self.queue_group:
             if not SUBJECT_REGEX.match(self.queue_group):
-                raise ValueError("Invalid queue group. Queue group must not contain spaces.")
+                raise ConfigValidationError("Invalid queue group. Queue group must not contain spaces.")
 
 
 @dataclass
@@ -411,20 +416,24 @@ class ServiceConfig:
 
     def __post_init__(self) -> None:
         if not self.name:
-            raise ValueError("Name cannot be empty.")
+            raise ConfigValidationError("Name cannot be empty.")
 
         if not NAME_REGEX.match(self.name):
-            raise ValueError("Invalid name. It must contain only alphanumeric characters, dashes, and underscores.")
+            raise ConfigValidationError(
+                "Invalid name. It must contain only alphanumeric characters, dashes, and underscores."
+            )
 
         if not self.version:
-            raise ValueError("Version cannot be empty.")
+            raise ConfigValidationError("Version cannot be empty.")
 
         if not SEMVER_REGEX.match(self.version):
-            raise ValueError("Invalid version. It must follow semantic versioning (e.g., 1.0.0, 2.1.3-alpha.1).")
+            raise ConfigValidationError(
+                "Invalid version. It must follow semantic versioning (e.g., 1.0.0, 2.1.3-alpha.1)."
+            )
 
         if self.queue_group:
             if not SUBJECT_REGEX.match(self.queue_group):
-                raise ValueError(
+                raise ConfigValidationError(
                     "Invalid queue group. It must contain only alphanumeric characters, dashes, and underscores."
                 )
 
@@ -819,8 +828,18 @@ def control_subject(
     id: Optional[str] = None,
     prefix=DEFAULT_PREFIX,
 ) -> str:
+    """Returns the monitoring subject of a verb for all services, for the
+    services called ``name``, or for the service instance ``id`` of them.
+
+    :raises VerbNotSupportedError: If ``verb`` is not PING, STATS or INFO.
+    :raises ServiceNameRequiredError: If ``id`` is given without ``name``.
+    """
+    try:
+        verb = ServiceVerb(verb)
+    except ValueError:
+        raise VerbNotSupportedError(f"unsupported verb: {json.dumps(str(verb))}") from None
     if not name and id:
-        raise ValueError("service name is required to generate ID control subject")
+        raise ServiceNameRequiredError()
     if not name:
         return f"{prefix}.{verb.value}"
     elif not id:
