@@ -15,13 +15,50 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, NoReturn, Optional
+from enum import IntEnum
+from typing import TYPE_CHECKING, Any, Dict, NoReturn, Optional, Type
 
 import nats.errors
 from nats.js import api
 
 if TYPE_CHECKING:
     from nats.aio.msg import Msg
+
+
+class ErrorCode(IntEnum):
+    """
+    JetStream API error codes, as sent by the server in the ``err_code``
+    field of an API error (nats.go ``jetstream.ErrorCode`` and its
+    ``JSErrCode*`` constants).
+    """
+
+    BAD_REQUEST = 10003
+    CONSUMER_CREATE = 10012
+    CONSUMER_NAME_EXISTS = 10013
+    CONSUMER_NOT_FOUND = 10014
+    MAXIMUM_CONSUMERS_LIMIT = 10026
+    MESSAGE_NOT_FOUND = 10037
+    JETSTREAM_NOT_ENABLED_FOR_ACCOUNT = 10039
+    STREAM_NAME_IN_USE = 10058
+    STREAM_NOT_FOUND = 10059
+    STREAM_WRONG_LAST_SEQUENCE = 10071
+    JETSTREAM_NOT_ENABLED = 10076
+    CONSUMER_ALREADY_EXISTS = 10105
+    DUPLICATE_FILTER_SUBJECTS = 10136
+    OVERLAPPING_FILTER_SUBJECTS = 10138
+    CONSUMER_EMPTY_FILTER = 10139
+    CONSUMER_EXISTS = 10148
+    CONSUMER_DOES_NOT_EXIST = 10149
+    STREAM_WRONG_LAST_SEQUENCE_CONSTANT = 10164
+    MIRROR_WITH_MSG_SCHEDULES = 10186
+    SOURCE_WITH_MSG_SCHEDULES = 10187
+    MESSAGE_SCHEDULES_DISABLED = 10188
+    SCHEDULE_PATTERN_INVALID = 10189
+    SCHEDULE_TARGET_INVALID = 10190
+    SCHEDULE_TTL_INVALID = 10191
+    SCHEDULE_ROLLUP_INVALID = 10192
+    SCHEDULE_SOURCE_INVALID = 10203
+    CONSUMER_INVALID_RESET = 10204
 
 
 class Error(nats.errors.Error):
@@ -37,6 +74,18 @@ class Error(nats.errors.Error):
         if self.description:
             desc = self.description
         return f"nats: JetStream.{self.__class__.__name__} {desc}"
+
+    @property
+    def api_error(self) -> Optional[APIError]:
+        """
+        The API error returned by the server that caused this error, if any
+        (nats.go ``JetStreamError.APIError()``).
+        """
+        return None
+
+
+# JetStreamError is the nats.go name of the base JetStream error.
+JetStreamError = Error
 
 
 @dataclass(repr=False, init=False)
@@ -74,23 +123,41 @@ class APIError(Error):
             raise ServiceUnavailableError
         else:
             desc = msg.header[api.Header.DESCRIPTION]
-            raise APIError(code=int(code), description=desc)
+            err_cls: Type[APIError] = APIError
+            if code == api.StatusCode.CONFLICT and desc:
+                if desc.startswith("Consumer Deleted"):
+                    err_cls = ConsumerDeletedError
+                elif desc.startswith("Consumer is push based"):
+                    err_cls = NotPullConsumerError
+            raise err_cls(code=int(code), description=desc)
 
     @classmethod
     def from_error(cls, err: Dict[str, Any]):
         code = err["code"]
+        base: Type[APIError]
         if code == 503:
-            raise ServiceUnavailableError(**err)
+            base = ServiceUnavailableError
         elif code == 500:
-            raise ServerError(**err)
+            base = ServerError
         elif code == 423:
-            raise PinIdMismatchError(**err)
+            base = PinIdMismatchError
         elif code == 404:
-            raise NotFoundError(**err)
+            base = NotFoundError
         elif code == 400:
-            raise BadRequestError(**err)
+            base = BadRequestError
         else:
-            raise APIError(**err)
+            base = APIError
+        # Raise the error matching the JetStream error code when there is one
+        # (nats.go maps err_code to its sentinel errors), as long as it is a
+        # subclass of the error raised for the status code.
+        typed = _API_ERRORS.get(err.get("err_code"))
+        if typed is not None and issubclass(typed, base):
+            raise typed(**err)
+        raise base(**err)
+
+    @property
+    def api_error(self) -> Optional[APIError]:
+        return self
 
     def __str__(self) -> str:
         return (
@@ -153,6 +220,410 @@ class ConsumerInvalidResetError(BadRequestError):
     pass
 
 
+class StreamNotFoundError(NotFoundError):
+    """
+    Raised when a stream does not exist (err_code 10059).
+    """
+
+    pass
+
+
+class ConsumerNotFoundError(NotFoundError):
+    """
+    Raised when a consumer does not exist (err_code 10014).
+    """
+
+    pass
+
+
+class MsgNotFoundError(NotFoundError):
+    """
+    Raised when a stream message does not exist (err_code 10037).
+    """
+
+    pass
+
+
+class StreamNameAlreadyInUseError(BadRequestError):
+    """
+    Raised when creating a stream whose name is already in use with a
+    different configuration (err_code 10058).
+    """
+
+    pass
+
+
+class StreamWrongLastSequenceError(BadRequestError):
+    """
+    Raised when an expected last sequence does not match the stream
+    (err_code 10071 or 10164).
+    """
+
+    pass
+
+
+class JetStreamBadRequestError(BadRequestError):
+    """
+    Raised when the server rejects a request as a bad request (err_code
+    10003, nats.go ``ErrBadRequest``).
+    """
+
+    pass
+
+
+class ConsumerCreateError(ServerError):
+    """
+    Raised when the server could not create a consumer (err_code 10012).
+    """
+
+    pass
+
+
+class ConsumerNameAlreadyInUseError(BadRequestError):
+    """
+    Raised when a consumer name is already in use (err_code 10013).
+    """
+
+    pass
+
+
+class ConsumerExistsError(BadRequestError):
+    """
+    Raised when creating a consumer that already exists with a different
+    configuration (err_code 10148).
+    """
+
+    pass
+
+
+class ConsumerDoesNotExistError(BadRequestError):
+    """
+    Raised when updating a consumer that does not exist (err_code 10149).
+    """
+
+    pass
+
+
+class MaximumConsumersLimitError(BadRequestError):
+    """
+    Raised when the stream's or account's consumer limit is reached
+    (err_code 10026).
+    """
+
+    pass
+
+
+class DuplicateFilterSubjectsError(BadRequestError):
+    """
+    Raised when a consumer has both filter_subject and filter_subjects
+    (err_code 10136).
+    """
+
+    pass
+
+
+class OverlappingFilterSubjectsError(BadRequestError):
+    """
+    Raised when a consumer's filter subjects overlap (err_code 10138).
+    """
+
+    pass
+
+
+class EmptyFilterError(BadRequestError):
+    """
+    Raised when one of a consumer's filter subjects is empty
+    (err_code 10139).
+    """
+
+    pass
+
+
+class JetStreamNotEnabledError(ServiceUnavailableError):
+    """
+    Raised when JetStream is not enabled on the server (err_code 10076),
+    and when a JetStream API request has no responders.
+    """
+
+    pass
+
+
+class JetStreamNotEnabledForAccountError(ServiceUnavailableError):
+    """
+    Raised when JetStream is not enabled for the account (err_code 10039).
+    """
+
+    pass
+
+
+class MirrorWithMsgSchedulesError(BadRequestError):
+    """
+    Raised when a mirror stream enables message schedules (err_code 10186).
+    """
+
+    pass
+
+
+class SourceWithMsgSchedulesError(BadRequestError):
+    """
+    Raised when a sourcing stream enables message schedules
+    (err_code 10187).
+    """
+
+    pass
+
+
+class MessageSchedulesDisabledError(BadRequestError):
+    """
+    Raised when a scheduled message is published to a stream without
+    message schedules enabled (err_code 10188).
+    """
+
+    pass
+
+
+class SchedulePatternInvalidError(BadRequestError):
+    """
+    Raised when a message schedule pattern is invalid (err_code 10189).
+    """
+
+    pass
+
+
+class ScheduleTargetInvalidError(BadRequestError):
+    """
+    Raised when a message schedule target is invalid (err_code 10190).
+    """
+
+    pass
+
+
+class ScheduleTTLInvalidError(BadRequestError):
+    """
+    Raised when a message schedule TTL is invalid (err_code 10191).
+    """
+
+    pass
+
+
+class ScheduleRollupInvalidError(BadRequestError):
+    """
+    Raised when a message schedule rollup is invalid (err_code 10192).
+    """
+
+    pass
+
+
+class ScheduleSourceInvalidError(BadRequestError):
+    """
+    Raised when a message schedule source is invalid (err_code 10203).
+    """
+
+    pass
+
+
+class _InvalidValueError(Error, ValueError):
+    """
+    A client-side validation error. It is also a ValueError, which the
+    client raised for these checks before it had dedicated errors.
+    """
+
+    _default = ""
+
+    def __init__(self, description: Optional[str] = None) -> None:
+        self.description = description
+
+    def __str__(self) -> str:
+        return self.description or self._default
+
+
+class StreamNameRequiredError(_InvalidValueError):
+    """
+    Raised when a stream name is required but missing.
+    """
+
+    _default = "nats: stream name is required"
+
+
+class InvalidStreamNameError(_InvalidValueError):
+    """
+    Raised when a stream name contains characters it cannot have.
+    """
+
+    _default = "nats: invalid stream name"
+
+
+class InvalidConsumerNameError(_InvalidValueError):
+    """
+    Raised when a consumer name is missing or contains characters it cannot
+    have.
+    """
+
+    _default = "nats: invalid consumer name"
+
+
+class InvalidSubjectError(_InvalidValueError):
+    """
+    Raised when a subject is empty or invalid.
+    """
+
+    _default = "nats: invalid subject name"
+
+
+class InvalidOptionError(_InvalidValueError):
+    """
+    Raised when JetStream options are invalid or conflict.
+    """
+
+    _default = "nats: invalid jetstream option"
+
+
+class ConsumerCreationResponseEmptyError(Error):
+    """
+    Raised when the server replies to a consumer create request without the
+    consumer's info.
+    """
+
+    def __str__(self) -> str:
+        return "nats: consumer creation response is empty"
+
+
+class ConsumerResetResponseEmptyError(Error):
+    """
+    Raised when the server replies to a consumer reset request without the
+    consumer's info.
+    """
+
+    def __str__(self) -> str:
+        return "nats: consumer reset response is empty"
+
+
+class StreamSubjectTransformNotSupportedError(Error):
+    """
+    Raised when the server dropped a requested stream subject transform.
+    """
+
+    def __str__(self) -> str:
+        return "nats: stream subject transformation not supported by nats-server"
+
+
+class StreamSourceNotSupportedError(Error):
+    """
+    Raised when the server dropped the requested stream sources.
+    """
+
+    def __str__(self) -> str:
+        return "nats: stream sourcing is not supported by nats-server"
+
+
+class StreamSourceSubjectTransformNotSupportedError(StreamSubjectTransformNotSupportedError):
+    """
+    Raised when the server dropped a stream source's subject transforms.
+    """
+
+    pass
+
+
+class StreamSourceMultipleFilterSubjectsNotSupportedError(Error):
+    """
+    Raised when the server does not support stream sources with multiple
+    subject filters.
+    """
+
+    def __str__(self) -> str:
+        return "nats: stream sourcing with multiple subject filters not supported by nats-server"
+
+
+class ConsumerMultipleFilterSubjectsNotSupportedError(Error):
+    """
+    Raised when the server dropped a consumer's filter_subjects.
+    """
+
+    def __str__(self) -> str:
+        return "nats: multiple consumer filter subjects not supported by nats-server"
+
+
+class ConsumerHasActiveSubscriptionError(Error):
+    """
+    Raised when binding to a push consumer that already has an active
+    subscription.
+    """
+
+    pass
+
+
+class ConsumerAlreadyConsumingError(Error):
+    """
+    Raised when a consumer is already being consumed.
+    """
+
+    def __str__(self) -> str:
+        return "nats: consumer is already consuming"
+
+
+class ConsumerDeletedError(APIError):
+    """
+    Raised when the consumer was deleted while it was being consumed
+    (a 409 "Consumer Deleted" status).
+    """
+
+    pass
+
+
+class NotPullConsumerError(APIError):
+    """
+    Raised when a pull operation is used with a push consumer (a 409
+    "Consumer is push based" status, or a push consumer's info).
+    """
+
+    pass
+
+
+class NotPushConsumerError(Error):
+    """
+    Raised when a push operation is used with a pull consumer.
+    """
+
+    def __str__(self) -> str:
+        return "nats: consumer is not a push consumer"
+
+
+class HandlerRequiredError(Error):
+    """
+    Raised when a message handler is required but missing.
+    """
+
+    def __str__(self) -> str:
+        return "nats: handler cannot be empty"
+
+
+class EndOfDataError(Error):
+    """
+    Raised when a listing reached its end.
+    """
+
+    def __str__(self) -> str:
+        return "nats: end of data reached"
+
+
+class OrderConsumerUsedAsFetchError(Error):
+    """
+    Raised when an ordered consumer being consumed is used to fetch.
+    """
+
+    def __str__(self) -> str:
+        return "nats: ordered consumer initialized as fetch"
+
+
+class OrderConsumerUsedAsConsumeError(Error):
+    """
+    Raised when an ordered consumer being fetched from is used to consume.
+    """
+
+    def __str__(self) -> str:
+        return "nats: ordered consumer initialized as consume"
+
+
 class NoStreamResponseError(Error):
     """
     Raised if the client gets a 503 when publishing a message.
@@ -178,6 +649,15 @@ class FetchTimeoutError(nats.errors.TimeoutError):
 
     def __str__(self) -> str:
         return "nats: fetch timeout"
+
+
+class NoMessagesError(FetchTimeoutError):
+    """
+    Raised when no messages were received before the request expired.
+    """
+
+    def __str__(self) -> str:
+        return "nats: no messages"
 
 
 class ConsumerSequenceMismatchError(Error):
@@ -557,3 +1037,34 @@ class KeyValueLimitMarkerTTLNotSupportedError(Error):
 
     def __str__(self):
         return "nats: limit marker TTLs not supported by server"
+
+
+# The JetStream API errors raised for an err_code (see APIError.from_error).
+_API_ERRORS: Dict[Optional[int], Type[APIError]] = {
+    ErrorCode.BAD_REQUEST: JetStreamBadRequestError,
+    ErrorCode.CONSUMER_CREATE: ConsumerCreateError,
+    ErrorCode.CONSUMER_NAME_EXISTS: ConsumerNameAlreadyInUseError,
+    ErrorCode.CONSUMER_NOT_FOUND: ConsumerNotFoundError,
+    ErrorCode.MAXIMUM_CONSUMERS_LIMIT: MaximumConsumersLimitError,
+    ErrorCode.MESSAGE_NOT_FOUND: MsgNotFoundError,
+    ErrorCode.JETSTREAM_NOT_ENABLED_FOR_ACCOUNT: JetStreamNotEnabledForAccountError,
+    ErrorCode.STREAM_NAME_IN_USE: StreamNameAlreadyInUseError,
+    ErrorCode.STREAM_NOT_FOUND: StreamNotFoundError,
+    ErrorCode.STREAM_WRONG_LAST_SEQUENCE: StreamWrongLastSequenceError,
+    ErrorCode.JETSTREAM_NOT_ENABLED: JetStreamNotEnabledError,
+    ErrorCode.DUPLICATE_FILTER_SUBJECTS: DuplicateFilterSubjectsError,
+    ErrorCode.OVERLAPPING_FILTER_SUBJECTS: OverlappingFilterSubjectsError,
+    ErrorCode.CONSUMER_EMPTY_FILTER: EmptyFilterError,
+    ErrorCode.CONSUMER_EXISTS: ConsumerExistsError,
+    ErrorCode.CONSUMER_DOES_NOT_EXIST: ConsumerDoesNotExistError,
+    ErrorCode.STREAM_WRONG_LAST_SEQUENCE_CONSTANT: StreamWrongLastSequenceError,
+    ErrorCode.MIRROR_WITH_MSG_SCHEDULES: MirrorWithMsgSchedulesError,
+    ErrorCode.SOURCE_WITH_MSG_SCHEDULES: SourceWithMsgSchedulesError,
+    ErrorCode.MESSAGE_SCHEDULES_DISABLED: MessageSchedulesDisabledError,
+    ErrorCode.SCHEDULE_PATTERN_INVALID: SchedulePatternInvalidError,
+    ErrorCode.SCHEDULE_TARGET_INVALID: ScheduleTargetInvalidError,
+    ErrorCode.SCHEDULE_TTL_INVALID: ScheduleTTLInvalidError,
+    ErrorCode.SCHEDULE_ROLLUP_INVALID: ScheduleRollupInvalidError,
+    ErrorCode.SCHEDULE_SOURCE_INVALID: ScheduleSourceInvalidError,
+    ErrorCode.CONSUMER_INVALID_RESET: ConsumerInvalidResetError,
+}

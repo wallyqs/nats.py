@@ -21,7 +21,22 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
 from nats.errors import NoRespondersError
 from nats.js import api
-from nats.js.errors import APIError, ConsumerInvalidResetError, NotFoundError, ServiceUnavailableError
+from nats.js.errors import (
+    APIError,
+    ConsumerCreationResponseEmptyError,
+    ConsumerInvalidResetError,
+    ConsumerMultipleFilterSubjectsNotSupportedError,
+    ConsumerResetResponseEmptyError,
+    ErrorCode,
+    InvalidConsumerNameError,
+    InvalidStreamNameError,
+    JetStreamNotEnabledError,
+    NotFoundError,
+    StreamNameRequiredError,
+    StreamSourceNotSupportedError,
+    StreamSourceSubjectTransformNotSupportedError,
+    StreamSubjectTransformNotSupportedError,
+)
 
 if TYPE_CHECKING:
     from nats import NATS
@@ -38,16 +53,56 @@ _INVALID_NAME_CHARS = ">*. /\\\t\r\n"
 
 def _validate_stream_name(name: Optional[str]) -> None:
     if not name:
-        raise ValueError("nats: stream name is required")
+        raise StreamNameRequiredError()
     if any(c in _INVALID_NAME_CHARS for c in name):
-        raise ValueError(f"nats: invalid stream name: {name!r}")
+        raise InvalidStreamNameError(f"nats: invalid stream name: {name!r}")
 
 
 def _validate_consumer_name(name: Optional[str]) -> None:
     if not name:
-        raise ValueError("nats: consumer name is required")
+        raise InvalidConsumerNameError("nats: consumer name is required")
     if any(c in _INVALID_NAME_CHARS for c in name):
-        raise ValueError(f"nats: invalid consumer name: {name!r}")
+        raise InvalidConsumerNameError(f"nats: invalid consumer name: {name!r}")
+
+
+def _check_stream_support(config: api.StreamConfig, info: api.StreamInfo) -> None:
+    """
+    Checks that the server kept the subject transform and sources of a
+    created or updated stream, as nats.go does: servers that do not support
+    them drop them from the stream's config.
+    """
+    if config.subject_transform is not None and info.config.subject_transform is None:
+        raise StreamSubjectTransformNotSupportedError
+    if not config.sources:
+        return
+    returned = info.config.sources or []
+    if len(config.sources) != len(returned):
+        raise StreamSourceNotSupportedError
+
+    # The server may return the sources in another order.
+    def counts(sources: List[Any]) -> List[int]:
+        def transforms(src: Any) -> Any:
+            if isinstance(src, dict):
+                return src.get("subject_transforms")
+            return getattr(src, "subject_transforms", None)
+
+        return sorted(len(transforms(src) or []) for src in sources)
+
+    if counts(config.sources) != counts(returned):
+        raise StreamSourceSubjectTransformNotSupportedError
+
+
+def _check_consumer_support(config: api.ConsumerConfig, info: api.ConsumerInfo) -> None:
+    """
+    Checks that the server kept a consumer's filter_subjects, which servers
+    before v2.10 drop.
+    """
+    if config.filter_subjects and not info.config.filter_subjects:
+        raise ConsumerMultipleFilterSubjectsNotSupportedError
+
+
+def _has_consumer_info(resp: Dict[str, Any]) -> bool:
+    return "name" in resp or "config" in resp
 
 
 class JetStreamManager:
@@ -114,7 +169,9 @@ class JetStreamManager:
             data.encode(),
             timeout=self._timeout,
         )
-        return api.StreamInfo.from_response(resp)
+        info = api.StreamInfo.from_response(resp)
+        _check_stream_support(config, info)
+        return info
 
     async def update_stream(self, config: Optional[api.StreamConfig] = None, **params) -> api.StreamInfo:
         """
@@ -131,7 +188,9 @@ class JetStreamManager:
             data.encode(),
             timeout=self._timeout,
         )
-        return api.StreamInfo.from_response(resp)
+        info = api.StreamInfo.from_response(resp)
+        _check_stream_support(config, info)
+        return info
 
     async def delete_stream(self, name: str) -> bool:
         """
@@ -240,7 +299,11 @@ class JetStreamManager:
             subject = f"{self._prefix}.CONSUMER.CREATE.{stream}"
 
         resp = await self._api_request(subject, req_data, timeout=timeout)
-        return api.ConsumerInfo.from_response(resp)
+        if not _has_consumer_info(resp):
+            raise ConsumerCreationResponseEmptyError
+        info = api.ConsumerInfo.from_response(resp)
+        _check_consumer_support(config, info)
+        return info
 
     async def delete_consumer(self, stream: str, consumer: str) -> bool:
         """
@@ -388,6 +451,8 @@ class JetStreamManager:
                 ) from err
             raise
 
+        if not _has_consumer_info(resp):
+            raise ConsumerResetResponseEmptyError
         return api.ConsumerReset.from_response(resp)
 
     async def consumers_info(self, stream: str, offset: Optional[int] = None) -> List[api.ConsumerInfo]:
@@ -550,7 +615,13 @@ class JetStreamManager:
             msg = await self._nc.request(req_subject, req, timeout=timeout)
             resp = json.loads(msg.data)
         except NoRespondersError:
-            raise ServiceUnavailableError
+            # nats.go reports a JetStream API request without responders as
+            # ErrJetStreamNotEnabled.
+            raise JetStreamNotEnabledError(
+                code=503,
+                err_code=ErrorCode.JETSTREAM_NOT_ENABLED,
+                description="jetstream not enabled",
+            )
 
         # Check for API errors.
         if "error" in resp:

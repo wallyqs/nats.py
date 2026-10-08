@@ -422,7 +422,9 @@ class JetStreamContext(JetStreamManager):
                 elif consumer_info.push_bound:
                     # Need to reject a non queue subscription to a non queue consumer
                     # if the consumer is already bound.
-                    raise nats.js.errors.Error("consumer is already bound to a subscription")
+                    raise nats.js.errors.ConsumerHasActiveSubscriptionError(
+                        "consumer is already bound to a subscription"
+                    )
             else:
                 if not queue:
                     raise nats.js.errors.Error(
@@ -686,7 +688,7 @@ class JetStreamContext(JetStreamManager):
 
         """
         if not stream:
-            raise ValueError("nats: stream name is required")
+            raise nats.js.errors.StreamNameRequiredError()
 
         if inbox_prefix is None:
             inbox_prefix = bytes(self._nc._inbox_prefix[:]) + b"."

@@ -133,7 +133,8 @@ class BatchErrorIdentityTest(SingleJetStreamServerTestCase):
 
         # Other errors keep their usual classes.
         err = api_error_from({"code": 404, "err_code": 10059, "description": "stream not found"})
-        assert type(err) is NotFoundError
+        assert isinstance(err, NotFoundError)
+        assert type(err).__module__ == "nats.js.errors"
         err = api_error_from({"code": 429, "err_code": 10210, "description": "atomic publish too many inflight"})
         assert isinstance(err, AtomicPublishTooManyInflightError)
         err = api_error_from({"code": 429, "err_code": 10211, "description": "batch publish too many inflight"})
