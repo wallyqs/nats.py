@@ -4226,6 +4226,39 @@ class KVTest(SingleJetStreamServerTestCase):
         await nc.close()
 
     @async_test
+    async def test_kv_get_entry_metadata(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        for direct in (False, True):
+            with self.subTest(direct=direct):
+                bucket = f"META_{int(direct)}"
+                kv = await js.create_key_value(bucket=bucket, history=5, direct=direct)
+
+                before = datetime.datetime.now(datetime.timezone.utc)
+                await kv.put("k", b"v1")
+                await kv.put("k", b"v2")
+                after = datetime.datetime.now(datetime.timezone.utc)
+
+                for entry in (await kv.get("k"), await kv.get("k", revision=1)):
+                    assert entry.delta == 0
+                    assert isinstance(entry.created, datetime.datetime)
+                    margin = datetime.timedelta(seconds=1)
+                    assert before - margin <= entry.created <= after + margin
+
+                await kv.delete("k")
+                with pytest.raises(KeyNotFoundError) as err:
+                    await kv.get("k")
+                assert err.value.entry.operation == "DEL"
+
+                await kv.purge("k")
+                with pytest.raises(KeyNotFoundError) as err:
+                    await kv.get("k")
+                assert err.value.entry.operation == "PURGE"
+
+        await nc.close()
+
+    @async_test
     async def test_kv_placement(self):
         nc = await nats.connect()
         js = nc.jetstream()

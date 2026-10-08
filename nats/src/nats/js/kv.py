@@ -200,8 +200,8 @@ class KeyValue:
             key=key,
             value=msg.data,
             revision=msg.seq,
-            delta=None,
-            created=None,
+            delta=0,
+            created=msg.time,
             operation=None,
         )
 
@@ -209,6 +209,7 @@ class KeyValue:
         if msg.headers:
             op = msg.headers.get(KV_OP, None)
             if op == KV_DEL or op == KV_PURGE:
+                entry.operation = op
                 raise nats.js.errors.KeyDeletedError(entry, op)
 
         return entry
