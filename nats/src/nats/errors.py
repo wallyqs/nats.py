@@ -111,13 +111,102 @@ class BadTimeoutError(Error):
 
 
 class AuthenticationExpiredError(Error):
+    def __init__(self, description: str = "") -> None:
+        super().__init__(description)
+        self.description = description
+
     def __str__(self) -> str:
+        if self.description:
+            return f"nats: {self.description}"
         return "nats: authentication expired"
 
 
-class AuthorizationError(Error):
+class AccountAuthExpiredError(AuthenticationExpiredError):
+    """
+    The server reported that the account's authentication expired,
+    as nats.go's ErrAccountAuthExpired.
+    """
+
     def __str__(self) -> str:
+        if self.description:
+            return f"nats: {self.description}"
+        return "nats: account authentication expired"
+
+
+class AuthorizationError(Error):
+    def __init__(self, description: str = "") -> None:
+        super().__init__(description)
+        self.description = description
+
+    def __str__(self) -> str:
+        if self.description:
+            return f"nats: {self.description}"
         return "nats: authorization failed"
+
+
+class AuthRevokedError(Error):
+    """
+    The server revoked the user's authentication, as nats.go's ErrAuthRevoked.
+    """
+
+    def __init__(self, description: str = "") -> None:
+        super().__init__(description)
+        self.description = description
+
+    def __str__(self) -> str:
+        if self.description:
+            return f"nats: {self.description}"
+        return "nats: authentication revoked"
+
+
+class PermissionViolationError(Error):
+    """
+    The server rejected a publish or subscribe for lack of permissions,
+    as nats.go's ErrPermissionViolation. ``description`` holds the
+    server's text, e.g. ``permissions violation for subscription to "foo"``.
+    """
+
+    def __init__(self, description: str = "") -> None:
+        super().__init__(description)
+        self.description = description
+
+    def __str__(self) -> str:
+        if self.description:
+            return f"nats: {self.description}"
+        return "nats: permissions violation"
+
+
+class MaxSubscriptionsExceededError(Error):
+    def __init__(self, description: str = "") -> None:
+        super().__init__(description)
+        self.description = description
+
+    def __str__(self) -> str:
+        if self.description:
+            return f"nats: {self.description}"
+        return "nats: server maximum subscriptions exceeded"
+
+
+class MaxConnectionsExceededError(Error):
+    def __init__(self, description: str = "") -> None:
+        super().__init__(description)
+        self.description = description
+
+    def __str__(self) -> str:
+        if self.description:
+            return f"nats: {self.description}"
+        return "nats: server maximum connections exceeded"
+
+
+class MaxAccountConnectionsExceededError(Error):
+    def __init__(self, description: str = "") -> None:
+        super().__init__(description)
+        self.description = description
+
+    def __str__(self) -> str:
+        if self.description:
+            return f"nats: {self.description}"
+        return "nats: maximum account active connections exceeded"
 
 
 class NoServersError(Error):
@@ -163,6 +252,16 @@ class InvalidCallbackTypeError(Error):
 class ProtocolError(Error):
     def __str__(self) -> str:
         return "nats: protocol error"
+
+
+class NoInfoReceivedError(Error):
+    """
+    The server did not start the connection with INFO,
+    as nats.go's ErrNoInfoReceived.
+    """
+
+    def __str__(self) -> str:
+        return "nats: empty response from server when expecting INFO message"
 
 
 class ServerNotInPoolError(Error):

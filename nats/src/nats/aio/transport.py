@@ -171,6 +171,19 @@ class TcpTransport(Transport):
     async def drain(self):
         return await self._io_writer.drain()
 
+    def _buffered_line(self) -> bytes:
+        """
+        Returns a complete line that was received but not read yet, which
+        a reader whose connection was reset no longer hands out.
+        """
+        buffer = getattr(self._io_reader, "_buffer", None)
+        if not buffer:
+            return b""
+        end = buffer.find(b"\r\n")
+        if end < 0:
+            return b""
+        return bytes(buffer[: end + 2])
+
     async def wait_closed(self):
         if self._io_writer is not None:
             return await self._io_writer.wait_closed()

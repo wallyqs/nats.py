@@ -66,6 +66,11 @@ STALE_CONNECTION = "stale connection"
 AUTHORIZATION_VIOLATION = "authorization violation"
 AUTHENTICATION_EXPIRED = "authentication expired"
 PERMISSIONS_ERR = "permissions violation"
+AUTHENTICATION_REVOKED = "authentication revoked"
+ACCOUNT_AUTHENTICATION_EXPIRED = "account authentication expired"
+MAX_SUBSCRIPTIONS_ERR = "maximum subscriptions exceeded"
+MAX_CONNECTIONS_ERR = "maximum connections exceeded"
+MAX_ACCOUNT_CONNECTIONS_ERR = "maximum account active connections exceeded"
 
 
 class Parser:

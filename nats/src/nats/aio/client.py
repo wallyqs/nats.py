@@ -43,8 +43,13 @@ from nats import errors
 from nats.nuid import NUID
 from nats.protocol import command as prot_command
 from nats.protocol.parser import (
+    ACCOUNT_AUTHENTICATION_EXPIRED,
     AUTHENTICATION_EXPIRED,
+    AUTHENTICATION_REVOKED,
     AUTHORIZATION_VIOLATION,
+    MAX_ACCOUNT_CONNECTIONS_ERR,
+    MAX_CONNECTIONS_ERR,
+    MAX_SUBSCRIPTIONS_ERR,
     PERMISSIONS_ERR,
     PONG,
     STALE_CONNECTION,
@@ -284,6 +289,34 @@ class ServerVersion:
 
     def __repr__(self) -> str:
         return f"<nats server v{self._server_version}>"
+
+
+def _server_error(description: str) -> errors.Error:
+    """
+    Maps the text of a server -ERR to its error class, as nats.go's
+    processErr and checkAuthError. The error keeps the server's text.
+    """
+    text = description.strip().strip("'").lower()
+    cls: type = errors.Error
+    if text.startswith(AUTHORIZATION_VIOLATION):
+        cls = errors.AuthorizationError
+    elif text.startswith(ACCOUNT_AUTHENTICATION_EXPIRED):
+        cls = errors.AccountAuthExpiredError
+    elif AUTHENTICATION_EXPIRED in text:
+        cls = errors.AuthenticationExpiredError
+    elif AUTHENTICATION_REVOKED in text:
+        cls = errors.AuthRevokedError
+    elif text.startswith(PERMISSIONS_ERR):
+        cls = errors.PermissionViolationError
+    elif text.startswith(MAX_SUBSCRIPTIONS_ERR):
+        cls = errors.MaxSubscriptionsExceededError
+    elif text.startswith(MAX_ACCOUNT_CONNECTIONS_ERR):
+        cls = errors.MaxAccountConnectionsExceededError
+    elif text.startswith(MAX_CONNECTIONS_ERR):
+        cls = errors.MaxConnectionsExceededError
+    if cls is errors.Error:
+        return errors.Error(f"nats: {description}")
+    return cls(description)
 
 
 async def _default_error_callback(ex: Exception) -> None:
@@ -1596,18 +1629,22 @@ class Client:
             return
 
         if AUTHENTICATION_EXPIRED in err_msg:
-            await self._process_op_err(errors.AuthenticationExpiredError())
+            if ACCOUNT_AUTHENTICATION_EXPIRED in err_msg:
+                await self._process_op_err(errors.AccountAuthExpiredError())
+            else:
+                await self._process_op_err(errors.AuthenticationExpiredError())
             return
 
         if AUTHORIZATION_VIOLATION in err_msg:
             self._err = errors.AuthorizationError()
         else:
             prot_err = err_msg.strip("'")
-            m = f"nats: {prot_err}"
-            err = errors.Error(m)
+            err = _server_error(prot_err)
             self._err = err
 
-            if PERMISSIONS_ERR in m:
+            # Neither error makes the server close the connection, so they
+            # are only reported, as nats.go's processTransientError.
+            if isinstance(err, (errors.PermissionViolationError, errors.MaxSubscriptionsExceededError)):
                 await self._error_cb(err)
                 return
 
@@ -2256,7 +2293,7 @@ class Client:
         info_line = await asyncio.wait_for(connection_completed, self.options["connect_timeout"])
         if INFO_OP not in info_line:
             # FIXME: Handle PING/PONG arriving first as well.
-            raise errors.Error("nats: empty response from server when expecting INFO message")
+            raise errors.NoInfoReceivedError
 
         _, info = info_line.split(INFO_OP + _SPC_, 1)
 
@@ -2311,7 +2348,10 @@ class Client:
         assert self._transport
         connect_cmd = self._connect_command()
         self._transport.write(connect_cmd)
-        await self._transport.drain()
+        try:
+            await self._transport.drain()
+        except OSError as e:
+            raise await self._handshake_write_error(e)
         if self.options["verbose"]:
             future = self._transport.readline()
             next_op = await asyncio.wait_for(future, self.options["connect_timeout"])
@@ -2321,14 +2361,13 @@ class Client:
             elif ERR_OP in next_op:
                 err_line = next_op.decode()
                 _, err_msg = err_line.split(" ", 1)
-
-                # FIXME: Maybe handling could be more special here,
-                # checking for errors.AuthorizationError for example.
-                # await self._process_err(err_msg)
-                raise errors.Error("nats: " + err_msg.rstrip("\r\n"))
+                raise _server_error(err_msg.rstrip("\r\n"))
 
         self._transport.write(PING_PROTO)
-        await self._transport.drain()
+        try:
+            await self._transport.drain()
+        except OSError as e:
+            raise await self._handshake_write_error(e)
 
         future = self._transport.readline()
         next_op = await asyncio.wait_for(future, self.options["connect_timeout"])
@@ -2338,11 +2377,7 @@ class Client:
         elif ERR_OP in next_op:
             err_line = next_op.decode()
             _, err_msg = err_line.split(" ", 1)
-
-            # FIXME: Maybe handling could be more special here,
-            # checking for ErrAuthorization for example.
-            # await self._process_err(err_msg)
-            raise errors.Error("nats: " + err_msg.rstrip("\r\n"))
+            raise _server_error(err_msg.rstrip("\r\n"))
 
         if PONG_PROTO in next_op:
             self._status = Client.CONNECTED
@@ -2354,6 +2389,24 @@ class Client:
 
         # Task for kicking the flusher queue
         self._flusher_task = asyncio.get_running_loop().create_task(self._flusher())
+
+    async def _handshake_write_error(self, error: Exception) -> Exception:
+        """
+        A server that rejects a connection (e.g. maximum connections
+        exceeded) sends -ERR and closes it, so writing CONNECT may fail
+        first. Reports the server's error when it was received.
+        """
+        assert self._transport
+        try:
+            line = await asyncio.wait_for(self._transport.readline(), 0.5)
+        except Exception:
+            # A reset connection fails reads even with the -ERR received.
+            buffered_line = getattr(self._transport, "_buffered_line", None)
+            line = buffered_line() if buffered_line is not None else b""
+        if line.startswith(ERR_OP):
+            _, err_msg = line.decode().split(" ", 1)
+            return _server_error(err_msg.rstrip("\r\n"))
+        return error
 
     async def _send_ping(self, future: Optional[asyncio.Future] = None) -> None:
         assert self._transport, "Client.connect must be called first"
