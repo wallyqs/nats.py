@@ -1,6 +1,7 @@
 import asyncio
 import json
 import datetime
+import signal
 import time
 import unittest
 
@@ -509,6 +510,90 @@ class StatusErrorsTest(SingleJetStreamServerTestCase):
         with pytest.raises(ConsumerDeletedError) as err:
             await asyncio.wait_for(fetch, timeout=2)
         assert err.value.code == 409
+        await nc.close()
+
+
+class StatusErrorsLiveTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_batch_completed(self):
+        # nats-server ends a pull whose batch is filled before its max_bytes
+        # with 409 Batch Completed (consumer.go JsPullRequestRemainingBytesT):
+        # nats.go ErrBatchCompleted, which only ends that pull.
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="BC", subjects=["bc"])
+        for i in range(5):
+            await js.publish("bc", str(i).encode())
+        await js.add_consumer("BC", durable_name="dur", ack_policy="none")
+
+        inbox = await nc.subscribe("bc.inbox")
+        request = {"batch": 2, "max_bytes": 100000, "expires": 1_000_000_000}
+        await nc.publish("$JS.API.CONSUMER.MSG.NEXT.BC.dur", json.dumps(request).encode(), reply="bc.inbox")
+        msgs = [await inbox.next_msg(timeout=1) for _ in range(3)]
+        assert [m.data for m in msgs[:2]] == [b"0", b"1"]
+        with pytest.raises(BatchCompletedError) as err:
+            APIError.from_msg(msgs[2])
+        assert err.value.code == 409
+        assert err.value.description == "Batch Completed"
+        assert msgs[2].headers["Nats-Pending-Messages"] == "0"
+        assert int(msgs[2].headers["Nats-Pending-Bytes"]) > 0
+
+        # consume() and messages() pull again quietly after it.
+        consumer = await js.pull_consumer("BC", "dur")
+        received = []
+        errors = []
+        done = asyncio.Event()
+
+        async def cb(msg):
+            received.append(msg.data)
+            if len(received) == 3:
+                done.set()
+
+        ctx = await consumer.consume(cb, max_messages=2, bytes_limit=100000, error_cb=lambda c, e: errors.append(e))
+        await asyncio.wait_for(done.wait(), 2)
+        await asyncio.sleep(0.2)
+        assert received == [b"2", b"3", b"4"]
+        assert errors == []
+        ctx.stop()
+        await ctx.closed()
+
+        for i in range(5, 8):
+            await js.publish("bc", str(i).encode())
+        msgs = await consumer.messages(max_messages=2, bytes_limit=100000)
+        assert [(await msgs.next(timeout=1)).data for _ in range(3)] == [b"5", b"6", b"7"]
+        msgs.stop()
+        await nc.close()
+
+    @async_test
+    async def test_server_shutdown(self):
+        # A shutting down nats-server ends the pending pulls of R1
+        # consumers with 409 Server Shutdown (jetstream.go
+        # signalPullConsumers): nats.go ErrServerShutdown, the error of a
+        # fetch and only reported by consume().
+        nc = await nats.connect(allow_reconnect=False)
+        js = nc.jetstream()
+        await js.add_stream(name="SHUT", subjects=["shut"])
+        await js.add_consumer("SHUT", durable_name="fetch", ack_policy="explicit")
+        await js.add_consumer("SHUT", durable_name="consume", ack_policy="explicit")
+        fetching = await js.pull_consumer("SHUT", "fetch")
+        consuming = await js.pull_consumer("SHUT", "consume")
+
+        errors = []
+
+        async def cb(msg):
+            pass
+
+        ctx = await consuming.consume(cb, error_cb=lambda c, e: errors.append(e))
+        batch = await fetching.fetch(1, max_wait=5)
+        await asyncio.sleep(0.3)
+
+        self.server_pool[0].send_signal(signal.SIGTERM)
+        assert [m async for m in batch] == []
+        assert isinstance(batch.error, ServerShutdownError)
+        assert batch.error.code == 409
+        await asyncio.wait_for(ctx.closed(), 3)
+        # Then the connection closes, which ends consuming.
+        assert [type(e) for e in errors] == [ServerShutdownError, nats.errors.ConnectionClosedError]
         await nc.close()
 
 
