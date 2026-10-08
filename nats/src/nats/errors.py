@@ -98,6 +98,16 @@ class ConnectionNotTLSError(Error):
         return "nats: connection is not tls"
 
 
+class ClientCertOrRootCAsRequiredError(Error):
+    """
+    A ClientTLSConfig was given without a certificate or a CAs callback,
+    as nats.go's ErrClientCertOrRootCAsRequired.
+    """
+
+    def __str__(self) -> str:
+        return "nats: at least one of certCB or rootCAsCB must be set"
+
+
 class ClientIDNotSupportedError(Error):
     def __str__(self) -> str:
         return "nats: client ID not supported by this server"

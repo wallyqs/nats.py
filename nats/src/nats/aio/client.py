@@ -187,6 +187,22 @@ UserInfoCallback = Callable[[], Tuple[str, str]]
 TLSContextCallback = Callable[[ssl.SSLContext], None]
 
 
+@dataclass
+class ClientTLSConfig:
+    """
+    The TLS callbacks of nats.go's ClientTLSConfig option, given to
+    connect(client_tls_config=...). At least one is required.
+
+    :param cert_cb: As tls_cert_cb, loads the client certificate into a
+        new SSLContext before every TLS handshake.
+    :param roots_cb: As tls_roots_cb, loads the trusted CAs into a new
+        SSLContext before every TLS handshake.
+    """
+
+    cert_cb: Optional[TLSContextCallback] = None
+    roots_cb: Optional[TLSContextCallback] = None
+
+
 class RawCredentials(UserString):
     pass
 
@@ -541,6 +557,7 @@ class Client:
         user_jwt_and_seed: Optional[Tuple[str, str]] = None,
         tls_cert_cb: Optional[TLSContextCallback] = None,
         tls_roots_cb: Optional[TLSContextCallback] = None,
+        client_tls_config: Optional[ClientTLSConfig] = None,
         ws_connection_headers_cb: Optional[WebSocketHeadersCallback] = None,
         ws_compression: bool = False,
         ws_proxy_path: Optional[str] = None,
@@ -607,6 +624,9 @@ class Client:
         :param tls_roots_cb: Called with a new SSLContext before every TLS
             handshake to load the trusted CAs into it (the system ones are
             then not loaded). Implies TLS.
+        :param client_tls_config: Both TLS callbacks as one ClientTLSConfig
+            (nats.go's ClientTLSConfig); raises
+            ClientCertOrRootCAsRequiredError when it has neither.
         :param ws_connection_headers_cb: Function (or coroutine function)
             returning the WebSocket handshake headers, called on every
             connection attempt; cannot be combined with ws_connection_headers.
@@ -810,6 +830,13 @@ class Client:
 
         if tls:
             self.options["tls"] = tls
+        if client_tls_config is not None:
+            if client_tls_config.cert_cb is None and client_tls_config.roots_cb is None:
+                raise errors.ClientCertOrRootCAsRequiredError
+            if tls_cert_cb is not None or tls_roots_cb is not None:
+                raise errors.Error("nats: client_tls_config cannot be combined with tls_cert_cb or tls_roots_cb")
+            tls_cert_cb = client_tls_config.cert_cb
+            tls_roots_cb = client_tls_config.roots_cb
         for tls_cb in (tls_cert_cb, tls_roots_cb):
             if tls_cb is not None and not callable(tls_cb):
                 raise errors.Error("nats: tls_cert_cb and tls_roots_cb must be callable")

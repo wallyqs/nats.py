@@ -1164,6 +1164,46 @@ class TLSCallbacksTest(TLSServerTestCase):
             await nc.connect("tls://127.0.0.1:4224", tls_roots_cb=lambda ctx: None, allow_reconnect=False)
 
     @async_test
+    async def test_client_tls_config(self):
+        from nats.aio.client import ClientTLSConfig
+
+        calls = []
+
+        def roots(ctx):
+            calls.append("roots")
+            ctx.load_verify_locations(get_config_file("certs/ca.pem"))
+
+        def cert(ctx):
+            calls.append("cert")
+            ctx.load_cert_chain(
+                certfile=get_config_file("certs/client-cert.pem"),
+                keyfile=get_config_file("certs/client-key.pem"),
+            )
+
+        nc = await nats.connect(
+            "nats://127.0.0.1:4224", client_tls_config=ClientTLSConfig(cert_cb=cert, roots_cb=roots)
+        )
+        self.assertEqual(calls, ["roots", "cert"])
+        self.assertIsInstance(nc.tls_connection_state(), ssl.SSLObject)
+        await nc.close()
+
+        # As nats.go's ErrClientCertOrRootCAsRequired, one callback is needed.
+        nc = NATS()
+        with self.assertRaises(nats.errors.ClientCertOrRootCAsRequiredError) as err:
+            await nc.connect("tls://127.0.0.1:4224", client_tls_config=ClientTLSConfig(), allow_reconnect=False)
+        self.assertEqual(str(err.exception), "nats: at least one of certCB or rootCAsCB must be set")
+        self.assertFalse(nc.is_connected)
+
+        nc = NATS()
+        with self.assertRaises(nats.errors.Error):
+            await nc.connect(
+                "tls://127.0.0.1:4224",
+                client_tls_config=ClientTLSConfig(roots_cb=roots),
+                tls_roots_cb=roots,
+                allow_reconnect=False,
+            )
+
+    @async_test
     async def test_tls_with_callbacks_rejected(self):
         nc = NATS()
         with self.assertRaises(nats.errors.Error):
