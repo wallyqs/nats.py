@@ -112,6 +112,7 @@ CTRL_STATUS = "100"
 STATUS_MSG_LEN = 3  # e.g. 20x, 40x, 50x
 
 _SUBJECT_INVALID_RE = re.compile(r"[ \t\r\n]")
+_PERMISSION_SUB_RE = re.compile(r'subscription to "([^"]*)"(?: using queue "([^"]*)")?', re.IGNORECASE)
 
 
 def _validate_subject(subject: str, *, strict: bool = False) -> None:
@@ -481,6 +482,7 @@ class Client:
         reconnect_error_cb: Optional[ErrorCallback] = None,
         no_callbacks_after_client_close: bool = False,
         ignore_auth_error_abort: bool = False,
+        permission_err_on_subscribe: bool = False,
     ) -> None:
         """
         Establishes a connection to NATS.
@@ -508,6 +510,10 @@ class Client:
         :param ignore_auth_error_abort: Keep reconnecting to a server that rejected
             the credentials twice in a row with the same authentication error.
             By default the connection is closed then, as in nats.go.
+        :param permission_err_on_subscribe: Make next_msg and iteration of a
+            subscription raise the PermissionViolationError the server reported
+            for its subject (and queue group), instead of waiting for messages
+            that will never come. The error is still reported to error_cb.
 
         Connecting setting all callbacks::
 
@@ -647,6 +653,7 @@ class Client:
         self._skip_subject_validation = skip_subject_validation
         self.options["no_callbacks_after_client_close"] = no_callbacks_after_client_close
         self.options["ignore_auth_error_abort"] = ignore_auth_error_abort
+        self.options["permission_err_on_subscribe"] = permission_err_on_subscribe
 
         if tls:
             self.options["tls"] = tls
@@ -1704,6 +1711,10 @@ class Client:
             # Neither error makes the server close the connection, so they
             # are only reported, as nats.go's processTransientError.
             if isinstance(err, (errors.PermissionViolationError, errors.MaxSubscriptionsExceededError)):
+                if isinstance(err, errors.PermissionViolationError) and self.options.get(
+                    "permission_err_on_subscribe", False
+                ):
+                    self._process_permission_violation(prot_err, err)
                 await self._error_cb(err)
                 return
 
@@ -1716,6 +1727,23 @@ class Client:
         # For now we handle similar as other clients and close.
         self._close_err = self._err
         asyncio.create_task(self._close(Client.CLOSED, do_cbs))
+
+    def _process_permission_violation(self, description: str, err: Exception) -> None:
+        """
+        Hands a subscribe permissions violation to the subscriptions with that
+        subject and queue group, as nats.go's PermissionErrOnSubscribe.
+        The server's text reads: Permissions Violation for Subscription to
+        "<subject>" [using queue "<queue>"]. The parser lowercases it, so
+        subjects are compared without case.
+        """
+        match = _PERMISSION_SUB_RE.search(description)
+        if match is None:
+            return
+        subject = match.group(1)
+        queue = match.group(2) or ""
+        for sub in list(self._subs.values()):
+            if sub._subject.lower() == subject.lower() and (sub._queue or "").lower() == queue.lower():
+                sub._set_permission_error(err)
 
     async def force_reconnect(self) -> None:
         """
@@ -1853,6 +1881,8 @@ class Client:
                 # Replay all the subscriptions in case there were some.
                 subs_to_remove = []
                 for sid, sub in self._subs.items():
+                    # The new server decides afresh about permissions.
+                    sub._clear_permission_error()
                     max_msgs = 0
                     if sub._max_msgs > 0:
                         # If we already hit the message limit, remove the subscription and don't

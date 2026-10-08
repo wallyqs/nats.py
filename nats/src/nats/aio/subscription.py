@@ -97,6 +97,11 @@ class Subscription:
         self._wait_for_msgs_task = None
         self._message_iterator = None
 
+        # Permissions violation the server reported for this subscription,
+        # raised by next_msg and iteration when the connection was made
+        # with permission_err_on_subscribe.
+        self._permission_error: Optional[Exception] = None
+
         # For JetStream enabled subscriptions.
         self._jsi: Optional[JetStreamContext._JSI] = None
 
@@ -180,6 +185,9 @@ class Subscription:
         if self._cb:
             raise errors.SyncSubRequiredError
 
+        if self._permission_error is not None:
+            raise self._permission_error
+
         if self._max_msgs > 0 and self._received >= self._max_msgs and self._pending_queue.empty():
             raise errors.MaxMessagesError
 
@@ -195,6 +203,8 @@ class Subscription:
         except asyncio.CancelledError:
             if self._conn.is_closed:
                 raise errors.ConnectionClosedError
+            if self._permission_error is not None:
+                raise self._permission_error
             raise
         else:
             self._pending_size -= len(msg.data)
@@ -205,6 +215,23 @@ class Subscription:
             return msg
         finally:
             self._pending_next_msgs_calls.pop(task_name, None)
+
+    def _set_permission_error(self, err: Exception) -> None:
+        """
+        Records a permissions violation for this subscription and wakes up
+        the next_msg calls and iteration waiting on it.
+        """
+        self._permission_error = err
+        if self._pending_next_msgs_calls:
+            for fut in self._pending_next_msgs_calls.values():
+                fut.cancel()
+        if self._message_iterator:
+            self._message_iterator._fail(err)
+
+    def _clear_permission_error(self) -> None:
+        self._permission_error = None
+        if self._message_iterator:
+            self._message_iterator._reset_failure()
 
     def _start(self, error_cb):
         """
@@ -336,17 +363,28 @@ class _SubscriptionMessageIterator:
         self._sub: Subscription = sub
         self._queue: asyncio.Queue[Msg] = sub._pending_queue
         self._unsubscribed_future: asyncio.Future[bool] = asyncio.Future()
+        self._failed_future: asyncio.Future[bool] = asyncio.Future()
 
     def _cancel(self) -> None:
         if not self._unsubscribed_future.done():
             self._unsubscribed_future.set_result(True)
 
+    def _fail(self, err: Exception) -> None:
+        if not self._failed_future.done():
+            self._failed_future.set_result(True)
+
+    def _reset_failure(self) -> None:
+        if self._failed_future.done():
+            self._failed_future = asyncio.Future()
+
     def __aiter__(self) -> _SubscriptionMessageIterator:
         return self
 
     async def __anext__(self) -> Msg:
+        if self._sub._permission_error is not None:
+            raise self._sub._permission_error
         get_task = asyncio.get_running_loop().create_task(self._queue.get())
-        tasks: List[asyncio.Future] = [get_task, self._unsubscribed_future]
+        tasks: List[asyncio.Future] = [get_task, self._unsubscribed_future, self._failed_future]
         try:
             finished, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
@@ -363,7 +401,10 @@ class _SubscriptionMessageIterator:
             if sub._max_msgs > 0 and sub._received >= sub._max_msgs:
                 self._cancel()
             return msg
-        elif self._unsubscribed_future.done():
-            get_task.cancel()
+        get_task.cancel()
+        if self._unsubscribed_future.done():
+            raise StopAsyncIteration
+        if sub._permission_error is not None:
+            raise sub._permission_error
 
         raise StopAsyncIteration

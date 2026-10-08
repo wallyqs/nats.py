@@ -121,6 +121,47 @@ class ServerErrorsTest(ConfiguredServerTestCase):
         await nc.close()
 
 
+class PermissionErrOnSubscribeTest(ConfiguredServerTestCase):
+    config = PERMISSIONS_CONF
+
+    @async_test
+    async def test_next_msg_raises_permission_error(self):
+        nc = await nats.connect(
+            "nats://limited:pass@127.0.0.1:4222", permission_err_on_subscribe=True, error_cb=self.ignore
+        )
+        allowed = await nc.subscribe("allowed")
+        sub = await nc.subscribe("denied")
+        queue_sub = await nc.subscribe("denied", queue="workers")
+        # A waiting next_msg wakes up with the error.
+        with self.assertRaises(nats.errors.PermissionViolationError) as raised:
+            await sub.next_msg(timeout=2)
+        self.assertEqual(str(raised.exception), 'nats: permissions violation for subscription to "denied"')
+        # And later calls keep failing with it.
+        with self.assertRaises(nats.errors.PermissionViolationError):
+            await sub.next_msg(timeout=2)
+        with self.assertRaises(nats.errors.PermissionViolationError) as raised:
+            async for msg in queue_sub.messages:
+                pass
+        self.assertIn('using queue "workers"', str(raised.exception))
+
+        # Other subscriptions are not affected.
+        await nc.publish("allowed", b"ok")
+        msg = await allowed.next_msg()
+        self.assertEqual(msg.data, b"ok")
+        await nc.close()
+
+    @async_test
+    async def test_disabled_by_default(self):
+        nc = await nats.connect("nats://limited:pass@127.0.0.1:4222", error_cb=self.ignore)
+        sub = await nc.subscribe("denied")
+        with self.assertRaises(nats.errors.TimeoutError):
+            await sub.next_msg(timeout=0.5)
+        await nc.close()
+
+    async def ignore(self, e):
+        pass
+
+
 class MaxSubscriptionsTest(ConfiguredServerTestCase):
     config = "max_subscriptions: 1\n"
 
