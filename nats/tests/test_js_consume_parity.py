@@ -931,6 +931,50 @@ class OrderedConsumerTest(SingleJetStreamServerTestCase):
         assert got == [b"5", b"7"]
         await nc.close()
 
+    @async_test
+    async def test_config_metadata_start_time_and_replay(self):
+        # nats.go OrderedConsumerConfig.Metadata, OptStartTime (with
+        # DeliverByStartTimePolicy) and ReplayPolicy reach the consumer.
+        nc, js = await self._setup(n=3)
+        await asyncio.sleep(0.2)
+        start = datetime.datetime.now(datetime.timezone.utc)
+        await asyncio.sleep(0.2)
+        for i in range(3, 6):
+            await js.publish("ord.0", str(i).encode())
+
+        config = nats.js.consume.OrderedConsumerConfig(
+            deliver_policy=api.DeliverPolicy.BY_START_TIME,
+            opt_start_time=start,
+            replay_policy=api.ReplayPolicy.ORIGINAL,
+            metadata={"owner": "parity", "kind": "ordered"},
+        )
+        oc = await js.ordered_consumer("ORD", config)
+        info = await js.consumer_info("ORD", oc.cached_info().name)
+        assert info.config.deliver_policy == api.DeliverPolicy.BY_START_TIME
+        assert info.config.opt_start_time == start
+        assert info.config.opt_start_seq is None
+        assert info.config.replay_policy == api.ReplayPolicy.ORIGINAL
+        # The server adds its own _nats.* entries.
+        assert {k: v for k, v in info.config.metadata.items() if not k.startswith("_nats.")} == config.metadata
+
+        # Only the messages published after the start time are delivered.
+        batch = await oc.fetch(10, max_wait=1)
+        assert [int(m.data) async for m in batch] == [3, 4, 5]
+
+        # A recreated consumer resumes by sequence, keeping metadata and
+        # the replay policy.
+        await js.delete_consumer("ORD", oc.cached_info().name)
+        await js.publish("ord.0", b"6")
+        batch = await oc.fetch(1, max_wait=2)
+        assert [int(m.data) async for m in batch] == [6]
+        info = await js.consumer_info("ORD", oc.cached_info().name)
+        assert info.config.deliver_policy == api.DeliverPolicy.BY_START_SEQUENCE
+        assert info.config.opt_start_seq == 7
+        assert info.config.opt_start_time is None
+        assert info.config.replay_policy == api.ReplayPolicy.ORIGINAL
+        assert info.config.metadata["owner"] == "parity"
+        await nc.close()
+
     @async_long_test
     async def test_consume(self):
         nc, js = await self._setup()
