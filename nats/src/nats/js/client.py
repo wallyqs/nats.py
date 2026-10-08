@@ -1885,7 +1885,20 @@ class JetStreamContext(JetStreamManager):
         """
         config = self._object_store_config(bucket, config, params)
         stream = self._object_store_stream_config(config)
-        await self.add_stream(stream)
+        try:
+            await self.add_stream(stream)
+        except nats.js.errors.APIError as err:
+            # As nats.go, an existing bucket with another config is ErrBucketExists.
+            if err.err_code != KV_STREAM_NAME_IN_USE:
+                raise
+            raise nats.js.errors.BucketExistsError(
+                bucket=config.bucket,
+                code=err.code,
+                description=err.description,
+                err_code=err.err_code,
+                stream=err.stream,
+                seq=err.seq,
+            ) from err
 
         assert stream.name is not None
         return ObjectStore(

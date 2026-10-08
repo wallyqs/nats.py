@@ -592,3 +592,23 @@ class KVHistoryTest(SingleJetStreamServerTestCase):
         assert all(not e.value for e in history)
 
         await nc.close()
+
+
+class ObjectStoreBucketExistsTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_create_object_store_bucket_exists(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        await js.create_object_store("OBJEXISTS", description="first")
+        # The same config again is fine.
+        await js.create_object_store("OBJEXISTS", description="first")
+
+        with pytest.raises(BucketExistsError) as exc:
+            await js.create_object_store("OBJEXISTS", description="second")
+        err = exc.value
+        assert isinstance(err, BadRequestError)
+        assert err.err_code == 10058
+        assert err.bucket == "OBJEXISTS"
+
+        await nc.close()
