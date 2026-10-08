@@ -119,6 +119,31 @@ class ErrorCodeTest(unittest.TestCase):
 
 class JetStreamErrorsTest(SingleJetStreamServerTestCase):
     @async_test
+    async def test_stream_source_multiple_filter_subjects(self):
+        # nats.go defines ErrStreamSourceMultipleFilterSubjectsNotSupported
+        # (jetstream/errors.go) but never returns it; the class only exists
+        # to be matched, with nats.go's message.
+        err = StreamSourceMultipleFilterSubjectsNotSupportedError()
+        assert isinstance(err, JetStreamError)
+        assert err.api_error is None
+        assert str(err) == "nats: stream sourcing with multiple subject filters not supported by nats-server"
+
+        # A source with several subject filters is created as is.
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="ORIGIN", subjects=["origin.>"])
+        transforms = [
+            api.SubjectTransform(src="origin.a", dest="copy.a"),
+            api.SubjectTransform(src="origin.b", dest="copy.b"),
+        ]
+        info = await js.add_stream(
+            name="SOURCED",
+            sources=[api.StreamSource(name="ORIGIN", subject_transforms=transforms)],
+        )
+        assert info.config.sources[0].subject_transforms == transforms
+        await nc.close()
+
+    @async_test
     async def test_api_errors_are_typed(self):
         nc = await nats.connect()
         js = nc.jetstream()
