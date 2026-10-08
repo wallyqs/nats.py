@@ -250,6 +250,32 @@ class MsgNotFoundError(NotFoundError):
     pass
 
 
+class MsgDeleteUnsuccessfulError(APIError):
+    """
+    Raised by a Stream handle's delete_msg / secure_delete_msg when the
+    server did not delete the message (nats.go ErrMsgDeleteUnsuccessful).
+    It carries the code, err_code and description of the server's API
+    error, which is also its ``__cause__``.
+    """
+
+    @classmethod
+    def from_api_error(cls, err: Optional[APIError]) -> MsgDeleteUnsuccessfulError:
+        if err is None:
+            return cls()
+        return cls(
+            code=err.code,
+            description=err.description,
+            err_code=err.err_code,
+            stream=err.stream,
+            seq=err.seq,
+        )
+
+    def __str__(self) -> str:
+        if self.description:
+            return f"nats: message deletion unsuccessful: {self.description}"
+        return "nats: message deletion unsuccessful"
+
+
 class StreamNameAlreadyInUseError(BadRequestError):
     """
     Raised when creating a stream whose name is already in use with a

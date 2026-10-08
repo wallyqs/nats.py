@@ -36,6 +36,7 @@ from nats.js.errors import (
     InvalidStreamNameError,
     InvalidSubjectError,
     JetStreamNotEnabledError,
+    MsgDeleteUnsuccessfulError,
     NotFoundError,
     NotPullConsumerError,
     NotPushConsumerError,
@@ -1031,14 +1032,30 @@ class Stream:
     async def delete_msg(self, seq: int) -> bool:
         """
         Marks the message at the sequence as deleted, without erasing it.
+        Returns True, or raises MsgDeleteUnsuccessfulError when the server
+        did not delete it (nats.go Stream.DeleteMsg).
         """
-        return await self._jsm.delete_msg(self._name, seq, no_erase=True)
+        return await self._delete_msg(seq, no_erase=True)
 
     async def secure_delete_msg(self, seq: int) -> bool:
         """
-        Deletes the message at the sequence, overwriting its data.
+        Deletes the message at the sequence, overwriting its data. Returns
+        True, or raises MsgDeleteUnsuccessfulError when the server did not
+        delete it (nats.go Stream.SecureDeleteMsg).
         """
-        return await self._jsm.delete_msg(self._name, seq)
+        return await self._delete_msg(seq, no_erase=False)
+
+    async def _delete_msg(self, seq: int, no_erase: bool) -> bool:
+        try:
+            ok = await self._jsm.delete_msg(self._name, seq, no_erase=no_erase)
+        except JetStreamNotEnabledError:
+            # No JetStream API to answer: not an unsuccessful delete.
+            raise
+        except APIError as err:
+            raise MsgDeleteUnsuccessfulError.from_api_error(err) from err
+        if not ok:
+            raise MsgDeleteUnsuccessfulError
+        return True
 
     async def create_consumer(self, config: Optional[api.ConsumerConfig] = None, **params) -> api.ConsumerInfo:
         """

@@ -679,6 +679,21 @@ class StreamHandleTest(SingleJetStreamServerTestCase):
         info = await stream.info(deleted_details=True)
         assert info.state.deleted == [2, 3]
 
+        # nats.go ErrMsgDeleteUnsuccessful, wrapping the server's API error.
+        for delete in (stream.delete_msg, stream.secure_delete_msg):
+            with pytest.raises(MsgDeleteUnsuccessfulError) as err:
+                await delete(2)
+            assert isinstance(err.value, APIError)
+            assert isinstance(err.value.__cause__, APIError)
+            assert err.value.err_code == err.value.__cause__.err_code
+            assert err.value.description == err.value.__cause__.description
+            assert str(err.value) == f"nats: message deletion unsuccessful: {err.value.description}"
+        assert str(MsgDeleteUnsuccessfulError()) == "nats: message deletion unsuccessful"
+        # The manager's delete_msg keeps raising the API error itself.
+        with pytest.raises(APIError) as err:
+            await js.delete_msg("HANDLE", 2)
+        assert not isinstance(err.value, MsgDeleteUnsuccessfulError)
+
         with pytest.raises(InvalidOptionError):
             await stream.purge(seq=4, keep=1)
         assert await stream.purge(subject="handle.a")
