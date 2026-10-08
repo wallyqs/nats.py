@@ -32,10 +32,15 @@ class Header(str, Enum):
     EXPECTED_LAST_MSG_ID = "Nats-Expected-Last-Msg-Id"
     EXPECTED_LAST_SEQUENCE = "Nats-Expected-Last-Sequence"
     EXPECTED_LAST_SUBJECT_SEQUENCE = "Nats-Expected-Last-Subject-Sequence"
+    # Subject whose last sequence EXPECTED_LAST_SUBJECT_SEQUENCE refers to,
+    # instead of the published subject.
+    EXPECTED_LAST_SUBJECT_SEQUENCE_SUBJECT = "Nats-Expected-Last-Subject-Sequence-Subject"
     EXPECTED_STREAM = "Nats-Expected-Stream"
     # Decimal counter delta, for example ``"5"`` or ``"-2"`` (ADR-49).
     INCR = "Nats-Incr"
     LAST_CONSUMER = "Nats-Last-Consumer"
+    # Direct get responses: the sequence of the previous message.
+    LAST_SEQUENCE = "Nats-Last-Sequence"
     LAST_STREAM = "Nats-Last-Stream"
     MSG_ID = "Nats-Msg-Id"
     PIN_ID = "Nats-Pin-Id"
@@ -49,7 +54,11 @@ class Header(str, Enum):
     SCHEDULE_TIME_ZONE = "Nats-Schedule-Time-Zone"
     SCHEDULE_TTL = "Nats-Schedule-TTL"
     SCHEDULER = "Nats-Scheduler"
+    # Direct get responses: the original stream, sequence and subject.
+    SEQUENCE = "Nats-Sequence"
     STATUS = "Status"
+    STREAM = "Nats-Stream"
+    SUBJECT = "Nats-Subject"
     # Time a message was stored, set on direct get replies.
     TIME_STAMP = "Nats-Time-Stamp"
 
@@ -61,6 +70,11 @@ SCHEDULE_MONTHLY = "@monthly"
 SCHEDULE_WEEKLY = "@weekly"
 SCHEDULE_DAILY = "@daily"
 SCHEDULE_HOURLY = "@hourly"
+
+# Values of the Header.ROLLUP header: roll up the messages of the subject
+# or of the whole stream into the published one.
+MSG_ROLLUP_SUBJECT = "sub"
+MSG_ROLLUP_ALL = "all"
 
 DEFAULT_PREFIX = "$JS.API"
 INBOX_PREFIX = b"_INBOX."
@@ -250,6 +264,103 @@ class PubAck(Base):
         if "batch_size" in result:
             result["count"] = result.pop("batch_size")
         return result
+
+
+def _format_go_duration(seconds: float) -> str:
+    """Format seconds as Go's time.Duration.String, e.g. "1.5s" or "1h0m0s"."""
+    ns = int(round(seconds * _NANOSECOND))
+    if ns == 0:
+        return "0s"
+    sign = "-" if ns < 0 else ""
+    u = abs(ns)
+
+    def frac(value: int, prec: int) -> str:
+        whole, rest = divmod(value, 10**prec)
+        if rest == 0:
+            return str(whole)
+        return f"{whole}.{str(rest).rjust(prec, '0').rstrip('0')}"
+
+    if u < 1_000:
+        return f"{sign}{u}ns"
+    if u < 1_000_000:
+        return f"{sign}{frac(u, 3)}µs"
+    if u < _NANOSECOND:
+        return f"{sign}{frac(u, 6)}ms"
+    secs = frac(u % (60 * _NANOSECOND), 9) + "s"
+    minutes = u // (60 * _NANOSECOND)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{sign}{hours}h{minutes}m{secs}"
+    if minutes:
+        return f"{sign}{minutes}m{secs}"
+    return f"{sign}{secs}"
+
+
+@dataclass
+class MsgSchedule:
+    """
+    MsgSchedule makes a published message a schedule (requires a stream with
+    ``allow_msg_schedules`` and NATS Server 2.12+). It is the equivalent of
+    the nats.go ``WithSchedule*`` publish options.
+
+    Exactly one of ``at``, ``every`` or ``cron`` sets when the scheduled
+    message is produced:
+
+    - ``at``: once, at the given time (a naive datetime is taken as UTC).
+    - ``every``: repeatedly, every interval in seconds.
+    - ``cron``: by a cron expression or one of the ``SCHEDULE_*`` constants.
+
+    The other fields are optional:
+
+    - ``target``: subject the scheduled messages are published to.
+    - ``source``: subject whose last message is used as the payload.
+    - ``ttl``: per-message TTL in seconds of the produced messages.
+    - ``ttl_never``: produced messages never expire.
+    - ``time_zone``: time zone of the cron expression.
+    - ``rollup``: produced messages roll up their subject.
+    """
+
+    at: Optional[datetime.datetime] = None
+    every: Optional[float] = None
+    cron: Optional[str] = None
+    target: Optional[str] = None
+    source: Optional[str] = None
+    ttl: Optional[float] = None
+    ttl_never: bool = False
+    time_zone: Optional[str] = None
+    rollup: bool = False
+
+    def headers(self) -> Dict[str, str]:
+        """Return the headers that carry this schedule."""
+        if sum(x is not None for x in (self.at, self.every, self.cron)) > 1:
+            raise ValueError("nats: only one of at, every or cron can be set in a schedule")
+        if self.ttl is not None and self.ttl_never:
+            raise ValueError("nats: ttl and ttl_never cannot both be set in a schedule")
+
+        hdrs: Dict[str, str] = {}
+        if self.at is not None:
+            at = self.at
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=datetime.timezone.utc)
+            at = at.astimezone(datetime.timezone.utc)
+            hdrs[Header.SCHEDULE] = "@at " + at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        elif self.every is not None:
+            hdrs[Header.SCHEDULE] = "@every " + _format_go_duration(self.every)
+        elif self.cron:
+            hdrs[Header.SCHEDULE] = self.cron
+        if self.target:
+            hdrs[Header.SCHEDULE_TARGET] = self.target
+        if self.source:
+            hdrs[Header.SCHEDULE_SOURCE] = self.source
+        if self.ttl_never:
+            hdrs[Header.SCHEDULE_TTL] = "never"
+        elif self.ttl is not None:
+            hdrs[Header.SCHEDULE_TTL] = _format_go_duration(self.ttl)
+        if self.time_zone:
+            hdrs[Header.SCHEDULE_TIME_ZONE] = self.time_zone
+        if self.rollup:
+            hdrs[Header.SCHEDULE_ROLLUP] = MSG_ROLLUP_SUBJECT
+        return hdrs
 
 
 @dataclass

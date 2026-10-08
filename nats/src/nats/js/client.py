@@ -218,42 +218,118 @@ class JetStreamContext(JetStreamManager):
         stream: Optional[str] = None,
         headers: Optional[Dict[str, Any]] = None,
         msg_ttl: Optional[float] = None,
+        *,
+        msg_id: Optional[str] = None,
+        expected_last_msg_id: Optional[str] = None,
+        expected_last_sequence: Optional[int] = None,
+        expected_last_subject_sequence: Optional[int] = None,
+        expected_last_subject_sequence_subject: Optional[str] = None,
+        schedule: Optional[api.MsgSchedule] = None,
+        retry_attempts: int = 0,
+        retry_wait: float = api.DEFAULT_PUB_RETRY_WAIT,
     ) -> api.PubAck:
         """
         publish emits a new message to JetStream and waits for acknowledgement.
 
         :param subject: Subject to publish to.
         :param payload: Message payload.
-        :param timeout: Request timeout in seconds.
+        :param timeout: Request timeout in seconds, covering any retries.
         :param stream: Expected stream name.
         :param headers: Message headers.
         :param msg_ttl: Per-message TTL in seconds (requires NATS Server 2.11+).
+        :param msg_id: Message ID used by the stream for deduplication.
+        :param expected_last_msg_id: Expected ID of the last message in the stream.
+        :param expected_last_sequence: Expected sequence of the last message in the stream.
+        :param expected_last_subject_sequence: Expected sequence of the last message
+            on the subject (or on ``expected_last_subject_sequence_subject``).
+        :param expected_last_subject_sequence_subject: Subject (may contain wildcards)
+            that ``expected_last_subject_sequence`` refers to.
+        :param schedule: Publish the message as a message schedule.
+        :param retry_attempts: Times to retry when no stream responded (negative
+            retries until the timeout).
+        :param retry_wait: Seconds to wait before each retry.
         """
-        hdr = headers
+        hdr = self._publish_headers(
+            headers,
+            stream=stream,
+            msg_ttl=msg_ttl,
+            msg_id=msg_id,
+            expected_last_msg_id=expected_last_msg_id,
+            expected_last_sequence=expected_last_sequence,
+            expected_last_subject_sequence=expected_last_subject_sequence,
+            expected_last_subject_sequence_subject=expected_last_subject_sequence_subject,
+            schedule=schedule,
+        )
         if timeout is None:
             timeout = self._timeout
-        if stream is not None:
-            hdr = hdr or {}
-            hdr[api.Header.EXPECTED_STREAM] = stream
-        if msg_ttl is not None:
-            hdr = hdr or {}
-            # TTL header accepts seconds as integer or duration string
-            hdr[api.Header.MSG_TTL] = str(int(msg_ttl))
 
-        try:
-            msg = await self._nc.request(
-                subject,
-                payload,
-                timeout=timeout,
-                headers=hdr,
-            )
-        except nats.errors.NoRespondersError:
-            raise nats.js.errors.NoStreamResponseError
+        deadline = time.monotonic() + timeout
+        attempt = 0
+        while True:
+            try:
+                msg = await self._nc.request(
+                    subject,
+                    payload,
+                    timeout=timeout,
+                    headers=hdr,
+                )
+                break
+            except nats.errors.NoRespondersError:
+                if 0 <= retry_attempts <= attempt:
+                    raise nats.js.errors.NoStreamResponseError
+            # Retry to ride out small blips such as leadership changes,
+            # all within the original timeout as nats.go does.
+            attempt += 1
+            await asyncio.sleep(min(retry_wait, max(deadline - time.monotonic(), 0)))
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                raise nats.errors.TimeoutError
 
         resp = json.loads(msg.data)
         if "error" in resp:
             raise nats.js.errors.APIError.from_error(resp["error"])
         return api.PubAck.from_response(resp)
+
+    @staticmethod
+    def _publish_headers(
+        headers: Optional[Dict[str, Any]],
+        stream: Optional[str] = None,
+        msg_ttl: Optional[float] = None,
+        msg_id: Optional[str] = None,
+        expected_last_msg_id: Optional[str] = None,
+        expected_last_sequence: Optional[int] = None,
+        expected_last_subject_sequence: Optional[int] = None,
+        expected_last_subject_sequence_subject: Optional[str] = None,
+        schedule: Optional[api.MsgSchedule] = None,
+    ) -> Optional[Dict[str, Any]]:
+        hdr = headers
+        if msg_id:
+            hdr = hdr or {}
+            hdr[api.Header.MSG_ID] = msg_id
+        if expected_last_msg_id:
+            hdr = hdr or {}
+            hdr[api.Header.EXPECTED_LAST_MSG_ID] = expected_last_msg_id
+        if stream is not None:
+            hdr = hdr or {}
+            hdr[api.Header.EXPECTED_STREAM] = stream
+        if expected_last_sequence is not None:
+            hdr = hdr or {}
+            hdr[api.Header.EXPECTED_LAST_SEQUENCE] = str(expected_last_sequence)
+        if expected_last_subject_sequence_subject and expected_last_subject_sequence is None:
+            raise ValueError("nats: expected_last_subject_sequence is required with its subject")
+        if expected_last_subject_sequence is not None:
+            hdr = hdr or {}
+            hdr[api.Header.EXPECTED_LAST_SUBJECT_SEQUENCE] = str(expected_last_subject_sequence)
+            if expected_last_subject_sequence_subject:
+                hdr[api.Header.EXPECTED_LAST_SUBJECT_SEQUENCE_SUBJECT] = expected_last_subject_sequence_subject
+        if msg_ttl is not None:
+            hdr = hdr or {}
+            # TTL header accepts seconds as integer or duration string
+            hdr[api.Header.MSG_TTL] = str(int(msg_ttl))
+        if schedule is not None:
+            hdr = hdr or {}
+            hdr.update(schedule.headers())
+        return hdr
 
     async def publish_async(
         self,
@@ -263,6 +339,13 @@ class JetStreamContext(JetStreamManager):
         stream: Optional[str] = None,
         headers: Optional[Dict] = None,
         msg_ttl: Optional[float] = None,
+        *,
+        msg_id: Optional[str] = None,
+        expected_last_msg_id: Optional[str] = None,
+        expected_last_sequence: Optional[int] = None,
+        expected_last_subject_sequence: Optional[int] = None,
+        expected_last_subject_sequence_subject: Optional[str] = None,
+        schedule: Optional[api.MsgSchedule] = None,
     ) -> asyncio.Future[api.PubAck]:
         """
         emits a new message to JetStream and returns a future that can be awaited for acknowledgement.
@@ -273,20 +356,25 @@ class JetStreamContext(JetStreamManager):
         :param stream: Expected stream name.
         :param headers: Message headers.
         :param msg_ttl: Per-message TTL in seconds (requires NATS Server 2.11+).
+
+        The other keyword arguments set the same headers as in :meth:`publish`.
         """
 
         if not self._async_reply_prefix:
             await self._init_async_reply()
         assert self._async_reply_prefix
 
-        hdr = headers
-        if stream is not None:
-            hdr = hdr or {}
-            hdr[api.Header.EXPECTED_STREAM] = stream
-        if msg_ttl is not None:
-            hdr = hdr or {}
-            # TTL header accepts seconds as integer or duration string
-            hdr[api.Header.MSG_TTL] = str(int(msg_ttl))
+        hdr = self._publish_headers(
+            headers,
+            stream=stream,
+            msg_ttl=msg_ttl,
+            msg_id=msg_id,
+            expected_last_msg_id=expected_last_msg_id,
+            expected_last_sequence=expected_last_sequence,
+            expected_last_subject_sequence=expected_last_subject_sequence,
+            expected_last_subject_sequence_subject=expected_last_subject_sequence_subject,
+            schedule=schedule,
+        )
 
         try:
             await asyncio.wait_for(self._publish_async_pending_semaphore.acquire(), timeout=wait_stall)
