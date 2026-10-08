@@ -216,6 +216,42 @@ class BadBucketError(APIError):
     pass
 
 
+class BucketExistsError(BadRequestError):
+    """
+    Raised when creating a KeyValue store whose bucket already exists
+    with a different configuration (nats.go ErrBucketExists).
+
+    It keeps the server's stream-name-in-use API error details, so it is
+    still the BadRequestError that was raised before.
+    """
+
+    def __init__(
+        self,
+        bucket: Optional[str] = None,
+        code: Optional[int] = None,
+        description: Optional[str] = None,
+        err_code: Optional[int] = None,
+        stream: Optional[str] = None,
+        seq: Optional[int] = None,
+    ) -> None:
+        super().__init__(
+            code=code,
+            description=description,
+            err_code=err_code,
+            stream=stream,
+            seq=seq,
+        )
+        self.bucket = bucket
+
+    def __str__(self) -> str:
+        s = "nats: bucket name already in use"
+        if self.bucket:
+            s += f": {self.bucket}"
+        if self.description:
+            s += f": {self.description}"
+        return s
+
+
 class KeyValueError(APIError):
     """
     Raised when there is an issue interacting with the KeyValue store.

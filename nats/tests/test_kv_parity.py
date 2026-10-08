@@ -4,13 +4,16 @@ import pytest
 from nats.js.errors import (
     APIError,
     BadRequestError,
+    BucketExistsError,
     BucketMalformedError,
+    BucketNotFoundError,
     BucketRequiredError,
     InvalidBucketNameError,
     KeyNotFoundError,
     KeyRevisionMismatchError,
     KeyValueConfigRequiredError,
     KeyWrongLastSequenceError,
+    NotFoundError,
 )
 
 from tests.utils import SingleJetStreamServerTestCase, async_test
@@ -92,5 +95,74 @@ class KVPurgeLastRevisionTest(SingleJetStreamServerTestCase):
             await kv.delete("b", last=latest - 1)
         assert exc.value.err_code in (10071, 10164)
         assert await kv.delete("b", last=latest)
+
+        await nc.close()
+
+
+class KVManagerTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_create_key_value_bucket_exists(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        await js.create_key_value(bucket="EXISTS", history=2)
+        # Creating it again with the same config is fine.
+        kv = await js.create_key_value(bucket="EXISTS", history=2)
+        assert (await kv.status()).history == 2
+
+        with pytest.raises(BucketExistsError) as exc:
+            await js.create_key_value(bucket="EXISTS", history=5)
+        err = exc.value
+        assert isinstance(err, BadRequestError)
+        assert err.err_code == 10058
+        assert err.bucket == "EXISTS"
+        assert str(err).startswith("nats: bucket name already in use: EXISTS")
+
+        # A bucket stream that differs only in its discard policy is
+        # updated instead (nats.go's upgrade of older buckets).
+        si = await js.stream_info("KV_EXISTS")
+        await js.update_stream(si.config.evolve(discard=nats.js.api.DiscardPolicy.OLD))
+        assert (await js.stream_info("KV_EXISTS")).config.discard == nats.js.api.DiscardPolicy.OLD
+        await js.create_key_value(bucket="EXISTS", history=2)
+        assert (await js.stream_info("KV_EXISTS")).config.discard == nats.js.api.DiscardPolicy.NEW
+
+        await nc.close()
+
+    @async_test
+    async def test_update_key_value(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        with pytest.raises(BucketNotFoundError) as exc:
+            await js.update_key_value(bucket="UPDATED", history=5)
+        assert isinstance(exc.value, NotFoundError)
+        assert "UPDATED" in str(exc.value)
+
+        with pytest.raises(KeyValueConfigRequiredError):
+            await js.update_key_value()
+
+        await js.create_key_value(bucket="UPDATED")
+        kv = await js.update_key_value(nats.js.api.KeyValueConfig(bucket="UPDATED", history=5, description="up"))
+        await kv.put("a", b"1")
+        await kv.put("a", b"2")
+        status = await kv.status()
+        assert status.history == 5
+        assert status.stream_info.config.description == "up"
+        assert len(await kv.history("a")) == 2
+
+        await nc.close()
+
+    @async_test
+    async def test_create_or_update_key_value(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        kv = await js.create_or_update_key_value(bucket="UPSERT", history=2)
+        assert (await kv.status()).history == 2
+        await kv.put("a", b"1")
+
+        kv = await js.create_or_update_key_value(bucket="UPSERT", history=4)
+        assert (await kv.status()).history == 4
+        assert (await kv.get("a")).value == b"1"
 
         await nc.close()

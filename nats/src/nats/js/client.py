@@ -62,6 +62,7 @@ NATS_HDR_LINE_SIZE = len(NATS_HDR_LINE)
 _CRLF_ = b"\r\n"
 _CRLF_LEN_ = len(_CRLF_)
 KV_STREAM_TEMPLATE = "KV_{bucket}"
+KV_STREAM_PREFIX = "KV_"
 KV_PRE_TEMPLATE = "$KV.{bucket}."
 Callback = Callable[["Msg"], Awaitable[None]]
 
@@ -71,6 +72,10 @@ DEFAULT_JS_SUB_PENDING_BYTES_LIMIT = 256 * 1024 * 1024
 
 # Max history limit for key value.
 KV_MAX_HISTORY = 64
+
+# JetStream error codes the KV management calls map to bucket errors.
+KV_STREAM_NAME_IN_USE = 10058
+KV_STREAM_NOT_FOUND = 10059
 
 # 409 status descriptions of pull requests that the server would reject
 # again on retry, so they are reported instead of treated as a timeout.
@@ -1566,13 +1571,7 @@ class JetStreamContext(JetStreamManager):
         if si.config.max_msgs_per_subject < 1:
             raise BadBucketError
 
-        return KeyValue(
-            name=bucket,
-            stream=stream,
-            pre=KV_PRE_TEMPLATE.format(bucket=bucket),
-            js=self,
-            direct=bool(si.config.allow_direct),
-        )
+        return self._map_stream_to_kv(si)
 
     async def create_key_value(
         self,
@@ -1581,13 +1580,100 @@ class JetStreamContext(JetStreamManager):
     ) -> KeyValue:
         """
         create_key_value takes an api.KeyValueConfig and creates a KV in JetStream.
+
+        Raises BucketExistsError when a bucket with that name already
+        exists with a different configuration.
         """
+        config = self._key_value_config(config, params)
+        stream = await self._prepare_key_value_config(config)
+
+        try:
+            si = await self.add_stream(stream)
+        except nats.js.errors.APIError as err:
+            if err.err_code != KV_STREAM_NAME_IN_USE:
+                raise
+            exists = nats.js.errors.BucketExistsError(
+                bucket=config.bucket,
+                code=err.code,
+                description=err.description,
+                err_code=err.err_code,
+                stream=err.stream,
+                seq=err.seq,
+            )
+            # As nats.go, a bucket whose stream differs only in its discard
+            # policy or direct gets (e.g. one created by an older client) is
+            # updated. Re-adding the stream with the existing values of those
+            # fields lets the server tell whether anything else differs.
+            try:
+                current = await self.stream_info(stream.name)
+                probe = stream.evolve(
+                    discard=current.config.discard,
+                    allow_direct=current.config.allow_direct,
+                )
+                await self.add_stream(probe)
+            except nats.js.errors.APIError:
+                raise exists from err
+            si = await self.update_stream(stream)
+
+        return self._map_stream_to_kv(si)
+
+    async def update_key_value(
+        self,
+        config: Optional[api.KeyValueConfig] = None,
+        **params,
+    ) -> KeyValue:
+        """
+        update_key_value updates the configuration of an existing KV,
+        raising BucketNotFoundError when it does not exist.
+        """
+        config = self._key_value_config(config, params)
+        stream = await self._prepare_key_value_config(config)
+
+        try:
+            si = await self.update_stream(stream)
+        except NotFoundError as err:
+            if err.err_code != KV_STREAM_NOT_FOUND:
+                raise
+            raise BucketNotFoundError(
+                code=err.code,
+                description=f"bucket not found: {config.bucket}",
+                err_code=err.err_code,
+            ) from err
+        return self._map_stream_to_kv(si)
+
+    async def create_or_update_key_value(
+        self,
+        config: Optional[api.KeyValueConfig] = None,
+        **params,
+    ) -> KeyValue:
+        """
+        create_or_update_key_value updates a KV, creating it when it does
+        not exist yet.
+        """
+        config = self._key_value_config(config, params)
+        stream = await self._prepare_key_value_config(config)
+
+        try:
+            si = await self.update_stream(stream)
+        except NotFoundError as err:
+            if err.err_code != KV_STREAM_NOT_FOUND:
+                raise
+            si = await self.add_stream(stream)
+        return self._map_stream_to_kv(si)
+
+    @staticmethod
+    def _key_value_config(config: Optional[api.KeyValueConfig], params: Dict[str, Any]) -> api.KeyValueConfig:
         if config is None:
             if "bucket" not in params:
                 raise nats.js.errors.KeyValueConfigRequiredError
             config = api.KeyValueConfig(bucket=params["bucket"])
-        config = config.evolve(**params)
+        return config.evolve(**params)
 
+    async def _prepare_key_value_config(self, config: api.KeyValueConfig) -> api.StreamConfig:
+        """
+        _prepare_key_value_config derives the stream configuration of a KV
+        (nats.go prepareKeyValueConfig).
+        """
         if VALID_BUCKET_RE.match(config.bucket) is None:
             raise InvalidBucketNameError
 
@@ -1628,13 +1714,20 @@ class JetStreamContext(JetStreamManager):
             placement=config.placement,
             subject_delete_marker_ttl=subject_delete_marker_ttl,
         )
-        si = await self.add_stream(stream)
-        assert stream.name is not None
+        return stream
 
+    def _map_stream_to_kv(self, si: api.StreamInfo) -> KeyValue:
+        """
+        _map_stream_to_kv returns the KeyValue handle of a KV stream
+        (nats.go mapStreamToKVS).
+        """
+        stream = si.config.name
+        assert stream is not None
+        bucket = stream[len(KV_STREAM_PREFIX) :] if stream.startswith(KV_STREAM_PREFIX) else stream
         return KeyValue(
-            name=config.bucket,
-            stream=stream.name,
-            pre=KV_PRE_TEMPLATE.format(bucket=config.bucket),
+            name=bucket,
+            stream=stream,
+            pre=KV_PRE_TEMPLATE.format(bucket=bucket),
             js=self,
             direct=bool(si.config.allow_direct),
         )
