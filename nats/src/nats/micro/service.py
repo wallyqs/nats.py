@@ -165,6 +165,13 @@ class EndpointStats:
     Additional statistics the endpoint makes available
     """
 
+    endpoint = None
+    """
+    The `Endpoint` these statistics belong to, when they were made by the
+    service (as passed to a `StatsHandler`); None when decoded from a
+    STATS response. Not a dataclass field: it is not serialized.
+    """
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> EndpointStats:
         return cls(
@@ -269,6 +276,11 @@ class Endpoint:
         self._metadata = config.metadata
         self._pending_msgs_limit = config.pending_msgs_limit
         self._pending_bytes_limit = config.pending_bytes_limit
+        self._config = replace(
+            config,
+            subject=self._subject,
+            queue_group=self._queue_group,
+        )
 
         self._num_requests = 0
         self._num_errors = 0
@@ -277,6 +289,41 @@ class Endpoint:
         self._last_error = None
 
         self._subscription: Optional[Subscription] = None
+
+    @property
+    def name(self) -> str:
+        """The name of the endpoint."""
+        return self._name
+
+    @property
+    def config(self) -> EndpointConfig:
+        """The configuration of the endpoint, with its subject and queue group resolved."""
+        return self._config
+
+    @property
+    def subject(self) -> str:
+        """The subject the endpoint listens on."""
+        return self._subject
+
+    @property
+    def queue_group(self) -> str:
+        """The queue group the endpoint listens on, empty when queue groups are disabled."""
+        return self._queue_group
+
+    @property
+    def queue_group_disabled(self) -> bool:
+        """Whether the endpoint subscribes without a queue group."""
+        return self._queue_group_disabled
+
+    @property
+    def metadata(self) -> Optional[Dict[str, str]]:
+        """The metadata of the endpoint."""
+        return self._metadata
+
+    @property
+    def handler(self) -> Handler:
+        """The handler of the endpoint."""
+        return self._handler
 
     async def _start(self) -> None:
         assert not self._subscription
@@ -358,7 +405,7 @@ class EndpointManager(Protocol):
     """
 
     @overload
-    async def add_endpoint(self, config: EndpointConfig) -> None: ...
+    async def add_endpoint(self, config: EndpointConfig) -> Endpoint: ...
 
     @overload
     async def add_endpoint(
@@ -372,9 +419,9 @@ class EndpointManager(Protocol):
         queue_group_disabled: bool = False,
         pending_msgs_limit: Optional[int] = None,
         pending_bytes_limit: Optional[int] = None,
-    ) -> None: ...
+    ) -> Endpoint: ...
 
-    async def add_endpoint(self, config: Optional[EndpointConfig] = None, **kwargs) -> None: ...
+    async def add_endpoint(self, config: Optional[EndpointConfig] = None, **kwargs) -> Endpoint: ...
 
 
 class GroupManager(Protocol):
@@ -401,7 +448,7 @@ class Group(GroupManager, EndpointManager):
         self._queue_group_disabled = config.queue_group_disabled
 
     @overload
-    async def add_endpoint(self, config: EndpointConfig) -> None: ...
+    async def add_endpoint(self, config: EndpointConfig) -> Endpoint: ...
 
     @overload
     async def add_endpoint(
@@ -415,9 +462,9 @@ class Group(GroupManager, EndpointManager):
         queue_group_disabled: bool = False,
         pending_msgs_limit: Optional[int] = None,
         pending_bytes_limit: Optional[int] = None,
-    ) -> None: ...
+    ) -> Endpoint: ...
 
-    async def add_endpoint(self, config: Optional[EndpointConfig] = None, **kwargs) -> None:
+    async def add_endpoint(self, config: Optional[EndpointConfig] = None, **kwargs) -> Endpoint:
         if config is None:
             config = EndpointConfig(**kwargs)
         else:
@@ -433,7 +480,7 @@ class Group(GroupManager, EndpointManager):
             queue_group_disabled=queue_group_disabled,
         )
 
-        await self._service.add_endpoint(config)
+        return await self._service.add_endpoint(config)
 
     @overload
     def add_group(
@@ -465,6 +512,9 @@ class Group(GroupManager, EndpointManager):
 StatsHandler = Callable[[EndpointStats], Any]
 """
 A handler function used to configure a custom *STATS* endpoint.
+
+It is called with each endpoint's `EndpointStats`, whose `endpoint`
+attribute is the `Endpoint` itself (nats.go passes the `*Endpoint`).
 """
 
 
@@ -755,7 +805,7 @@ class Service(AsyncContextManager):
         await self._client.flush()
 
     @overload
-    async def add_endpoint(self, config: EndpointConfig) -> None: ...
+    async def add_endpoint(self, config: EndpointConfig) -> Endpoint: ...
 
     @overload
     async def add_endpoint(
@@ -769,9 +819,9 @@ class Service(AsyncContextManager):
         queue_group_disabled: bool = False,
         pending_msgs_limit: Optional[int] = None,
         pending_bytes_limit: Optional[int] = None,
-    ) -> None: ...
+    ) -> Endpoint: ...
 
-    async def add_endpoint(self, config: Optional[EndpointConfig] = None, **kwargs) -> None:
+    async def add_endpoint(self, config: Optional[EndpointConfig] = None, **kwargs) -> Endpoint:
         if config is None:
             config = EndpointConfig(**kwargs)
         else:
@@ -785,6 +835,8 @@ class Service(AsyncContextManager):
         endpoint = Endpoint(self, config)
         await endpoint._start()
         self._endpoints.append(endpoint)
+
+        return endpoint
 
     @overload
     def add_group(
@@ -831,6 +883,9 @@ class Service(AsyncContextManager):
             ],
             started=self._started,
         )
+
+        for endpoint, endpoint_stats in zip(self._endpoints or [], stats.endpoints):
+            endpoint_stats.endpoint = endpoint
 
         if self._stats_handler:
             for endpoint_stats in stats.endpoints:

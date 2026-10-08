@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import json
 
 import nats
@@ -17,8 +18,11 @@ from nats.micro.errors import (
 )
 from nats.micro.request import Request
 from nats.micro.service import (
+    Endpoint,
     EndpointConfig,
+    EndpointStats,
     ServiceConfig,
+    ServiceStats,
     ServiceVerb,
     control_subject,
 )
@@ -355,5 +359,72 @@ class MicroEndpointOptionsTest(SingleServerTestCase):
         await svc.add_endpoint(updated)
         info = await nc.request(control_subject(ServiceVerb.INFO, "svc"), b"", timeout=1)
         self.assertEqual(json.loads(info.data)["endpoints"][0]["metadata"], {"a": "3", "b": "2"})
+        await svc.stop()
+        await nc.close()
+
+
+class MicroEndpointTest(SingleServerTestCase):
+    @async_test
+    async def test_endpoint_accessors(self):
+        nc = await nats.connect()
+        svc = await add_service(nc, name="svc", version="0.1.0", queue_group="sq")
+
+        endpoint = await svc.add_endpoint(name="e", handler=noop_handler, metadata={"k": "v"})
+        self.assertIsInstance(endpoint, Endpoint)
+        self.assertEqual(endpoint.name, "e")
+        self.assertEqual(endpoint.subject, "e")
+        self.assertEqual(endpoint.queue_group, "sq")
+        self.assertFalse(endpoint.queue_group_disabled)
+        self.assertEqual(endpoint.metadata, {"k": "v"})
+        self.assertIs(endpoint.handler, noop_handler)
+        self.assertIsInstance(endpoint.config, EndpointConfig)
+        self.assertEqual(endpoint.config.name, "e")
+        self.assertEqual(endpoint.config.subject, "e")
+        self.assertEqual(endpoint.config.queue_group, "sq")
+        self.assertEqual(endpoint.config.metadata, {"k": "v"})
+
+        group = svc.add_group(name="g", queue_group_disabled=True)
+        grouped = await group.add_endpoint(name="ge", subject="sub", handler=noop_handler)
+        self.assertEqual(grouped.name, "ge")
+        self.assertEqual(grouped.subject, "g.sub")
+        self.assertEqual(grouped.config.subject, "g.sub")
+        self.assertEqual(grouped.queue_group, "")
+        self.assertTrue(grouped.queue_group_disabled)
+        self.assertTrue(grouped.config.queue_group_disabled)
+
+        await svc.stop()
+        await nc.close()
+
+    @async_test
+    async def test_stats_handler_receives_endpoint(self):
+        seen = []
+
+        def stats_handler(stats: EndpointStats):
+            # The current EndpointStats argument keeps working ...
+            self.assertIsInstance(stats, EndpointStats)
+            # ... and also exposes the endpoint, as nats.go passes *Endpoint.
+            seen.append(stats.endpoint)
+            return {"endpoint": stats.endpoint.name, "requests": stats.num_requests, **stats.endpoint.config.metadata}
+
+        nc = await nats.connect()
+        svc = await add_service(nc, name="svc", version="0.1.0", stats_handler=stats_handler)
+        first = await svc.add_endpoint(name="first", handler=noop_handler, metadata={"m": "1"})
+        second = await svc.add_group(name="g").add_endpoint(name="second", handler=noop_handler, metadata={"m": "2"})
+
+        resp = await nc.request(control_subject(ServiceVerb.STATS, "svc"), b"", timeout=1)
+        stats = ServiceStats.from_dict(json.loads(resp.data))
+        self.assertEqual(
+            [e.data for e in stats.endpoints],
+            [
+                {"endpoint": "first", "requests": 0, "m": "1"},
+                {"endpoint": "second", "requests": 0, "m": "2"},
+            ],
+        )
+        self.assertEqual(seen, [first, second])
+        # Decoded stats have no endpoint, and the attribute is not a field.
+        self.assertIsNone(stats.endpoints[0].endpoint)
+        self.assertNotIn("endpoint", dataclasses.asdict(svc.stats().endpoints[0]))
+        self.assertIs(svc.stats().endpoints[1].endpoint, second)
+
         await svc.stop()
         await nc.close()
