@@ -31,8 +31,9 @@ from tests.utils import (
 class FakeServer:
     """A minimal NATS server that sends the given INFO and answers PING."""
 
-    def __init__(self, info):
+    def __init__(self, info, after_info=b""):
         self.info = info
+        self.after_info = after_info
         self.lines = []
 
     async def __aenter__(self):
@@ -46,7 +47,7 @@ class FakeServer:
 
     async def _handle(self, reader, writer):
         info = dict({"server_id": "FAKE", "version": "2.10.0", "max_payload": 1048576}, **self.info)
-        writer.write(b"INFO " + json.dumps(info).encode() + b"\r\n")
+        writer.write(b"INFO " + json.dumps(info).encode() + b"\r\n" + self.after_info)
         await writer.drain()
         try:
             while True:
@@ -183,31 +184,6 @@ class MaxSubscriptionsTest(ConfiguredServerTestCase):
         await nc.flush()
         # The server does not close the connection for this error.
         self.assertTrue(nc.is_connected)
-        await nc.close()
-
-
-class MaxConnectionsTest(ConfiguredServerTestCase):
-    config = "max_connections: 1\n"
-
-    @async_test
-    async def test_max_connections_exceeded_on_connect(self):
-        nc = await nats.connect("nats://127.0.0.1:4222")
-        # The server closes the connection right after its -ERR, and a reset
-        # can occasionally discard the -ERR before it is read; then the
-        # connect fails with the OSError instead, so allow a few attempts.
-        for _ in range(5):
-            nc2 = NATS()
-            try:
-                await nc2.connect("nats://127.0.0.1:4222", allow_reconnect=False)
-            except nats.errors.MaxConnectionsExceededError as e:
-                err = e
-                break
-            except OSError:
-                continue
-        else:
-            self.fail("MaxConnectionsExceededError not raised")
-        self.assertIsInstance(err, nats.errors.Error)
-        self.assertIn("maximum connections exceeded", str(err))
         await nc.close()
 
 
@@ -365,6 +341,16 @@ class ClientErrorsTest(SingleServerTestCase):
 
 
 class FakeServerErrorsTest(unittest.IsolatedAsyncioTestCase):
+    async def test_max_connections_exceeded_on_connect(self):
+        # A real server closes the connection after this -ERR, and the reset
+        # can make the client miss it, so the fake one keeps it open.
+        async with FakeServer({}, after_info=b"-ERR 'maximum connections exceeded'\r\n") as server:
+            nc = NATS()
+            with self.assertRaises(nats.errors.MaxConnectionsExceededError) as raised:
+                await nc.connect(server.url, allow_reconnect=False)
+            self.assertEqual(str(raised.exception), "nats: 'maximum connections exceeded'")
+            await nc.close()
+
     async def test_headers_not_supported(self):
         async with FakeServer({"headers": False, "proto": 1}) as server:
             nc = await nats.connect(server.url, allow_reconnect=False)
