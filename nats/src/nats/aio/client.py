@@ -20,6 +20,7 @@ import inspect
 import ipaddress
 import json
 import logging
+import random
 import re
 import ssl
 import string
@@ -208,6 +209,9 @@ class Srv:
 
 
 ReconnectToServerHandler = Callable[[List[Server], Dict[str, Any]], Tuple[Optional[Server], float]]
+# Called with the number of times the client backed off while reconnecting
+# (1 the first time), returns the seconds to wait before trying again.
+ReconnectDelayHandler = Callable[[int], float]
 
 
 class ServerVersion:
@@ -377,6 +381,7 @@ class Client:
         self._close_err: Optional[Exception] = None
 
         self._reconnection_task: Optional[asyncio.Task[None]] = None
+        self._reconnect_backoffs: int = 0
         self._reconnection_task_future: Optional[asyncio.Future] = None
         self._max_payload: int = DEFAULT_MAX_PAYLOAD_SIZE
 
@@ -484,6 +489,9 @@ class Client:
         ignore_auth_error_abort: bool = False,
         permission_err_on_subscribe: bool = False,
         retry_on_failed_connect: bool = False,
+        custom_reconnect_delay_cb: Optional[ReconnectDelayHandler] = None,
+        reconnect_jitter: float = 0,
+        reconnect_jitter_tls: float = 0,
     ) -> None:
         """
         Establishes a connection to NATS.
@@ -519,6 +527,13 @@ class Client:
             connected to, return right away and keep connecting in the
             background, as reconnections do (publishes are buffered meanwhile).
             connected_cb reports when the connection is established.
+        :param custom_reconnect_delay_cb: Function called with the number of
+            times the client backed off while reconnecting (starting at 1) that
+            returns the seconds to wait, replacing reconnect_time_wait.
+        :param reconnect_jitter: Up to this many seconds, chosen at random, are
+            added to reconnect_time_wait, so that clients do not all reconnect
+            at once.
+        :param reconnect_jitter_tls: Like reconnect_jitter, for TLS connections.
 
         Connecting setting all callbacks::
 
@@ -660,6 +675,11 @@ class Client:
         self.options["ignore_auth_error_abort"] = ignore_auth_error_abort
         self.options["permission_err_on_subscribe"] = permission_err_on_subscribe
         self.options["retry_on_failed_connect"] = retry_on_failed_connect
+        if custom_reconnect_delay_cb is not None and not callable(custom_reconnect_delay_cb):
+            raise errors.Error("nats: custom_reconnect_delay_cb must be callable")
+        self.options["custom_reconnect_delay_cb"] = custom_reconnect_delay_cb
+        self.options["reconnect_jitter"] = reconnect_jitter
+        self.options["reconnect_jitter_tls"] = reconnect_jitter_tls
 
         if tls:
             self.options["tls"] = tls
@@ -1707,7 +1727,7 @@ class Client:
             self._server_pool.append(s)
             if s.last_attempt is not None and now < s.last_attempt + self.options["reconnect_time_wait"]:
                 # Backoff connecting to server if we attempted recently.
-                await asyncio.sleep(self.options["reconnect_time_wait"])
+                await asyncio.sleep(self._reconnect_delay())
             try:
                 await self._connect_to_server(s)
                 self._current_server = s
@@ -1721,6 +1741,23 @@ class Client:
                 if self.is_reconnecting:
                     await self._notify_reconnect_error(e)
                 continue
+
+    def _reconnect_delay(self) -> float:
+        """
+        How long to back off before trying a server again, as nats.go's
+        doReconnect: the custom delay callback's answer, or else
+        reconnect_time_wait plus a random jitter.
+        """
+        self._reconnect_backoffs += 1
+        custom_delay = self.options.get("custom_reconnect_delay_cb")
+        if custom_delay is not None:
+            return custom_delay(self._reconnect_backoffs)
+        delay = self.options["reconnect_time_wait"]
+        secure = self._secure_wanted() or bool(self._server_info.get("tls_required", False))
+        jitter = self.options.get("reconnect_jitter_tls" if secure else "reconnect_jitter", 0)
+        if jitter and jitter > 0:
+            delay += random.random() * jitter
+        return delay
 
     async def _process_err(self, err_msg: str) -> None:
         """
@@ -1855,6 +1892,8 @@ class Client:
 
         if "dont_randomize" not in self.options or not self.options["dont_randomize"]:
             shuffle(self._server_pool)
+
+        self._reconnect_backoffs = 0
 
         # Create a future that the client can use to control waiting
         # on the reconnection attempts.

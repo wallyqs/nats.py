@@ -9,6 +9,7 @@ import shutil
 import ssl
 import tempfile
 import unittest
+from unittest import mock
 
 import nats
 import nats.errors
@@ -668,6 +669,54 @@ class RetryOnFailedConnectTest(unittest.TestCase):
         nc = NATS()
         with self.assertRaises(nats.errors.NoServersError):
             await nc.connect("nats://127.0.0.1:4222", max_reconnect_attempts=1, reconnect_time_wait=0.1)
+
+
+class ReconnectDelayTest(SingleServerTestCase):
+    @async_test
+    async def test_custom_reconnect_delay_cb(self):
+        backoffs = []
+        reconnected = asyncio.Event()
+
+        def delay(attempts):
+            backoffs.append(attempts)
+            return 0.05
+
+        async def reconnected_cb():
+            reconnected.set()
+
+        async def error_cb(e):
+            pass
+
+        nc = await nats.connect(
+            custom_reconnect_delay_cb=delay,
+            reconnected_cb=reconnected_cb,
+            error_cb=error_cb,
+            max_reconnect_attempts=-1,
+        )
+        self.server_pool[0].stop()
+        # With the default reconnect_time_wait of 2s this would take far longer.
+        while len(backoffs) < 3:
+            await asyncio.sleep(0.05)
+        self.assertEqual(backoffs[:3], [1, 2, 3])
+        start_natsd(self.server_pool[0])
+        await asyncio.wait_for(reconnected.wait(), 3)
+        await nc.close()
+
+    def test_reconnect_jitter(self):
+        nc = NATS()
+        nc.options.update(
+            reconnect_time_wait=1,
+            reconnect_jitter=0.2,
+            reconnect_jitter_tls=2,
+        )
+        with mock.patch("random.random", return_value=0.5):
+            self.assertAlmostEqual(nc._reconnect_delay(), 1.1)
+            nc.options["tls"] = object()
+            self.assertAlmostEqual(nc._reconnect_delay(), 2.0)
+        # No jitter by default.
+        nc = NATS()
+        nc.options.update(reconnect_time_wait=1)
+        self.assertEqual(nc._reconnect_delay(), 1)
 
 
 if __name__ == "__main__":
