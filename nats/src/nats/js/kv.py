@@ -540,6 +540,71 @@ class KeyValue:
                     raise StopAsyncIteration
                 return entry
 
+    class KeyLister:
+        """
+        KeyLister delivers the keys of a bucket as an async iterator
+        (nats.go KeyLister); iterating ends once the keys present when the
+        listing started have been delivered. stop() ends it early.
+
+        ::
+
+            lister = await kv.list_keys()
+            async for key in lister:
+                print(key)
+        """
+
+        def __init__(self, watcher: KeyValue.KeyWatcher) -> None:
+            self._watcher = watcher
+            self._done = False
+
+        def keys(self) -> KeyValue.KeyLister:
+            """
+            keys returns the async iterator of the keys.
+            """
+            return self
+
+        async def stop(self) -> None:
+            """
+            stop stops the listing.
+            """
+            if self._done:
+                return
+            self._done = True
+            await self._watcher.stop()
+
+        def __aiter__(self) -> KeyValue.KeyLister:
+            return self
+
+        async def __anext__(self) -> str:
+            if self._done:
+                raise StopAsyncIteration
+            entry = await self._watcher._updates.get()
+            if entry is None or isinstance(entry, StopIterSentinel):
+                await self.stop()
+                raise StopAsyncIteration
+            return entry.key
+
+    async def list_keys(self, **kwargs) -> KeyLister:
+        """
+        list_keys returns a KeyLister of the keys of the bucket that have
+        a value (nats.go ListKeys). The keyword arguments are watch()
+        options. Unlike keys(), an empty bucket lists no keys instead of
+        raising NoKeysError.
+        """
+        kwargs.update(ignore_deletes=True, meta_only=True)
+        watcher = await self.watchall(**kwargs)
+        return KeyValue.KeyLister(watcher)
+
+    async def list_keys_filtered(self, filters: List[str]) -> KeyLister:
+        """
+        list_keys_filtered returns a KeyLister of the keys that have a
+        value and match any of the subject patterns in filters, e.g.
+        ``["orders.*", "users.>"]`` (nats.go ListKeysFiltered). Unlike the
+        substring filters of keys(), these are NATS subject wildcards.
+        """
+        watcher = await self.watch_filtered(filters, ignore_deletes=True, meta_only=True)
+        return KeyValue.KeyLister(watcher)
+
     async def watchall(self, **kwargs) -> KeyWatcher:
         """
         watchall returns a KeyValue watcher that matches all the keys.

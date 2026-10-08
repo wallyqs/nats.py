@@ -477,3 +477,48 @@ class KVWatchOptionsTest(SingleJetStreamServerTestCase):
         assert nats.js.kv.ALL_KEYS == ">"
 
         await nc.close()
+
+
+class KVListKeysTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_list_keys(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        kv = await js.create_key_value(bucket="LISTKEYS", history=3)
+
+        lister = await kv.list_keys()
+        assert [key async for key in lister] == []
+
+        await kv.put("orders.1", b"1")
+        await kv.put("orders.2", b"2")
+        await kv.put("orders.1", b"3")
+        await kv.put("users.1", b"u")
+        await kv.put("gone", b"x")
+        await kv.delete("gone")
+        await kv.put("purged", b"x")
+        await kv.purge("purged")
+
+        lister = await kv.list_keys()
+        keys = [key async for key in lister.keys()]
+        assert sorted(keys) == ["orders.1", "orders.2", "users.1"]
+        # Iterating again after the end yields nothing.
+        assert [key async for key in lister] == []
+
+        lister = await kv.list_keys_filtered(["orders.*"])
+        assert sorted([key async for key in lister]) == ["orders.1", "orders.2"]
+
+        lister = await kv.list_keys_filtered(["users.>", "orders.2"])
+        assert sorted([key async for key in lister]) == ["orders.2", "users.1"]
+
+        # Stopping the lister ends the iteration.
+        lister = await kv.list_keys()
+        first = await lister.__anext__()
+        assert first in ("orders.1", "orders.2", "users.1")
+        await lister.stop()
+        assert [key async for key in lister] == []
+        await lister.stop()
+
+        # keys() keeps its substring filters.
+        assert sorted(await kv.keys(filters=["ders"])) == ["orders.1", "orders.2"]
+
+        await nc.close()
