@@ -348,6 +348,15 @@ class ObjectAlreadyExists(Error):
     pass
 
 
+class InvalidDigestFormatError(Error):
+    """
+    Raised when an object digest is not of the form ``SHA-256=<base64url>``.
+    """
+
+    def __str__(self) -> str:
+        return "nats: object digest hash has invalid format"
+
+
 class KeyValueLimitMarkerTTLNotSupportedError(Error):
     """
     Raised when limit_marker_ttl is used but the connected server does not support it (pre-2.11).

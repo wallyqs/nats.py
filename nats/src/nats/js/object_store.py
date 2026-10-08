@@ -14,6 +14,7 @@
 
 import asyncio
 import base64
+import binascii
 import io
 import json
 import re
@@ -27,6 +28,7 @@ from nats.js import api
 from nats.js.errors import (
     BadObjectMetaError,
     DigestMismatchError,
+    InvalidDigestFormatError,
     InvalidObjectNameError,
     LinkIsABucketError,
     NotFoundError,
@@ -51,6 +53,34 @@ OBJ_NO_PENDING = "0"
 OBJ_DEFAULT_CHUNK_SIZE = 128 * 1024  # 128k
 OBJ_DIGEST_TYPE = "SHA-256="
 OBJ_DIGEST_TEMPLATE = OBJ_DIGEST_TYPE + "{digest}"
+
+_BASE64URL_RE = re.compile(r"^[A-Za-z0-9_-]*={0,2}$")
+
+
+def get_object_digest_value(h) -> str:
+    """
+    get_object_digest_value returns the digest of an object as stored in its
+    info (``SHA-256=`` and the padded base64url of the hash), given the
+    SHA-256 hash object (e.g. ``hashlib.sha256()``) its data was fed to.
+    """
+    return OBJ_DIGEST_TEMPLATE.format(digest=base64.urlsafe_b64encode(h.digest()).decode())
+
+
+def decode_object_digest(digest: str) -> bytes:
+    """
+    decode_object_digest returns the hash bytes of an object digest as
+    produced by get_object_digest_value.
+
+    Raises InvalidDigestFormatError when the digest has no ``=`` separator,
+    and binascii.Error when the hash is not valid padded base64url.
+    """
+    parts = digest.split("=", 1)
+    if len(parts) != 2:
+        raise InvalidDigestFormatError
+    encoded = parts[1]
+    if not _BASE64URL_RE.match(encoded):
+        raise binascii.Error("nats: illegal base64 data in object digest")
+    return base64.b64decode(encoded, altchars=b"-_", validate=True)
 
 
 def _check_object_name(name: Optional[str]) -> None:
@@ -235,8 +265,7 @@ class ObjectStore:
 
                 # Make sure the digest matches.
                 sha = h.digest()
-                digest_str = info.digest.replace(OBJ_DIGEST_TYPE, "").replace(OBJ_DIGEST_TYPE.upper(), "")
-                rsha = base64.urlsafe_b64decode(digest_str)
+                rsha = decode_object_digest(info.digest)
                 if not sha == rsha:
                     raise DigestMismatchError
 
@@ -327,10 +356,9 @@ class ObjectStore:
                 await self._js.purge_stream(self._stream, subject=chunk_subj)
                 raise err
 
-        sha = h.digest()
         info.size = total
         info.chunks = sent
-        info.digest = OBJ_DIGEST_TEMPLATE.format(digest=base64.urlsafe_b64encode(sha).decode())
+        info.digest = get_object_digest_value(h)
 
         # Prepare the meta message.
         meta_subj = OBJ_META_PRE_TEMPLATE.format(
