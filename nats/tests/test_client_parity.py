@@ -1150,6 +1150,61 @@ class CustomDialerTest(SingleServerTestCase):
         await nc.close()
 
 
+class StuckTransport:
+    """A transport whose writes never complete."""
+
+    def writelines(self, payload):
+        pass
+
+    async def drain(self):
+        await asyncio.sleep(60)
+
+
+class FlusherTest(unittest.IsolatedAsyncioTestCase):
+    async def run_flusher(self, **options):
+        nc = NATS()
+        errs = []
+
+        async def error_cb(e):
+            errs.append(e)
+
+        op_errs = []
+
+        async def process_op_err(e):
+            op_errs.append(e)
+
+        nc._error_cb = error_cb
+        nc._process_op_err = process_op_err
+        nc.options.update(options)
+        nc._transport = StuckTransport()
+        nc._status = NATS.CONNECTED
+        nc._flush_queue = asyncio.Queue()
+        nc._pending = [b"PUB foo 0\r\n\r\n"]
+        nc._pending_data_size = len(nc._pending[0])
+        flusher = asyncio.create_task(nc._flusher())
+        future = asyncio.get_running_loop().create_future()
+        await nc._flush_queue.put(future)
+        await asyncio.wait_for(future, 2)
+        return nc, flusher, errs, op_errs
+
+    async def test_flusher_timeout_reconnects(self):
+        nc, flusher, errs, op_errs = await self.run_flusher(flusher_timeout=0.05)
+        await asyncio.wait_for(flusher, 1)
+        self.assertEqual(len(errs), 1)
+        self.assertIsInstance(errs[0], nats.errors.FlushTimeoutError)
+        self.assertEqual(op_errs, errs)
+
+    async def test_flusher_error_without_reconnect(self):
+        nc, flusher, errs, op_errs = await self.run_flusher(flusher_timeout=0.05, reconnect_on_flusher_error=False)
+        self.assertEqual(len(errs), 1)
+        self.assertIsInstance(errs[0], nats.errors.FlushTimeoutError)
+        self.assertIs(nc.last_error, errs[0])
+        self.assertEqual(op_errs, [])
+        # The flusher keeps running.
+        self.assertFalse(flusher.done())
+        flusher.cancel()
+
+
 if __name__ == "__main__":
     import sys
 

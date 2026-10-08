@@ -541,6 +541,8 @@ class Client:
         ws_compression: bool = False,
         ws_proxy_path: Optional[str] = None,
         custom_dialer: Optional[CustomDialer] = None,
+        flusher_timeout: Optional[float] = None,
+        reconnect_on_flusher_error: bool = True,
     ) -> None:
         """
         Establishes a connection to NATS.
@@ -607,6 +609,12 @@ class Client:
         :param custom_dialer: Coroutine function called with (host, port) that
             opens the TCP connection and returns its (StreamReader,
             StreamWriter), e.g. to go through a proxy or tunnel.
+        :param flusher_timeout: Max seconds the background flusher waits for
+            a write to the server; a slower write is reported to error_cb as
+            FlushTimeoutError and handled as a write error.
+        :param reconnect_on_flusher_error: Reconnect when the background flusher
+            fails to write (the default). When False, the error is recorded in
+            last_error and reported to error_cb only.
 
         Connecting setting all callbacks::
 
@@ -769,6 +777,8 @@ class Client:
         if custom_dialer is not None and not callable(custom_dialer):
             raise errors.Error("nats: custom_dialer must be callable")
         self.options["custom_dialer"] = custom_dialer
+        self.options["flusher_timeout"] = flusher_timeout
+        self.options["reconnect_on_flusher_error"] = reconnect_on_flusher_error
         self.options["skip_subject_validation"] = skip_subject_validation
         self._skip_subject_validation = skip_subject_validation
         self.options["no_callbacks_after_client_close"] = no_callbacks_after_client_close
@@ -3100,11 +3110,22 @@ class Client:
                     self._transport.writelines(self._pending[:])
                     self._pending = []
                     self._pending_data_size = 0
-                    await self._transport.drain()
-            except OSError as e:
+                    flusher_timeout = self.options.get("flusher_timeout")
+                    if flusher_timeout:
+                        try:
+                            await asyncio.wait_for(self._transport.drain(), flusher_timeout)
+                        except asyncio.TimeoutError:
+                            raise errors.FlushTimeoutError
+                    else:
+                        await self._transport.drain()
+            except (OSError, errors.FlushTimeoutError) as e:
                 await self._error_cb(e)
-                await self._process_op_err(e)
-                break
+                if self.options.get("reconnect_on_flusher_error", True):
+                    await self._process_op_err(e)
+                    break
+                # As nats.go without ReconnectOnFlusherError: keep the error,
+                # the read loop notices a broken connection.
+                self._err = e
             except (asyncio.CancelledError, RuntimeError, AttributeError):
                 # RuntimeError in case the event loop is closed
                 break
