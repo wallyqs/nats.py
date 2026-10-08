@@ -1678,15 +1678,87 @@ class JetStreamContext(JetStreamManager):
         """
         create_object_store takes an api.ObjectStoreConfig and creates a OBJ in JetStream.
         """
+        config = self._object_store_config(bucket, config, params)
+        stream = self._object_store_stream_config(config)
+        await self.add_stream(stream)
+
+        assert stream.name is not None
+        return ObjectStore(
+            name=config.bucket,
+            stream=stream.name,
+            js=self,
+        )
+
+    async def update_object_store(
+        self,
+        bucket: str = None,
+        config: Optional[api.ObjectStoreConfig] = None,
+        **params,
+    ) -> ObjectStore:
+        """
+        update_object_store takes an api.ObjectStoreConfig and updates the
+        stream of an existing OBJ in JetStream.
+
+        Raises BucketNotFoundError when the bucket does not exist.
+        """
+        config = self._object_store_config(bucket, config, params)
+        stream = self._object_store_stream_config(config)
+        try:
+            await self.update_stream(stream)
+        except NotFoundError as e:
+            raise BucketNotFoundError(code=e.code, err_code=e.err_code, description=e.description) from e
+
+        assert stream.name is not None
+        return ObjectStore(
+            name=config.bucket,
+            stream=stream.name,
+            js=self,
+        )
+
+    async def create_or_update_object_store(
+        self,
+        bucket: str = None,
+        config: Optional[api.ObjectStoreConfig] = None,
+        **params,
+    ) -> ObjectStore:
+        """
+        create_or_update_object_store takes an api.ObjectStoreConfig and
+        updates the OBJ in JetStream, creating it when it does not exist.
+        """
+        config = self._object_store_config(bucket, config, params)
+        stream = self._object_store_stream_config(config)
+        try:
+            await self.update_stream(stream)
+        except NotFoundError:
+            await self.add_stream(stream)
+
+        assert stream.name is not None
+        return ObjectStore(
+            name=config.bucket,
+            stream=stream.name,
+            js=self,
+        )
+
+    @staticmethod
+    def _object_store_config(
+        bucket: Optional[str],
+        config: Optional[api.ObjectStoreConfig],
+        params: Dict[str, Any],
+    ) -> api.ObjectStoreConfig:
         if config is None:
+            if bucket is None and not params:
+                raise nats.js.errors.ObjectConfigRequiredError
             config = api.ObjectStoreConfig(bucket=bucket)
-        else:
+        elif bucket is not None:
             config.bucket = bucket
         config = config.evolve(**params)
 
-        if VALID_BUCKET_RE.match(config.bucket) is None:
+        if config.bucket is None or VALID_BUCKET_RE.match(config.bucket) is None:
             raise nats.js.errors.InvalidStoreNameError
+        return config
 
+    @staticmethod
+    def _object_store_stream_config(config: api.ObjectStoreConfig) -> api.StreamConfig:
         name = config.bucket
         chunks = OBJ_ALL_CHUNKS_PRE_TEMPLATE.format(bucket=name)
         meta = OBJ_ALL_META_PRE_TEMPLATE.format(bucket=name)
@@ -1695,7 +1767,7 @@ class JetStreamContext(JetStreamManager):
         if max_bytes == 0:
             max_bytes = -1
 
-        stream = api.StreamConfig(
+        return api.StreamConfig(
             name=OBJ_STREAM_TEMPLATE.format(bucket=config.bucket),
             description=config.description,
             subjects=[chunks, meta],
@@ -1710,14 +1782,6 @@ class JetStreamContext(JetStreamManager):
             allow_direct=True,
             compression=api.StoreCompression.S2 if config.compression else None,
             metadata=config.metadata,
-        )
-        await self.add_stream(stream)
-
-        assert stream.name is not None
-        return ObjectStore(
-            name=config.bucket,
-            stream=stream.name,
-            js=self,
         )
 
     async def delete_object_store(self, bucket: str) -> bool:

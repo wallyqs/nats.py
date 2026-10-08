@@ -450,6 +450,15 @@ class BucketMalformedError(Error):
         return "nats: bucket malformed"
 
 
+class ObjectConfigRequiredError(Error):
+    """
+    Raised when creating or updating an Object Store without a config.
+    """
+
+    def __str__(self) -> str:
+        return "nats: object-store config required"
+
+
 class KeyValueLimitMarkerTTLNotSupportedError(Error):
     """
     Raised when limit_marker_ttl is used but the connected server does not support it (pre-2.11).

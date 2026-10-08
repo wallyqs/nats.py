@@ -10,6 +10,7 @@ import nats.js.api
 import pytest
 from nats.js.errors import (
     BucketMalformedError,
+    BucketNotFoundError,
     BucketRequiredError,
     DigestMismatchError,
     InvalidBucketNameError,
@@ -23,6 +24,7 @@ from nats.js.errors import (
     NoObjectsFoundError,
     NotFoundError,
     ObjectAlreadyExists,
+    ObjectConfigRequiredError,
     ObjectDeletedError,
     ObjectNameRequiredError,
     ObjectNotFoundError,
@@ -357,5 +359,63 @@ class ObjectStoreConfigTest(SingleJetStreamServerTestCase):
         assert not status.is_compressed
         assert status.backing_store == "JetStream"
         assert "team" not in (status.metadata or {})
+
+        await nc.close()
+
+
+class ObjectStoreManagerTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_update_object_store(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        with pytest.raises(BucketNotFoundError):
+            await js.update_object_store("MISSING", description="x")
+
+        await js.create_object_store("UPD", description="before")
+        obs = await js.update_object_store(
+            config=nats.js.api.ObjectStoreConfig(bucket="UPD", description="after", metadata={"v": "2"})
+        )
+        assert obs._name == "UPD"
+        assert obs._stream == "OBJ_UPD"
+        status = await obs.status()
+        assert status.description == "after"
+        assert status.metadata["v"] == "2"
+
+        with pytest.raises(InvalidStoreNameError):
+            await js.update_object_store("bad.name")
+
+        await nc.close()
+
+    @async_test
+    async def test_create_or_update_object_store(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        obs = await js.create_or_update_object_store("COU", description="one")
+        assert (await obs.status()).description == "one"
+        await obs.put("A", b"A")
+
+        obs = await js.create_or_update_object_store("COU", description="two")
+        assert (await obs.status()).description == "two"
+        # The bucket was updated, not replaced.
+        assert (await obs.get("A")).data == b"A"
+
+        await nc.close()
+
+    @async_test
+    async def test_config_required(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+
+        for call in (js.create_object_store, js.update_object_store, js.create_or_update_object_store):
+            with pytest.raises(ObjectConfigRequiredError) as e:
+                await call()
+            assert str(e.value) == "nats: object-store config required"
+
+        # The bucket may be given in the config alone.
+        obs = await js.create_object_store(config=nats.js.api.ObjectStoreConfig(bucket="CFGONLY"))
+        assert obs._name == "CFGONLY"
+        assert (await js.object_store("CFGONLY"))._stream == "OBJ_CFGONLY"
 
         await nc.close()
