@@ -14,12 +14,13 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from nats.aio.msg import Msg
 
-from .errors import ArgRequiredError, RespondError
+from .errors import ArgRequiredError, MarshalResponseError, RespondError
 
 ERROR_HEADER = "Nats-Service-Error"
 ERROR_CODE_HEADER = "Nats-Service-Error-Code"
@@ -36,6 +37,11 @@ class Request:
     def subject(self) -> str:
         """The subject on which request was received."""
         return self._msg.subject
+
+    @property
+    def reply(self) -> str:
+        """The reply subject of the request."""
+        return self._msg.reply
 
     @property
     def headers(self) -> Optional[Dict[str, str]]:
@@ -63,6 +69,20 @@ class Request:
             headers=headers,
         )
 
+    async def respond_json(self, data: Any, headers: Optional[Dict[str, str]] = None) -> None:
+        """Marshal a value to JSON and send it as the response.
+
+        :param data: The value to marshal.
+        :param headers: Additional response headers.
+        :raises MarshalResponseError: If the value cannot be marshalled to JSON.
+        """
+        try:
+            payload = json.dumps(data, separators=(",", ":")).encode()
+        except (TypeError, ValueError) as error:
+            raise MarshalResponseError() from error
+
+        await self.respond(payload, headers=headers)
+
     async def respond_error(
         self,
         code: str,
@@ -75,7 +95,8 @@ class Request:
         :param code: The error code describing the error.
         :param description: A string describing the error which can be displayed to the client.
         :param data: The error data.
-        :param headers: Additional response headers.
+        :param headers: Additional response headers. As in nats.go, they are
+            applied after the error headers and so may replace them.
         :raises ArgRequiredError: If the code or the description is empty.
         """
         if not code:
@@ -83,7 +104,14 @@ class Request:
         if not description:
             raise ArgRequiredError("argument required: description")
 
-        await self._send_error(code, description, data, headers)
+        error_headers = {
+            ERROR_HEADER: description,
+            ERROR_CODE_HEADER: code,
+        }
+        if headers:
+            error_headers.update(headers)
+
+        await self.respond(data, headers=error_headers)
         self._error = f"{code}:{description}"
 
     async def _send_error(

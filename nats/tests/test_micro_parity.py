@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import nats
 import nats.errors
@@ -7,6 +8,7 @@ from nats.micro import add_service
 from nats.micro.errors import (
     ArgRequiredError,
     ConfigValidationError,
+    MarshalResponseError,
     MicroError,
     NATSError,
     RespondError,
@@ -118,6 +120,78 @@ class MicroErrorsTest(SingleServerTestCase):
         self.assertEqual(len(failures), 1)
         self.assertIsInstance(failures[0], ValueError)
         self.assertTrue(str(failures[0]).startswith("NATS error when sending response"))
+
+        await svc.stop()
+        await nc.close()
+
+
+class MicroRequestTest(SingleServerTestCase):
+    @async_test
+    async def test_respond_json_and_reply(self):
+        replies = []
+        failures = []
+
+        async def handler(request: Request):
+            replies.append(request.reply)
+            if request.data == b"bad":
+                try:
+                    await request.respond_json(object())
+                except MarshalResponseError as e:
+                    failures.append(e)
+                await request.respond(b"fallback")
+                return
+            await request.respond_json({"a": [1, 2], "b": "c"}, headers={"X-Key": "v"})
+
+        nc = await nats.connect()
+        svc = await add_service(nc, name="svc", version="0.1.0")
+        await svc.add_endpoint(name="e", subject="svc.e", handler=handler)
+
+        resp = await nc.request("svc.e", b"", timeout=1)
+        self.assertEqual(resp.data, b'{"a":[1,2],"b":"c"}')
+        self.assertEqual(json.loads(resp.data), {"a": [1, 2], "b": "c"})
+        self.assertEqual(resp.headers, {"X-Key": "v"})
+
+        resp = await nc.request("svc.e", b"bad", timeout=1)
+        self.assertEqual(resp.data, b"fallback")
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(str(failures[0]), "marshaling response")
+        self.assertIsInstance(failures[0].__cause__, TypeError)
+
+        # The reply accessor is the request's reply subject.
+        inbox = nc.new_inbox()
+        sub = await nc.subscribe(inbox)
+        await nc.publish("svc.e", b"", reply=inbox)
+        msg = await sub.next_msg(timeout=1)
+        self.assertEqual(json.loads(msg.data), {"a": [1, 2], "b": "c"})
+        self.assertEqual(replies[-1], inbox)
+        self.assertTrue(all(r.startswith("_INBOX.") for r in replies))
+
+        await svc.stop()
+        await nc.close()
+
+    @async_test
+    async def test_respond_error_headers_override(self):
+        async def handler(request: Request):
+            await request.respond_error(
+                "400",
+                "bad request",
+                b"details",
+                headers={"Nats-Service-Error-Code": "401", "X-Key": "v"},
+            )
+
+        nc = await nats.connect()
+        svc = await add_service(nc, name="svc", version="0.1.0")
+        await svc.add_endpoint(name="e", subject="svc.e", handler=handler)
+
+        resp = await nc.request("svc.e", b"", timeout=1)
+        self.assertEqual(resp.data, b"details")
+        # User headers are applied after the error headers, as in nats.go.
+        self.assertEqual(resp.headers["Nats-Service-Error-Code"], "401")
+        self.assertEqual(resp.headers["Nats-Service-Error"], "bad request")
+        self.assertEqual(resp.headers["X-Key"], "v")
+        stats = svc.stats()
+        self.assertEqual(stats.endpoints[0].num_errors, 1)
+        self.assertEqual(stats.endpoints[0].last_error, "400:bad request")
 
         await svc.stop()
         await nc.close()
