@@ -502,3 +502,85 @@ class StreamManagementTest(SingleJetStreamServerTestCase):
             {"subjects_filter": ">", "offset": 2},
         ]
         await nc.close()
+
+
+class ConsumerManagementTest(SingleJetStreamServerTestCase):
+    @async_test
+    async def test_create_and_update_consumer(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="CONS", subjects=["cons.>"])
+
+        info = await js.create_consumer("CONS", durable_name="dur", description="first")
+        assert info.name == "dur"
+        assert info.config.description == "first"
+        # The same config is idempotent.
+        info = await js.create_consumer("CONS", durable_name="dur", description="first")
+        assert info.name == "dur"
+        with pytest.raises(ConsumerExistsError) as err:
+            await js.create_consumer("CONS", durable_name="dur", description="second")
+        assert isinstance(err.value, BadRequestError)
+        assert err.value.err_code == ErrorCode.CONSUMER_EXISTS
+
+        info = await js.update_consumer("CONS", api.ConsumerConfig(durable_name="dur"), description="second")
+        assert info.config.description == "second"
+        with pytest.raises(ConsumerDoesNotExistError) as err:
+            await js.update_consumer("CONS", name="missing", description="x")
+        assert isinstance(err.value, BadRequestError)
+
+        info = await js.create_or_update_consumer("CONS", name="named", filter_subject="cons.a")
+        assert info.config.filter_subject == "cons.a"
+        info = await js.create_or_update_consumer("CONS", name="named", filter_subject="cons.b")
+        assert info.config.filter_subject == "cons.b"
+
+        # A consumer without a name gets a generated one.
+        info = await js.create_consumer("CONS", api.ConsumerConfig(inactive_threshold=10))
+        assert info.name
+        info = await js.consumer_info("CONS", info.name)
+        assert info.config.durable_name is None
+
+        with pytest.raises(InvalidConsumerNameError):
+            await js.create_consumer("CONS", name="bad.name")
+        await nc.close()
+
+    @async_long_test
+    async def test_consumer_names_and_list_consumers(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="MANY", subjects=["many"], storage=api.StorageType.MEMORY)
+        assert [name async for name in js.consumer_names("MANY")] == []
+
+        # The server lists at most 256 consumer infos per page.
+        total = 300
+        for i in range(total):
+            await js.add_consumer("MANY", durable_name=f"c{i}", mem_storage=True)
+
+        names = [name async for name in js.consumer_names("MANY")]
+        assert sorted(names) == sorted(f"c{i}" for i in range(total))
+        infos = [info async for info in js.list_consumers("MANY")]
+        assert sorted(info.name for info in infos) == sorted(names)
+        assert len(await js.consumers_info("MANY")) == 256
+        await nc.close()
+
+    @async_test
+    async def test_delete_msg_no_erase(self):
+        nc = await nats.connect()
+        js = nc.jetstream()
+        await js.add_stream(name="DEL", subjects=["del"])
+        for _ in range(3):
+            await js.publish("del", b"x")
+
+        requests = []
+
+        async def spy(msg):
+            requests.append(json.loads(msg.data))
+
+        await nc.subscribe("$JS.API.STREAM.MSG.DELETE.DEL", cb=spy)
+        assert await js.delete_msg("DEL", 1)
+        assert await js.delete_msg("DEL", 2, no_erase=True)
+        assert await js.secure_delete_msg("DEL", 3)
+        await nc.flush()
+        assert requests == [{"seq": 1}, {"seq": 2, "no_erase": True}, {"seq": 3}]
+        info = await js.stream_info("DEL")
+        assert info.state.messages == 0
+        await nc.close()

@@ -424,6 +424,130 @@ class JetStreamManager:
         _check_consumer_support(config, info)
         return info
 
+    async def create_consumer(
+        self,
+        stream: str,
+        config: Optional[api.ConsumerConfig] = None,
+        timeout: Optional[float] = None,
+        **params,
+    ) -> api.ConsumerInfo:
+        """
+        Creates a consumer. Creating a consumer that exists with the same
+        configuration returns its info; with another configuration it raises
+        ConsumerExistsError. A consumer without a name or durable name gets a
+        generated name. Requires nats-server 2.10.0 or later.
+        """
+        return await self._upsert_consumer(stream, config, timeout, params, "create")
+
+    async def update_consumer(
+        self,
+        stream: str,
+        config: Optional[api.ConsumerConfig] = None,
+        timeout: Optional[float] = None,
+        **params,
+    ) -> api.ConsumerInfo:
+        """
+        Updates an existing consumer; ConsumerDoesNotExistError if there is
+        none. Requires nats-server 2.10.0 or later.
+        """
+        return await self._upsert_consumer(stream, config, timeout, params, "update")
+
+    async def create_or_update_consumer(
+        self,
+        stream: str,
+        config: Optional[api.ConsumerConfig] = None,
+        timeout: Optional[float] = None,
+        **params,
+    ) -> api.ConsumerInfo:
+        """
+        Creates a consumer, or updates it if it exists. A consumer without a
+        name or durable name gets a generated name.
+        """
+        return await self._upsert_consumer(stream, config, timeout, params, "")
+
+    async def _upsert_consumer(
+        self,
+        stream: str,
+        config: Optional[api.ConsumerConfig],
+        timeout: Optional[float],
+        params: Dict[str, Any],
+        action: str,
+    ) -> api.ConsumerInfo:
+        """
+        Sends a CONSUMER.CREATE request with an action, as nats.go's
+        upsertConsumer does: "create" fails if the consumer exists with
+        another configuration, "update" if it does not exist, and "" creates
+        or updates it.
+        """
+        _validate_stream_name(stream)
+        if not timeout:
+            timeout = self._timeout
+        if config is None:
+            config = api.ConsumerConfig()
+        config = config.evolve(**params)
+        if config.name:
+            _validate_consumer_name(config.name)
+        if config.durable_name:
+            _validate_consumer_name(config.durable_name)
+        name = config.name or config.durable_name
+        if not name:
+            name = self._nc._nuid.next().decode()
+
+        req: Dict[str, Any] = {"stream_name": stream, "config": config.as_dict()}
+        if action:
+            req["action"] = action
+        if config.filter_subject and config.filter_subject != ">" and not config.filter_subjects:
+            subject = f"{self._prefix}.CONSUMER.CREATE.{stream}.{name}.{config.filter_subject}"
+        else:
+            subject = f"{self._prefix}.CONSUMER.CREATE.{stream}.{name}"
+
+        resp = await self._api_request(subject, json.dumps(req).encode(), timeout=timeout)
+        if not _has_consumer_info(resp):
+            raise ConsumerCreationResponseEmptyError
+        info = api.ConsumerInfo.from_response(resp)
+        _check_consumer_support(config, info)
+        return info
+
+    async def consumer_names(self, stream: str) -> AsyncIterator[str]:
+        """
+        Iterates over the names of the stream's consumers, fetched page by
+        page.
+        """
+        _validate_stream_name(stream)
+        offset = 0
+        while True:
+            resp = await self._api_request(
+                f"{self._prefix}.CONSUMER.NAMES.{stream}",
+                json.dumps({"offset": offset}).encode(),
+                timeout=self._timeout,
+            )
+            page = resp.get("consumers") or []
+            for name in page:
+                yield name
+            offset += len(page)
+            if not page or offset >= resp.get("total", 0):
+                return
+
+    async def list_consumers(self, stream: str) -> AsyncIterator[api.ConsumerInfo]:
+        """
+        Iterates over the infos of the stream's consumers, fetched page by
+        page.
+        """
+        _validate_stream_name(stream)
+        offset = 0
+        while True:
+            resp = await self._api_request(
+                f"{self._prefix}.CONSUMER.LIST.{stream}",
+                json.dumps({"offset": offset}).encode(),
+                timeout=self._timeout,
+            )
+            page = resp.get("consumers") or []
+            for consumer in page:
+                yield api.ConsumerInfo.from_response(consumer)
+            offset += len(page)
+            if not page or offset >= resp.get("total", 0):
+                return
+
     async def delete_consumer(self, stream: str, consumer: str) -> bool:
         """
         Delete a consumer from a given stream.
@@ -682,19 +806,37 @@ class JetStreamManager:
 
         return raw_msg
 
-    async def delete_msg(self, stream_name: str, seq: int) -> bool:
+    async def delete_msg(self, stream_name: str, seq: int, no_erase: bool = False) -> bool:
         """
         Delete a message from a stream based on the sequence ID.
+
+        By default the server overwrites the message's data in storage, as
+        secure_delete_msg does. With ``no_erase=True`` it only marks the
+        message as deleted, which is faster; this is what nats.go's
+        Stream.DeleteMsg does.
+
+        :param stream_name: The name of the stream from which the message should be deleted.
+        :param seq: The sequence id to delete
+        :param no_erase: Mark the message as deleted without erasing it.
+        """
+        _validate_stream_name(stream_name)
+        req_subject = f"{self._prefix}.STREAM.MSG.DELETE.{stream_name}"
+        req: Dict[str, Any] = {"seq": seq}
+        if no_erase:
+            req["no_erase"] = True
+        data = json.dumps(req)
+        resp = await self._api_request(req_subject, data.encode())
+        return resp["success"]
+
+    async def secure_delete_msg(self, stream_name: str, seq: int) -> bool:
+        """
+        Delete a message from a stream, overwriting its data in storage
+        (nats.go Stream.SecureDeleteMsg).
 
         :param stream_name: The name of the stream from which the message should be deleted.
         :param seq: The sequence id to delete
         """
-        _validate_stream_name(stream_name)
-        req_subject = f"{self._prefix}.STREAM.MSG.DELETE.{stream_name}"
-        req = {"seq": seq}
-        data = json.dumps(req)
-        resp = await self._api_request(req_subject, data.encode())
-        return resp["success"]
+        return await self.delete_msg(stream_name, seq)
 
     async def get_last_msg(
         self,
