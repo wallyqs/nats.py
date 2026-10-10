@@ -1525,6 +1525,19 @@ class LeadershipChangeClusterTest(unittest.TestCase):
                 subprocess.Popen(["nats-server", "-c", conf], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             )
         self.servers = [f"nats://127.0.0.1:{4230 + i}" for i in range(1, 4)]
+        # Wait until every server accepts client connections.
+        import socket
+
+        deadline = time.monotonic() + 15
+        for i in range(1, 4):
+            while True:
+                try:
+                    socket.create_connection(("127.0.0.1", 4230 + i), timeout=0.5).close()
+                    break
+                except OSError:
+                    if time.monotonic() > deadline:
+                        raise
+                    time.sleep(0.1)
 
     def tearDown(self):
         for p in self.procs:
@@ -1549,7 +1562,8 @@ class LeadershipChangeClusterTest(unittest.TestCase):
         resp = await nc.request("$JS.API.CONSUMER.LEADER.STEPDOWN.LC.d", b"", timeout=5)
         assert json.loads(resp.data)["success"]
 
-    @async_test
+    # Forming the cluster and electing leaders takes longer than async_test allows.
+    @async_long_test
     async def test_leadership_change_status(self):
         nc = await nats.connect(self.servers)
         await self._setup(nc)
@@ -1570,7 +1584,8 @@ class LeadershipChangeClusterTest(unittest.TestCase):
         assert err.value.code == 409
         await nc.close()
 
-    @async_test
+    # Forming the cluster and electing leaders takes longer than async_test allows.
+    @async_long_test
     async def test_consume_continues_after_leadership_change(self):
         nc = await nats.connect(self.servers)
         js = await self._setup(nc)
