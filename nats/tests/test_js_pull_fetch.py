@@ -210,7 +210,12 @@ async def test_fetch_observations(
                         "waiting_404": "No Messages",
                     }[label]
                 )
-        observed = {"messages": messages, "outcome": outcome, "error": error, "pending": sub.pending_msgs}
+        pending = sub.pending_msgs
+        if label == "healthy_timeout":
+            # Heartbeats keep streaming past the deadline, so one may already be
+            # buffered as a stale control frame. Only application messages count.
+            pending = sum(1 for m in sub._sub._pending_queue._queue if m.data or "Status" not in (m.headers or {}))
+        observed = {"messages": messages, "outcome": outcome, "error": error, "pending": pending}
         elapsed = time.monotonic() - start
         assert not client._disconnect_waiters
         assert not sub._sub._pending_next_msgs_calls
