@@ -81,6 +81,8 @@ async def test_fetch_observations(
             async def data(value):
                 await service.publish(msg.reply, value.encode())
 
+            # str.removeprefix needs Python 3.9; the legacy client still tests 3.8.
+            lifecycle = label[len("partial_") :] if label.startswith("partial_") else label
             if label in ("retry_404", "retry_408", "retry_missing", "renewal_suppressed") and number == 1:
                 if label == "renewal_suppressed":
                     for _ in range(3):
@@ -112,12 +114,12 @@ async def test_fetch_observations(
                 await service.publish(msg.reply, b"one", headers={"Status": "409"})
             elif label == "empty_payload":
                 await service.publish(msg.reply, b"", headers={"App": "empty"})
-            elif label.removeprefix("partial_") in ("disconnect", "close", "unsubscribe"):
+            elif lifecycle in ("disconnect", "close", "unsubscribe"):
                 if label.startswith("partial_"):
                     await data("one")
                     await service.flush()
                     await asyncio.sleep(0.03)
-                await service.publish(prefix + ".action", label.removeprefix("partial_").encode())
+                await service.publish(prefix + ".action", lifecycle.encode())
             elif label in (
                 "consumer_deleted",
                 "leadership",
