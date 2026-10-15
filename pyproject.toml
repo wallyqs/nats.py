@@ -1,5 +1,6 @@
 [dependency-groups]
 test = [
+    "hypothesis>=6.0.0",
     "pytest>=9.0.3",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=7.0.0",
@@ -41,7 +42,7 @@ ignore = ["E501"]
 [tool.ruff.lint.per-file-ignores]
 "nats/examples/*" = ["E722", "F821", "F841", "I001", "W291"]
 "nats/benchmark/*" = ["E722", "F403", "F405"]
-"nats/tests/*" = ["F403", "F405", "F841", "E711", "E402", "I001", "E722", "F601", "E712", "F401"]
+"nats/tests/*" = ["F403", "F405", "F841", "E711", "E402", "I001", "E722", "F601", "E712", "F401", "F811"]
 "nats/src/nats/micro/__init__.py" = ["F401"]
 "nats/src/nats/nuid.py" = ["E741"]
 

@@ -41,6 +41,8 @@ dev = [
   # fast-mail-parser is deliberately absent: it only ships wheels up to cp310,
   # so it would need a Rust toolchain on the 3.11+ legs of the test matrix.
   "aiohttp>=3.8.0",
+  # Property-based tests for pull subscription fetch (test_js_pull_fetch_properties.py).
+  "hypothesis>=6.0.0",
   "nkeys>=0.1.0",
   "pytest>=7.0.0",
   "pytest-asyncio>=0.21.0",
