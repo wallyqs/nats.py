@@ -180,14 +180,15 @@ class FetchTimeoutError(nats.errors.TimeoutError):
         return "nats: fetch timeout"
 
 
-class FetchDisconnectedError(nats.errors.TimeoutError):
-    """
-    Raised when the connection is lost while a fetch is waiting for messages.
+class NoHeartbeatError(Error):
+    """Fetch received no message or heartbeat for two heartbeat intervals."""
 
-    The server does not keep pending pull requests across a reconnect, so the
-    request is aborted instead of waiting for the rest of its timeout. Calling
-    fetch again sends a new request once the client has reconnected.
-    """
+    def __str__(self) -> str:
+        return "nats: no heartbeat received"
+
+
+class FetchDisconnectedError(Error):
+    """The connection disconnected while waiting for a fetch batch."""
 
     def __str__(self) -> str:
         return "nats: disconnected during fetch"
